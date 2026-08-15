@@ -153,7 +153,11 @@ func (s *Strategy) OnEvent(ev strategy.Event) ([]strategy.Action, error) {
 		if s.phase != strategy.PhaseEntering {
 			return nil, nil
 		}
-		s.position = s.position.Add(e.Filled)
+		// 建仓期间仓位事件可能已经把 size 写到目标附近；Filled 是同一增量，取更接近目标的值，禁止双加。
+		next := s.position.Add(e.Filled)
+		if s.target.Sub(next).Abs().LessThan(s.target.Sub(s.position).Abs()) {
+			s.position = next
+		}
 		s.phase = strategy.PhaseRunning
 		return s.placeActions(e.Now), nil
 
@@ -517,7 +521,7 @@ func (s *Strategy) resumeActions(now time.Time) []strategy.Action {
 		s.phase = strategy.PhaseEntering
 		return []strategy.Action{strategy.EnsurePosition{Target: s.target}}
 	}
-	if s.phase == strategy.PhaseIdle {
+	if s.phase == strategy.PhaseIdle || s.phase == strategy.PhaseEntering {
 		s.phase = strategy.PhaseRunning
 	}
 	if acts, handled := s.checkRange(now); handled {
@@ -544,6 +548,9 @@ func (s *Strategy) syncFromOrders(orders []order.Order) {
 			continue
 		}
 		ref := o.ClientOrderID.Decode()
+		if ref.Purpose == order.PurposeEntry {
+			continue
+		}
 		if ref.Slot != s.slot || ref.Epoch != s.epoch || int(ref.Cell) >= len(s.grid.Cells) {
 			continue
 		}
@@ -573,12 +580,18 @@ func (s *Strategy) needsEntry() bool {
 	if diff.IsZero() {
 		return false
 	}
+	if s.mkt.LotSize.IsPositive() && diff.LessThanOrEqual(s.mkt.LotSize) {
+		return false
+	}
 	base := s.target.Abs()
 	if base.IsZero() {
-		// 目标是空仓时，任何非零仓位都需要先处理掉。
 		return s.position.Abs().GreaterThan(s.mkt.LotSize)
 	}
-	return diff.Div(base).GreaterThan(positionTolerance)
+	threshold := base.Mul(positionTolerance)
+	if s.mkt.LotSize.GreaterThan(threshold) {
+		threshold = s.mkt.LotSize
+	}
+	return diff.GreaterThan(threshold)
 }
 
 // isMakerPrice 判断以该价格挂单是否能成为 maker。

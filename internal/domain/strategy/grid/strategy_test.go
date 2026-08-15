@@ -712,6 +712,61 @@ func TestPendingTimeoutIgnoresRestingOrders(t *testing.T) {
 	}
 }
 
+func TestEntryDoneDoesNotDoubleCountPosition(t *testing.T) {
+	s := newStrategy(t, smallParams(Long))
+	if _, err := s.Init(testState("150", "0")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.OnEvent(strategy.PositionEvent{
+		Position: position.Position{Size: d("2")},
+		Now:      epoch0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.OnEvent(strategy.EntryDoneEvent{Filled: d("2"), Now: epoch0}); err != nil {
+		t.Fatal(err)
+	}
+	if !s.position.Equal(d("2")) {
+		t.Fatalf("position = %s, want 2 (EntryDone must not add on top of PositionEvent)", s.position)
+	}
+	if s.needsEntry() {
+		t.Fatal("at target, needsEntry should be false")
+	}
+}
+
+func TestSyncFromOrdersIgnoresPurposeEntry(t *testing.T) {
+	s := newStrategy(t, smallParams(Long))
+	if _, err := s.Init(testState("150", "0")); err != nil {
+		t.Fatal(err)
+	}
+	entryID := order.MustEncode(order.Ref{Slot: 0, Epoch: 1, Cell: 0, Purpose: order.PurposeEntry, Seq: 1})
+	acts, err := s.OnEvent(strategy.ResyncEvent{
+		Position: position.Position{Size: d("2")},
+		Orders: []order.Order{{
+			ClientOrderID: entryID,
+			Side:          order.Buy,
+			Quantity:      d("2"),
+			State:         order.StateOpen,
+		}},
+		Now: epoch0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	placed := placements(acts)
+	if len(placed) == 0 {
+		t.Fatal("entry 单不应占用格子，网格仍应铺开")
+	}
+	for _, p := range placed {
+		if p.ClientOrderID == entryID {
+			t.Fatal("must not treat PurposeEntry as a grid cell order")
+		}
+		if p.ClientOrderID.Decode().Purpose == order.PurposeEntry {
+			t.Fatal("grid placements must not reuse PurposeEntry")
+		}
+	}
+}
+
 // --- 测试辅助 ---
 
 func findPlacement(t *testing.T, acts []strategy.Action, price string) strategy.PlaceOrder {

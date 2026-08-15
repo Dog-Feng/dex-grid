@@ -464,6 +464,10 @@ func (r *Runner) apply(ctx context.Context, acts []strategy.Action, now time.Tim
 }
 
 func (r *Runner) startEntry(ctx context.Context, req strategy.EnsurePosition, now time.Time) {
+	if r.entering && r.trig != nil && r.trig.Active() {
+		r.log.Info("entry already in progress, ignore EnsurePosition")
+		return
+	}
 	r.trig = entry.New(r.entryP, r.state.Market, r.cfg.Slot, r.epoch)
 	acts := r.trig.Start(req.Target, r.state.Position.Size, r.state.Book, r.state.Mark, now)
 	if !r.trig.Active() {

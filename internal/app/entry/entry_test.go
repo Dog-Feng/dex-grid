@@ -6,6 +6,7 @@ import (
 
 	"dex-grid/internal/domain/market"
 	"dex-grid/internal/domain/order"
+	"dex-grid/internal/domain/position"
 	"dex-grid/internal/domain/strategy"
 
 	"github.com/shopspring/decimal"
@@ -41,6 +42,16 @@ func firstPlace(t *testing.T, acts []strategy.Action) strategy.PlaceOrder {
 	}
 	t.Fatalf("no PlaceOrder in %d actions", len(acts))
 	return strategy.PlaceOrder{}
+}
+
+func countPlace(acts []strategy.Action) int {
+	n := 0
+	for _, a := range acts {
+		if _, ok := a.(strategy.PlaceOrder); ok {
+			n++
+		}
+	}
+	return n
 }
 
 func TestMarketEntryFillsInOneShot(t *testing.T) {
@@ -235,5 +246,165 @@ func TestPartialFillAccumulates(t *testing.T) {
 	filled, _ := tr.Result()
 	if !filled.Equal(d("1")) {
 		t.Fatalf("filled = %s (double-counted?)", filled)
+	}
+}
+
+func TestMakerFollowLateFillAfterRepriceDoesNotPlaceAgain(t *testing.T) {
+	p := strategy.DefaultEntryParams()
+	p.Mode = strategy.EntryMakerFollow
+	p.RepriceTicks = 1
+	p.RepriceInterval = 0
+	p.FillTolerance = d("0.01")
+	tr := New(p, testMarket(), 0, 1)
+
+	acts := tr.Start(d("1"), d("0"), book("149.9", "150.1"), d("150"), t0)
+	po1 := firstPlace(t, acts)
+	tr.OnEvent(strategy.OrderEvent{
+		Order: order.Order{ClientOrderID: po1.ClientOrderID, Side: order.Buy, State: order.StateOpen, Quantity: d("1")},
+		Now:   t0,
+	})
+
+	_, done, _ := tr.OnEvent(strategy.OrderEvent{
+		Order: order.Order{
+			ClientOrderID: po1.ClientOrderID, Side: order.Buy,
+			FilledQty: d("0.4"), Quantity: d("1"), State: order.StatePartiallyFilled,
+		},
+		Now: t0.Add(time.Second),
+	})
+	if done {
+		t.Fatal("0.4/1 should not finish")
+	}
+
+	acts, _, _ = tr.OnEvent(strategy.BookEvent{
+		Book: book("149.7", "149.9"),
+		Mark: d("149.8"),
+		Now:  t0.Add(2 * time.Second),
+	})
+	if len(acts) != 1 {
+		t.Fatalf("expected cancel, got %d actions", len(acts))
+	}
+
+	acts, done, _ = tr.OnEvent(strategy.OrderEvent{
+		Order: order.Order{
+			ClientOrderID: po1.ClientOrderID, Side: order.Buy,
+			FilledQty: d("0.4"), Quantity: d("1"), State: order.StateCanceled,
+		},
+		Now: t0.Add(2 * time.Second),
+	})
+	if done {
+		t.Fatal("should still place remainder")
+	}
+	po2 := firstPlace(t, acts)
+	if !po2.Quantity.Equal(d("0.6")) {
+		t.Fatalf("remainder qty = %s, want 0.6", po2.Quantity)
+	}
+
+	acts, done, _ = tr.OnEvent(strategy.OrderEvent{
+		Order: order.Order{
+			ClientOrderID: po1.ClientOrderID, Side: order.Buy,
+			FilledQty: d("1"), Quantity: d("1"), State: order.StateFilled,
+		},
+		Now: t0.Add(3 * time.Second),
+	})
+	if !done {
+		t.Fatal("late fill of old order should complete entry")
+	}
+	if countPlace(acts) != 0 {
+		t.Fatalf("must not place another entry, got %+v", acts)
+	}
+	if len(acts) != 1 {
+		t.Fatalf("expected cancel of replacement, got %d actions", len(acts))
+	}
+	c, ok := acts[0].(strategy.CancelOrder)
+	if !ok || c.ClientOrderID != po2.ClientOrderID {
+		t.Fatalf("expected cancel %v, got %#v", po2.ClientOrderID, acts[0])
+	}
+	filled, _ := tr.Result()
+	if !filled.Equal(d("1")) {
+		t.Fatalf("filled = %s", filled)
+	}
+}
+
+func TestMakerFollowRepriceThenOldOrderFillsFully(t *testing.T) {
+	p := strategy.DefaultEntryParams()
+	p.Mode = strategy.EntryMakerFollow
+	p.RepriceTicks = 1
+	p.RepriceInterval = 0
+	tr := New(p, testMarket(), 0, 1)
+
+	acts := tr.Start(d("1"), d("0"), book("149.9", "150.1"), d("150"), t0)
+	po1 := firstPlace(t, acts)
+	tr.OnEvent(strategy.OrderEvent{
+		Order: order.Order{ClientOrderID: po1.ClientOrderID, Side: order.Buy, State: order.StateOpen, Quantity: d("1")},
+		Now:   t0,
+	})
+
+	acts, _, _ = tr.OnEvent(strategy.BookEvent{
+		Book: book("149.7", "149.9"),
+		Mark: d("149.8"),
+		Now:  t0.Add(time.Second),
+	})
+	if len(acts) != 1 {
+		t.Fatalf("expected cancel, got %d", len(acts))
+	}
+
+	acts, done, _ := tr.OnEvent(strategy.OrderEvent{
+		Order: order.Order{
+			ClientOrderID: po1.ClientOrderID, Side: order.Buy,
+			Quantity: d("1"), State: order.StateCanceled,
+		},
+		Now: t0.Add(time.Second),
+	})
+	if done {
+		t.Fatal("empty cancel should re-place full remainder")
+	}
+	po2 := firstPlace(t, acts)
+	if !po2.Quantity.Equal(d("1")) {
+		t.Fatalf("replacement qty = %s, want 1", po2.Quantity)
+	}
+
+	acts, done, _ = tr.OnEvent(strategy.OrderEvent{
+		Order: order.Order{
+			ClientOrderID: po1.ClientOrderID, Side: order.Buy,
+			FilledQty: d("1"), Quantity: d("1"), State: order.StateFilled,
+		},
+		Now: t0.Add(2 * time.Second),
+	})
+	if !done {
+		t.Fatal("old order full fill should complete entry")
+	}
+	if countPlace(acts) != 0 {
+		t.Fatalf("must not place another initial entry, got %+v", acts)
+	}
+	c, ok := acts[0].(strategy.CancelOrder)
+	if !ok || c.ClientOrderID != po2.ClientOrderID {
+		t.Fatalf("expected cancel replacement, got %#v", acts)
+	}
+}
+
+func TestPositionAtTargetCancelsRestingEntry(t *testing.T) {
+	p := strategy.DefaultEntryParams()
+	p.Mode = strategy.EntryMakerFollow
+	tr := New(p, testMarket(), 0, 1)
+	acts := tr.Start(d("1"), d("0"), book("149.9", "150.1"), d("150"), t0)
+	po := firstPlace(t, acts)
+	tr.OnEvent(strategy.OrderEvent{
+		Order: order.Order{ClientOrderID: po.ClientOrderID, Side: order.Buy, State: order.StateOpen, Quantity: d("1")},
+		Now:   t0,
+	})
+
+	acts, done, failed := tr.OnEvent(strategy.PositionEvent{
+		Position: position.Position{Size: d("1")},
+		Now:      t0.Add(time.Second),
+	})
+	if failed || !done {
+		t.Fatalf("done=%v failed=%v", done, failed)
+	}
+	if countPlace(acts) != 0 {
+		t.Fatalf("must not place again, got %+v", acts)
+	}
+	c, ok := acts[0].(strategy.CancelOrder)
+	if !ok || c.ClientOrderID != po.ClientOrderID {
+		t.Fatalf("expected cancel resting entry, got %#v", acts)
 	}
 }

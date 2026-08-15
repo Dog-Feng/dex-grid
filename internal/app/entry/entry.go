@@ -63,7 +63,9 @@ type Trigger struct {
 	seq         uint8
 	orderPrice  decimal.Decimal
 	orderQty    decimal.Decimal
-	orderFill   decimal.Decimal // 当前挂单已计入 filled 的数量
+	fills       map[order.ClientOrderID]decimal.Decimal // 本轮每笔建仓单已计入的累计成交
+	havePos     bool
+	posSize     decimal.Decimal // 交易所仓位，作成交下限，避免漏单后再挂一轮
 	repriceN    int
 	lastReprice time.Time
 	sliceIdx    int
@@ -92,6 +94,9 @@ func (t *Trigger) Start(target, current decimal.Decimal, book market.BookTicker,
 	t.coid = 0
 	t.reason = ""
 	t.forceMarket = false
+	t.fills = make(map[order.ClientOrderID]decimal.Decimal)
+	t.havePos = false
+	t.posSize = decimal.Zero
 
 	if t.done() {
 		t.phase = PhaseDone
@@ -118,7 +123,11 @@ func (t *Trigger) OnEvent(ev strategy.Event) (acts []strategy.Action, done, fail
 	case strategy.TickEvent:
 		acts = t.onTick(e.Now)
 	case strategy.PositionEvent:
-		// 仓位事件只作参考，成交量以订单回报为准，避免双边计数。
+		t.havePos = true
+		t.posSize = e.Position.Size
+		if t.done() {
+			acts = t.finish()
+		}
 	}
 
 	return acts, t.phase == PhaseDone, t.phase == PhaseFailed
@@ -126,7 +135,7 @@ func (t *Trigger) OnEvent(ev strategy.Event) (acts []strategy.Action, done, fail
 
 // Result 返回本次建仓实际成交的仓位增量（带符号）与失败原因。
 func (t *Trigger) Result() (filled decimal.Decimal, reason string) {
-	return t.filled, t.reason
+	return t.currentSize().Sub(t.start), t.reason
 }
 
 // Active 表示触发器正在工作。
@@ -135,7 +144,35 @@ func (t *Trigger) Active() bool {
 }
 
 func (t *Trigger) remaining() decimal.Decimal {
-	return t.target.Sub(t.start.Add(t.filled))
+	return t.target.Sub(t.currentSize())
+}
+
+// currentSize 取订单成交与交易所仓位里、更接近目标的那一侧。
+// 改价/超时换单后旧 COID 的成交可能迟到，仓位快照用来兜底，两者取较大进度，不累加。
+func (t *Trigger) currentSize() decimal.Decimal {
+	fromOrders := t.start.Add(t.filled)
+	if !t.havePos {
+		return fromOrders
+	}
+	if t.progressTowardTarget(t.posSize).GreaterThan(t.progressTowardTarget(fromOrders)) {
+		return t.posSize
+	}
+	return fromOrders
+}
+
+func (t *Trigger) progressTowardTarget(size decimal.Decimal) decimal.Decimal {
+	need := t.target.Sub(t.start)
+	delta := size.Sub(t.start)
+	if need.IsNegative() {
+		if delta.IsPositive() {
+			return decimal.Zero
+		}
+		return decimal.Min(delta.Abs(), need.Abs())
+	}
+	if delta.IsNegative() || need.IsZero() {
+		return decimal.Zero
+	}
+	return decimal.Min(delta, need)
 }
 
 func (t *Trigger) done() bool {
@@ -171,31 +208,41 @@ func (t *Trigger) fail(reason string) []strategy.Action {
 
 func (t *Trigger) finish() []strategy.Action {
 	t.phase = PhaseDone
-	return nil
+	if t.coid == 0 {
+		return nil
+	}
+	id := t.coid
+	t.coid = 0
+	return []strategy.Action{strategy.CancelOrder{ClientOrderID: id}}
 }
 
 func (t *Trigger) onOrder(e strategy.OrderEvent) []strategy.Action {
 	o := e.Order
-	if o.ClientOrderID != t.coid {
+	if !t.isSessionEntry(o.ClientOrderID) {
 		return nil
 	}
+	if o.FilledQty.IsPositive() {
+		t.noteFill(o)
+	}
+
+	current := t.coid != 0 && o.ClientOrderID == t.coid
+	if current && o.State.IsTerminal() {
+		t.coid = 0
+	}
+
+	if t.done() {
+		return t.finish()
+	}
+	if !current {
+		return nil
+	}
+
 	switch o.State {
 	case order.StateOpen, order.StatePartiallyFilled:
-		if o.FilledQty.IsPositive() {
-			t.noteFill(o)
-		}
-		if t.done() {
-			return t.finish()
-		}
 		t.phase = PhaseResting
 		return nil
 
 	case order.StateFilled:
-		t.noteFill(o)
-		t.coid = 0
-		if t.done() {
-			return t.finish()
-		}
 		if t.marketMode() && t.params.SliceInterval > 0 {
 			t.phase = PhasePlacing
 			return nil
@@ -203,20 +250,12 @@ func (t *Trigger) onOrder(e strategy.OrderEvent) []strategy.Action {
 		return t.placeNext(e.Now)
 
 	case order.StateRejected:
-		t.coid = 0
 		t.phase = PhasePlacing
 		return t.placeNext(e.Now)
 
 	case order.StateCanceled, order.StateExpired:
-		if o.FilledQty.IsPositive() {
-			t.noteFill(o)
-		}
-		t.coid = 0
 		if t.phase == PhaseRepricing {
 			return t.placeNext(e.Now)
-		}
-		if t.done() {
-			return t.finish()
 		}
 		t.phase = PhasePlacing
 		return t.placeNext(e.Now)
@@ -224,10 +263,24 @@ func (t *Trigger) onOrder(e strategy.OrderEvent) []strategy.Action {
 	return nil
 }
 
+func (t *Trigger) isSessionEntry(id order.ClientOrderID) bool {
+	if t.coid != 0 && id == t.coid {
+		return true
+	}
+	if !id.Valid() {
+		return false
+	}
+	ref := id.Decode()
+	return ref.Purpose == order.PurposeEntry && ref.Slot == t.slot && ref.Epoch == t.epoch
+}
+
 func (t *Trigger) noteFill(o order.Order) {
-	// 订单回报里的 FilledQty 是该单累计成交。减去本单已计入的部分，避免部分成交被加两次。
-	t.applySignedFill(o.Side, o.FilledQty.Sub(t.orderFill))
-	t.orderFill = o.FilledQty
+	if t.fills == nil {
+		t.fills = make(map[order.ClientOrderID]decimal.Decimal)
+	}
+	// 订单回报里的 FilledQty 是该单累计成交。按 COID 记增量，改价后的旧单迟到成交也能入账。
+	t.applySignedFill(o.Side, o.FilledQty.Sub(t.fills[o.ClientOrderID]))
+	t.fills[o.ClientOrderID] = o.FilledQty
 }
 
 func (t *Trigger) applySignedFill(side order.Side, qty decimal.Decimal) {
@@ -356,7 +409,6 @@ func (t *Trigger) placeNext(now time.Time) []strategy.Action {
 	t.coid = coid
 	t.orderPrice = price
 	t.orderQty = qty
-	t.orderFill = decimal.Zero
 	t.phase = PhasePlacing
 	t.lastSlice = now
 	t.sliceIdx++
