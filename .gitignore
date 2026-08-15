@@ -1,0 +1,31 @@
+# 密钥与本地配置
+.env
+config/config.yaml
+
+# 运行时数据
+/data/
+/logs/
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.lock
+
+# 构建产物（仅仓库根目录，不要忽略 cmd/gridbot）
+/dist/
+/gridbot
+/gridbot.exe
+/gridbot.exe~
+/lighterctl
+/lighterctl.exe
+*.exe~
+
+# 备份
+*.bak
+/backups/
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store

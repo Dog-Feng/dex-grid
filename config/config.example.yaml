@@ -1,0 +1,72 @@
+# dex-grid 配置示例
+#
+# 这里只放【密钥与运维参数】。交易对、网格区间、格数、杠杆等策略参数
+# 全部在 Web 控制台配置，保存在 data/gridbot.db，改动无需重启。
+#
+# 复制为 config.yaml 后修改。字段说明见 docs/GRID_CONFIG.md，部署见 docs/DEPLOYMENT.md
+#
+# 约定：
+#   - 价格/数量/金额一律用字符串书写，避免 YAML 解析成 float 丢精度
+#   - ${VAR} 会做环境变量展开；密钥必须走环境变量或同目录 .env 文件
+#   - 相对路径基于「可执行文件所在目录」，不是当前工作目录
+
+app:
+  log_level: info            # debug | info | warn | error
+  log_format: json           # json | text（本地调试用 text 更易读）
+  log_file: ./logs/gridbot.log
+  log_buffer_size: 2000      # 页面日志面板的内存环形缓冲条数
+  data_dir: ./data
+  tick_interval: 1s          # 定时事件间隔，驱动跟价/超时/止盈止损检查
+  reconcile_interval: 5m     # 周期性只读对账，0 关闭
+  shutdown_timeout: 30s
+
+server:
+  addr: "0.0.0.0:8080"       # 公网监听；只本机访问可改成 127.0.0.1:8080
+  auth:
+    # 默认关闭。需要时开启 Bearer Token，所有 /api/* 校验 Authorization 头
+    enabled: false
+    token: ${GRIDBOT_TOKEN}
+  metrics_enabled: true
+  cors_origins: ["*"]        # 允许任意来源调用 API；收紧时可改成具体 Origin
+
+proxy:
+  # 国内网络访问部分 DEX 需要代理。对 REST 与 WebSocket 同时生效。
+  enabled: false
+  url: "http://127.0.0.1:7890"   # 或 socks5://127.0.0.1:1080
+  username: ""
+  password: ""
+  no_proxy: ["localhost", "127.0.0.1"]
+  health_interval: 60s           # 连通性探测间隔，结果驱动页面代理状态灯
+
+exchanges:
+  # 每个交易所只能出现一次 —— 一个 DEX 只运行一个网格实例。
+  - name: lighter
+    enabled: true
+    network: mainnet             # mainnet | testnet（先在 testnet 跑通再上主网）
+
+    credentials:
+      account_index: ${LIGHTER_ACCOUNT_INDEX}
+      # 不要复用 Lighter 官方前端正在使用的 api_key_index，否则 nonce 会冲突
+      api_key_index: ${LIGHTER_API_KEY_INDEX}
+      api_key_private_key: ${LIGHTER_API_KEY_PRIVATE_KEY}
+
+    options:
+      tx_send_channel: ws        # ws（低延迟，推荐）| rest
+      batch_enabled: true        # 使用 sendTxBatch，铺满网格的关键
+      batch_size: 20
+      order_expiry: 28d          # GTT 有效期，Lighter 上限 30d
+      price_protection: true     # 市价单滑点保护
+
+    rate_limit:
+      rps: 10
+      burst: 20
+
+    timeout: 10s
+    max_retries: 3
+    reconnect:
+      initial: 1s
+      max: 30s
+
+  # 后续接入的交易所在这里追加一段，格式同上（当前只实现了 lighter）
+  # - name: <exchange>
+  #   enabled: false
