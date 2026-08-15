@@ -1,6 +1,6 @@
 # dex-grid 开发设计文档
 
-版本：v0.2（第一阶段：Lighter + 普通合约网格。当前无 Web 页面，策略 YAML / REST 启动；控制台规划中）
+版本：v0.2（第一阶段：Lighter + 普通合约网格。Web 控制台已 embed，默认不自动开网格）
 
 本文描述分层职责、核心抽象、网格算法、事件与命令流、HTTP API 契约、Lighter 适配细节与工程约定。配置字段规范见 [GRID_CONFIG.md](GRID_CONFIG.md)，部署见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
@@ -77,7 +77,7 @@ Lighter 主网的实际分布：235 个市场 = 227 个永续 + 8 个现货（`E
 | **单线程状态** | 行情、回报、定时器、页面命令全走同一个 goroutine，领域状态无锁 |
 | **能力协商** | 交易所差异用 `Capabilities` 描述，上层按能力降级 |
 | **确定性幂等** | `ClientOrderID` 由 (交易所, 轮次, 层级, 用途, 序号) 确定性计算 |
-| **配置双源** | 凭证/运维在 `config.yaml`（重启生效）；策略参数可写在 `strategy_file`（启动时加载）或经 REST 写入 SQLite | |
+| **配置双源** | 凭证/运维在 `config.yaml`（重启生效）；策略参数走控制台 / REST（SQLite）。`strategy_file` 仅在尚无已保存配置时作为模板；`autostart` 默认关闭 | |
 | **不过度设计** | 只抽象 `Exchange` 与 `Strategy` 两个端口（两者都确定有多实现）；日志直接用 `*slog.Logger`，不包接口；不引入 DI 容器、ORM、事件总线 |
 
 ---
@@ -85,8 +85,8 @@ Lighter 主网的实际分布：235 个市场 = 227 个永续 + 8 个现货（`E
 ## 2. 分层与依赖
 
 ```
-   策略 YAML / REST（Web 控制台规划中，当前不 embed 前端）
-        │  REST + WebSocket
+   Web 控制台（go:embed web/）/ 策略 YAML / REST
+        │  同源 HTTP（静态页 + REST）
    ┌────▼──────────────────────────────────────────┐
    │ api    路由 · DTO 校验 · 命令下发 · 实时推送      │
    └────┬──────────────────────────────────────────┘
@@ -558,7 +558,7 @@ API handler 投递命令后阻塞等待 `Reply`，默认超时 10s（`CmdStop` �
 | GET | `/api/system/status` | 各交易所连接状态、代理状态、版本、运行时长 | 顶部状态徽章 |
 | GET | `/api/exchanges` | 已启用交易所列表与能力 | Tab 列表 |
 | GET | `/api/exchanges/{ex}/symbols` | 可交易对列表 | 交易对下拉 |
-| GET | `/api/exchanges/{ex}/klines?symbol=&interval=&limit=` | K 线 | 图表 |
+| GET | `/api/exchanges/{ex}/klines?symbol=&interval=&limit=` | K 线（默认 1h） | 价格/网格曲线 |
 | GET | `/api/exchanges/{ex}/analysis?symbol=&interval=` | 趋势分析结果 | 趋势分析卡片 |
 | POST | `/api/exchanges/{ex}/suggest` | 按风格预设生成推荐参数与自动区间 | 「智能填充参数」「采用推荐策略 + 自动区间」 |
 | GET | `/api/exchanges/{ex}/config` | 当前策略配置 | 策略配置表单回填 |
@@ -897,7 +897,7 @@ type nonceTracker struct {
 | 保证金率单位 | `/orderBookDetails` 里是万分之一的整数（`maintenance_margin_fraction: 240` = 2.4%）；`/account` 的持仓里却是百分数字符串（`initial_margin_fraction: "5.00"` = 5%）。同一语义两种表示，转换时容易搞错 |
 | `is_ask` / `reduce_only` | 下单请求里是 `0/1`，查询挂单返回的是 `true/false`。解析时要能同时接受两种 |
 | `/orderBookOrders` | 返回的是**逐笔挂单**而不是按价格聚合的档位。取第一条能得到最优价，但它的数量只是那一笔的量 |
-| `/candlesticks` | 主网返回 403，加 UA 与 Accept 头也一样。K 线接入待确认鉴权要求，行情分析模块（M7）之前不影响交易 |
+| `/api/v1/candles` | 公开 K 线，控制台价格曲线使用。旧路径 `/candlesticks` 主网 403，已弃用 |
 | `CancelAllOrders` | Lighter 原生全撤是**账户级**。适配器的 `CancelAll(symbol)` **不得**调用它，改为拉取该市场活动单再逐笔撤销，避免误撤其他交易对（包括手动挂的单） |
 | WS `account_market` 的 `position` | 文档写的是数组，实际推送的是**单个对象**。解析要能同时吃两种形态 |
 | WS 订单回报延迟 | 从 `sendTx` 返回到收到对应的订单事件约 3-6 秒，这是排序器的入块时间，不是网络延迟 |
@@ -1033,7 +1033,7 @@ CREATE TABLE stats (
 
 **默认保守**：仓位漂移超阈值时默认停在 error 状态而非自动市价纠偏，因为误判下的自动纠偏会造成真实亏损。页面提供「确认并自动纠偏」按钮把决定权交给用户。
 
-周期性对账（默认 5 分钟）只做只读检查并上报 `grid_reconcile_drift` 指标，发现问题告警不自动动手。
+周期性对账现已接到运行循环（`app.reconcile_interval`，默认 15s）：对照交易所真实挂单，**本实例多余的撤掉、缺失的格子补挂**。仓位漂移超阈值仍默认不自动市价纠偏。解不出本系统 COID 的手工单不动。
 
 ---
 
@@ -1097,7 +1097,7 @@ const (
 | --- | --- |
 | CGO | **必须 `CGO_ENABLED=0`**。SQLite 用 `modernc.org/sqlite`，不用 `mattn/go-sqlite3` |
 | 路径 | 一律 `filepath.Join`；数据目录同时支持相对与绝对路径，相对路径基于可执行文件所在目录而非工作目录（Windows 服务的工作目录常常不是安装目录） |
-| 前端资源 | 当前不 embed 页面；HTTP 只提供 REST。规划中的控制台再 `go:embed` |
+| 前端资源 | `web/` 静态页由 `go:embed` 打进二进制；`GET /` 与 `/css/` `/js/` 同源托管，`/api/*` 仍走 REST |
 | 换行 | `.gitattributes` 统一 LF；`*.ps1`、`*.bat` 标记为 CRLF |
 | 信号 | `signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)`；`syscall.SIGTERM` 在 Windows 上也有定义，同一份代码即可 |
 | 文件锁 | 用 `data/gridbot.lock`（`O_CREATE\|O_EXCL`）防止同一数据目录被两个进程打开 —— 这会导致 nonce 冲突和重复下单 |
@@ -1167,7 +1167,7 @@ const (
 
 不引入：DI 框架、ORM、大型 web 框架、通用事件总线。
 
-前端：当前未实现。规划中的控制台需满足「构建产物是纯静态文件，可被 `go:embed` 打包」。
+前端：`web/` 纯静态文件，`internal/api` 通过 `dex-grid/web` 的 `embed.FS` 同源托管。账户状态每秒刷新；价格曲线默认 1h K 线。成交路径是交易所 WS 推送后立刻翻转格子，看门狗只做挂单缺补。
 
 ---
 

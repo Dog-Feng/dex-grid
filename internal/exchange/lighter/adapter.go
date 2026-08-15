@@ -360,10 +360,44 @@ func (a *Adapter) Ticker(ctx context.Context, symbol string) (exchange.Ticker, e
 	return t, nil
 }
 
-// Klines ææªå®ç°ï¼ä¸»ç½ç /candlesticks ç«¯ç¹å½åè¿å 403ï¼
-// éè¦ç¡®è®¤é´æè¦æ±ååè¡¥ãè¡æåææ¨¡åï¼M7ï¼ä¹åä¸å½±åäº¤æã
+// Klines 拉取公开 K 线。主网用 /api/v1/candles（旧的 /candlesticks 会 403）。
 func (a *Adapter) Klines(ctx context.Context, symbol, interval string, limit int) ([]market.Kline, error) {
-	return nil, fmt.Errorf("%w: lighter ç K çº¿ç«¯ç¹å¾æ¥å¥", exchange.ErrNotSupported)
+	cm, err := a.lookup(ctx, symbol)
+	if err != nil {
+		return nil, err
+	}
+	res, dur, ok := normalizeResolution(interval)
+	if !ok {
+		return nil, fmt.Errorf("lighter: 不支持的 K 线周期 %q", interval)
+	}
+	if limit <= 0 {
+		limit = 72
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	end := time.Now().UTC()
+	start := end.Add(-time.Duration(limit) * dur)
+	raw, err := a.rest.candles(ctx, cm.detail.MarketID, res, start, end, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]market.Kline, 0, len(raw))
+	for _, c := range raw {
+		if c.T <= 0 || !c.C.Decimal.IsPositive() {
+			continue
+		}
+		out = append(out, market.Kline{
+			OpenTime: candleTime(c.T),
+			Open:     c.O.Decimal,
+			High:     c.H.Decimal,
+			Low:      c.L.Decimal,
+			Close:    c.C.Decimal,
+			Volume:   c.V.Decimal,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OpenTime.Before(out[j].OpenTime) })
+	return out, nil
 }
 
 // --- è´¦æ·ä¸æä» ---

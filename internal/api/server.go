@@ -1,4 +1,4 @@
-// Package api 提供 REST 接口。前端页面待定，本包不托管任何静态页面。
+// Package api 提供 REST 接口，并同源托管 web 控制台静态文件。
 //
 // 所有写操作都翻译成 Supervisor 命令，由 Runner 单线程执行。
 package api
@@ -17,6 +17,7 @@ import (
 	"dex-grid/internal/app/supervisor"
 	"dex-grid/internal/config"
 	"dex-grid/internal/domain/strategy/grid"
+	"dex-grid/web"
 )
 
 // Server 是 HTTP 入口。
@@ -49,6 +50,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/system/status", s.handleSystem)
 	s.mux.HandleFunc("GET /api/exchanges", s.handleExchanges)
 	s.mux.HandleFunc("GET /api/exchanges/{ex}/symbols", s.handleSymbols)
+	s.mux.HandleFunc("GET /api/exchanges/{ex}/klines", s.handleKlines)
 	s.mux.HandleFunc("POST /api/exchanges/{ex}/preview", s.handlePreview)
 	s.mux.HandleFunc("GET /api/exchanges/{ex}/config", s.handleGetConfig)
 	s.mux.HandleFunc("PUT /api/exchanges/{ex}/config", s.handlePutConfig)
@@ -64,6 +66,23 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/exchanges/{ex}/reset-stats", s.handleReset)
 	s.mux.HandleFunc("POST /api/exchanges/{ex}/reconnect", s.handleReconnect)
 	s.mux.HandleFunc("GET /api/proxy", s.handleProxy)
+	s.mountStatic()
+}
+
+func (s *Server) mountStatic() {
+	s.mux.Handle("GET /css/", noCache(http.FileServer(http.FS(web.FS))))
+	s.mux.Handle("GET /js/", noCache(http.FileServer(http.FS(web.FS))))
+	s.mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeFileFS(w, r, web.FS, "index.html")
+	})
+}
+
+func noCache(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) withAccess(next http.Handler) http.Handler {
@@ -124,6 +143,17 @@ func (s *Server) handleExchanges(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleSymbols(w http.ResponseWriter, r *http.Request) {
 	list, err := s.sup.Symbols(r.Context(), r.PathValue("ex"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, list)
+}
+
+func (s *Server) handleKlines(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	list, err := s.sup.Klines(r.Context(), r.PathValue("ex"), q.Get("symbol"), q.Get("interval"), limit)
 	if err != nil {
 		writeErr(w, err)
 		return

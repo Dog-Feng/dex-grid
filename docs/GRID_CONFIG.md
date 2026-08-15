@@ -7,8 +7,8 @@
 | | `config.yaml` | 策略 YAML / REST API（存 SQLite） |
 | --- | --- | --- |
 | 内容 | 各 DEX 密钥、网络、代理、限流、日志、监听端口、IP 白名单 | 交易对、网格类型、区间、格数、保证金、杠杆、建仓方式、风控 |
-| 变更 | 手工编辑文件 | `strategy_file` 或 `PUT /api/exchanges/{ex}/config` |
-| 生效 | 重启进程 | `strategy_file` 在启动时加载；API 即时生效 |
+| 变更 | 手工编辑文件 | 控制台 / `PUT /config`；可选 `strategy_file` 仅作空库模板 |
+| 生效 | 重启进程 | API/页面即时生效。`strategy_file` 不覆盖已保存配置；`autostart` 默认 `false` |
 | 安全 | 密钥用环境变量注入 | 不含任何密钥 |
 
 **每个 DEX 只有一个实例**，所以 `config.yaml` 里一个交易所一段配置，策略 YAML / REST 也按交易所名对应。
@@ -40,7 +40,7 @@ exchanges: # 各 DEX 凭证与连接参数
 | `log_buffer_size` | int | `2000` | 页面日志面板的内存环形缓冲条数 |
 | `data_dir` | string | `./data` | SQLite 与运行时文件目录。相对路径基于**可执行文件所在目录** |
 | `tick_interval` | duration | `1s` | 定时事件间隔，驱动跟价、超时、止盈止损检查 |
-| `reconcile_interval` | duration | `5m` | 周期性只读对账间隔，`0` 关闭 |
+| `reconcile_interval` | duration | `15s` | 运行中对照交易所挂单：缺失补挂、多余撤销。`0` 时引擎仍按 15s 跑 |
 | `shutdown_timeout` | duration | `30s` | 优雅退出超时 |
 
 ## 2. server
@@ -90,8 +90,8 @@ exchanges: # 各 DEX 凭证与连接参数
 | `max_retries` | int | `3` | 可重试错误的最大重试次数 |
 | `reconnect.initial` | duration | `1s` | WS 重连初始退避 |
 | `reconnect.max` | duration | `30s` | WS 重连最大退避 |
-| `strategy_file` | string | 空 | 网格参数 YAML 路径，如 `config/lighter-sol.yaml`。启动时写入 SQLite |
-| `autostart` | bool | `false` | `true` 时进程起来后自动启动该交易所网格，不需要页面 |
+| `strategy_file` | string | 空 | 网格参数 YAML 路径。仅当 SQLite 还没有该交易所策略时写入；已有配置不覆盖 |
+| `autostart` | bool | `false` | `true` 时进程起来后自动开网格。有 Web 控制台时请保持 `false` |
 
 ### 4.2 Lighter 专有字段
 
@@ -115,7 +115,7 @@ app:
   log_format: json
   data_dir: ./data
   tick_interval: 1s
-  reconcile_interval: 5m
+  reconcile_interval: 15s
   shutdown_timeout: 30s
 
 server:
@@ -150,15 +150,17 @@ exchanges:
     rate_limit:
       rps: 10
       burst: 20
-    strategy_file: config/lighter-sol.yaml
-    autostart: true
+    # strategy_file: config/lighter-sol.yaml
+    autostart: false
 ```
 
 ---
 
 # 第二部分：策略参数（YAML 文件或 REST API）
 
-无 Web 页面时，把参数写在 `config/lighter-sol.yaml` 这类文件里，并在 `config.yaml` 中设置：
+网格参数优先走 **Web 控制台**（`http://127.0.0.1:8080/`）或 `PUT /api/exchanges/{ex}/config` 再 `POST .../start`。
+
+无页面部署时，把参数写在 `config/lighter-sol.yaml` 这类文件里，并在 `config.yaml` 中设置：
 
 ```yaml
 exchanges:
@@ -167,7 +169,7 @@ exchanges:
     autostart: true
 ```
 
-进程启动会：加载策略文件 → 写入 SQLite → 自动开网格。也可用 `PUT /api/exchanges/{ex}/config` 再 `POST .../start`。
+进程启动会：若 SQLite 还没有该交易所策略则加载 YAML → 若 `autostart: true` 再自动开网格。已有控制台保存的配置不会被 YAML 覆盖。
 
 仓库默认的 `config/lighter-sol.yaml`：SOL 做多、区间 72–77、25 格、保证金 1000、杠杆 10x，其余为系统默认。
 
@@ -298,6 +300,8 @@ exchanges:
 | 仓位偏差容忍 | `reconcile.position_tolerance` | `"0.01"` | 1% 以内视为一致 |
 | 自动纠偏 | `reconcile.auto_fix` | `false` | 超阈值时是否自动市价纠偏。`false` 则转 error 状态等人工确认 |
 | 撤销孤儿单 | `reconcile.cancel_orphans` | `true` | 撤销属于本交易所但 epoch 已过期的挂单 |
+
+运行中另有挂单看门狗（`app.reconcile_interval`，默认 15s）：对照交易所真实挂单，**本实例多余的撤掉、缺失的格子补挂**。解不出本系统 COID 的手工单不动。现价所在格若会穿价，仍跳过（不是漏单）。
 
 ## 11. order —— 挂单行为
 
@@ -588,7 +592,7 @@ k | 触发价  | 保证金  | 名义    | 累计名义 | 持仓均价 | 止盈�
 | 选中后 | 立即拉取该市场的元数据与行情，并触发一次 `POST /preview` 刷新派生量 |
 | 切换限制 | 实例处于 Running/Paused 时禁止切换交易对，必须先停止策略（撤单留仓） |
 
-**页面接入之前**，用 `market_index` 直接指定标的，命令行工具 `lighterctl` 提供了同样的数据：
+**页面已接入。** 命令行工具 `lighterctl` 仍可核对同一份市场数据：
 
 ```bash
 lighterctl markets -q sol    # 按关键字过滤，等价于下拉里的搜索
@@ -599,7 +603,8 @@ lighterctl market -m 2       # 查看 market_index=2 的元数据与最小下单
 
 | 后端结构 | 前端形态 |
 | --- | --- |
-| `GET /api/exchanges` | 已启用交易所列表与能力（规划中的前端 Tab 数据源） |
+| `GET /api/exchanges` | 已启用交易所列表与能力（控制台 Tab） |
+| `GET /api/exchanges/{ex}/klines` | 1h K 线，价格/网格曲线 |
 | `symbol` | 交易对可搜索下拉，见 20.1 |
 | `direction` | 中性 / 做多 / 做空 三选一按钮组 |
 | `preset` | 稳健 / 激进 / 成交少更安全 三选一 |

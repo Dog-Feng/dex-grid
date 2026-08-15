@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"dex-grid/internal/app/supervisor"
@@ -94,13 +95,23 @@ func validParams() map[string]any {
 	}
 }
 
-func TestRootHasNoPage(t *testing.T) {
+func TestRootServesConsole(t *testing.T) {
 	s, _ := setupAPI(t)
 	req := httptest.NewRequest("GET", "/", nil)
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", rec.Code)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "网格交易") {
+		t.Fatalf("index.html missing title, body=%s", rec.Body.String()[:min(200, rec.Body.Len())])
+	}
+
+	req = httptest.NewRequest("GET", "/css/console.css", nil)
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("css status = %d, want 200", rec.Code)
 	}
 }
 
@@ -158,6 +169,41 @@ func TestAuthRequired(t *testing.T) {
 	code, _ := doJSON(t, s.Handler(), "GET", "/api/exchanges", nil)
 	if code != 401 {
 		t.Fatalf("status = %d, want 401", code)
+	}
+}
+
+func TestStatusUsesConfigSymbol(t *testing.T) {
+	s, _ := setupAPI(t)
+	code, env := doJSON(t, s.Handler(), "PUT", "/api/exchanges/fake/config", validParams())
+	if code != 200 || env["ok"] != true {
+		t.Fatalf("put config %d %+v", code, env)
+	}
+	code, env = doJSON(t, s.Handler(), "GET", "/api/exchanges/fake/status", nil)
+	if code != 200 || env["ok"] != true {
+		t.Fatalf("status %d %+v", code, env)
+	}
+	data := env["data"].(map[string]any)
+	if data["symbol"] != "BTC" {
+		t.Fatalf("status symbol = %v, want BTC", data["symbol"])
+	}
+	if data["mark"] == nil || data["mark"] == "0" || data["mark"] == 0 {
+		t.Fatalf("status mark empty: %+v", data["mark"])
+	}
+}
+
+func TestKlinesUsesConfigSymbol(t *testing.T) {
+	s, _ := setupAPI(t)
+	code, env := doJSON(t, s.Handler(), "PUT", "/api/exchanges/fake/config", validParams())
+	if code != 200 {
+		t.Fatalf("put config %d %+v", code, env)
+	}
+	code, env = doJSON(t, s.Handler(), "GET", "/api/exchanges/fake/klines?interval=1h&limit=8", nil)
+	if code != 200 || env["ok"] != true {
+		t.Fatalf("klines %d %+v", code, env)
+	}
+	list, ok := env["data"].([]any)
+	if !ok || len(list) != 8 {
+		t.Fatalf("klines data = %+v", env["data"])
 	}
 }
 

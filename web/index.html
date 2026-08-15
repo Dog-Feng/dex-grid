@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>网格交易总控台</title>
+  <link rel="stylesheet" href="css/console.css" />
+</head>
+<body>
+  <header class="header">
+    <div class="header-logo">网格交易<span>总控台</span></div>
+    <div class="header-sep"></div>
+    <div id="ex-chips" class="ex-chips">
+      <span class="ex-chip"><i class="hdot idle"></i>—</span>
+    </div>
+    <div class="header-right">
+      <span class="conn" id="conn-badge"><i class="cdot"></i><span id="conn-text">连接中</span></span>
+      <span class="clock" id="clock">—</span>
+    </div>
+  </header>
+
+  <nav class="main-tabs">
+    <button class="tab-btn active" data-tab="overview">总览</button>
+    <button class="tab-btn" data-tab="lighter">Lighter</button>
+    <button class="tab-btn" disabled title="后续交易所按 /api/exchanges 动态追加">Decibel</button>
+    <button class="tab-btn" disabled>Extended</button>
+  </nav>
+
+  <main class="wrap">
+    <div class="static-banner" id="banner" hidden></div>
+
+    <section id="tab-overview" class="tab-panel active">
+      <div class="total-row">
+        <div class="total-card">
+          <div class="lbl">总权益</div>
+          <div class="val" id="ov-equity">—</div>
+          <div class="sub">可用保证金 <span id="ov-avail">—</span></div>
+        </div>
+        <div class="total-card">
+          <div class="lbl">总盈亏</div>
+          <div class="val" id="ov-pnl">—</div>
+          <div class="sub">已实现 <span id="ov-real">—</span> / 未实现 <span id="ov-unreal">—</span></div>
+        </div>
+        <div class="total-card">
+          <div class="lbl">挂单 / 完成格</div>
+          <div class="val" id="ov-orders">—</div>
+          <div class="sub">目标 <span id="ov-target">—</span></div>
+        </div>
+        <div class="total-card">
+          <div class="lbl">运行状态</div>
+          <div class="val" id="ov-status">—</div>
+          <div class="sub"><span id="ov-ex">—</span> · <span id="ov-symbol">—</span> <span id="ov-dir-short">—</span></div>
+        </div>
+      </div>
+      <div class="ov-card">
+        <div class="ov-exname"><span class="run-dot" id="ov-dot"></span><span id="ov-exname">—</span></div>
+        <div class="kv"><span class="lbl">交易对</span><span class="val" id="ov-pair">—</span></div>
+        <div class="kv"><span class="lbl">方向</span><span class="val" id="ov-direction">—</span></div>
+        <div class="kv"><span class="lbl">区间</span><span class="val" id="ov-range">—</span></div>
+        <div class="kv"><span class="lbl">最新价</span><span class="val" id="ov-mark">—</span></div>
+        <div class="kv"><span class="lbl">持仓</span><span class="val" id="ov-pos">—</span></div>
+        <div class="kv"><span class="lbl">挂单健康</span><span class="val" id="ov-health">—</span></div>
+        <button class="btn btn-ghost" id="btn-goto-ex">进入控制台 →</button>
+      </div>
+    </section>
+
+    <section id="tab-lighter" class="tab-panel">
+      <div class="grid-left-right">
+        <div class="stack">
+          <div class="panel">
+            <div class="panel-title">策略配置</div>
+
+            <label>网格类型</label>
+            <div class="modes">
+              <div class="mode-btn sel" data-group="kind" data-value="grid">普通网格<small>第一阶段</small></div>
+              <div class="mode-btn" data-group="kind" data-value="martingale">马丁网格<small>第二阶段</small></div>
+            </div>
+
+            <div id="martingale-box" class="note" hidden>马丁网格尚未实现。请选择普通网格后再配置参数。</div>
+
+            <div id="grid-config">
+              <label>交易对</label>
+              <div class="combo" id="symbol-combo">
+                <button type="button" class="combo-trigger" id="symbol-trigger" aria-expanded="false">
+                  <span id="symbol-label">选择交易对</span>
+                  <span class="combo-caret" aria-hidden="true"></span>
+                </button>
+                <div class="combo-menu" id="symbol-menu" hidden>
+                  <div class="combo-search">
+                    <input id="symbol-filter" placeholder="Search" autocomplete="off" />
+                    <button type="button" class="combo-clear" id="symbol-clear" title="清除">×</button>
+                    <span class="combo-mag" aria-hidden="true"></span>
+                  </div>
+                  <div class="combo-options" id="symbol-options"></div>
+                </div>
+              </div>
+              <input type="hidden" id="symbol" value="" />
+
+              <label>方向</label>
+              <div class="modes">
+                <div class="mode-btn" data-group="direction" data-value="neutral">中性<small>两边开仓</small></div>
+                <div class="mode-btn sel" data-group="direction" data-value="long">做多<small>先建底仓</small></div>
+                <div class="mode-btn" data-group="direction" data-value="short">做空<small>先建空仓</small></div>
+              </div>
+              <label>风格</label>
+              <div class="modes">
+                <div class="mode-btn sel" data-group="preset" data-value="stable">稳健</div>
+                <div class="mode-btn" data-group="preset" data-value="aggressive">激进</div>
+                <div class="mode-btn" data-group="preset" data-value="safe">成交少更安全</div>
+              </div>
+              <button class="btn btn-smart" id="btn-smart">智能填充参数</button>
+              <div class="row">
+                <div><label>下边界</label><input id="lower" value="72" /></div>
+                <div><label>上边界</label><input id="upper" value="77" /></div>
+              </div>
+              <div class="row">
+                <div><label>格子数量</label><input id="count" type="number" value="25" min="2" /></div>
+                <div>
+                  <label>杠杆</label>
+                  <input id="leverage" type="number" value="10" min="1" />
+                </div>
+              </div>
+              <div class="row">
+                <div>
+                  <label>保证金模式</label>
+                  <select id="margin-mode">
+                    <option value="isolated" selected>逐仓 isolated</option>
+                    <option value="cross">全仓 cross</option>
+                  </select>
+                </div>
+                <div>
+                  <label>数量输入</label>
+                  <select id="sizing">
+                    <option value="margin" selected>按保证金</option>
+                    <option value="per_grid_qty">按每格数量</option>
+                  </select>
+                </div>
+              </div>
+              <div id="margin-wrap"><label>保证金 (USDC)</label><input id="margin" value="1000" /></div>
+              <div id="qty-wrap" style="display:none"><label>每格数量 (币)</label><input id="qty" value="0.53" /></div>
+              <label>区间外策略</label>
+              <select id="out-of-range">
+                <option value="pause" selected>暂停网格，等待回归（不撤单）</option>
+                <option value="stop_and_cancel">停止网格并撤销挂单（留仓）</option>
+              </select>
+              <div id="derived" class="derived"></div>
+              <div id="warn" class="warn-box"></div>
+
+              <div id="entry-block">
+                <label>建仓方式</label>
+                <select id="entry-mode">
+                  <option value="maker_follow" selected>Maker 自动跟价</option>
+                  <option value="market">市价建仓</option>
+                  <option value="limit_price">指定价格</option>
+                </select>
+                <div id="entry-hint" class="note"></div>
+                <div id="entry-price-wrap" hidden>
+                  <label>建仓价格</label>
+                  <input id="entry-price" value="" />
+                </div>
+              </div>
+
+              <button class="btn btn-start" id="btn-start">启动网格</button>
+              <button class="btn btn-stop" id="btn-stop">停止策略（撤单留仓）</button>
+              <button class="btn btn-ghost" id="btn-adjust">调整区间（不停止网格）</button>
+              <button class="btn btn-warn" id="btn-cancel">撤销所有挂单（保留持仓）</button>
+              <button class="btn btn-cyan" id="btn-refill">补齐网格挂单（一键补格）</button>
+              <div class="note">看门狗默认 15s 对照交易所挂单：缺补、多撤。现价所在格 post-only 可能暂时空 1 笔。</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="stack">
+          <div class="panel">
+            <div class="panel-title">
+              账户状态
+              <span class="conn" id="st-conn"><i class="cdot"></i><span id="st-phase">—</span></span>
+            </div>
+            <div class="status-grid">
+              <div class="status-item"><div class="lbl">最新价</div><div class="val" id="st-mark">—</div></div>
+              <div class="status-item"><div class="lbl">持仓 / 均价</div><div class="val" id="st-pos">—</div></div>
+              <div class="status-item"><div class="lbl">余额</div><div class="val" id="st-bal">—</div></div>
+              <div class="status-item"><div class="lbl">权益</div><div class="val" id="st-eq">—</div></div>
+              <div class="status-item"><div class="lbl">已实现</div><div class="val" id="st-real">—</div></div>
+              <div class="status-item"><div class="lbl">未实现</div><div class="val" id="st-unreal">—</div></div>
+              <div class="status-item"><div class="lbl">强平价</div><div class="val" id="st-liq">—</div></div>
+              <div class="status-item"><div class="lbl">完成格</div><div class="val" id="st-grids">—</div></div>
+            </div>
+            <div class="watchdog" id="st-watch">
+              挂单看门狗 · 目标 <b>—</b> / 已确认 <b>—</b> · 更新于 —
+            </div>
+            <div class="progress">
+              <span id="st-progress-txt">挂单 — / 目标 —</span>
+              <div class="progress-bar"><i id="st-progress-bar"></i></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-title">价格 / 网格 <span class="chart-period">1H</span></div>
+            <div class="legend">
+              <span><i class="buy"></i>买单</span>
+              <span><i class="sell"></i>卖单</span>
+              <span><i class="curve"></i>价格</span>
+              <span><i class="mark"></i>标记价</span>
+            </div>
+            <div class="chartbox"><canvas id="chart"></canvas></div>
+          </div>
+
+          <div class="split-2">
+            <div class="panel">
+              <div class="panel-title">成交记录</div>
+              <table>
+                <thead><tr><th>时间</th><th>方向</th><th>价格</th><th>数量</th></tr></thead>
+                <tbody id="trades-body">
+                  <tr><td colspan="4" class="muted">暂无成交</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="panel">
+              <div class="panel-title">运行日志</div>
+              <div class="log" id="log-box">
+                <div class="log-item">等待连接后端…</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <div id="modal" class="modal">
+    <div class="panel">
+      <div class="panel-title" id="modal-title">确认</div>
+      <p id="modal-body" class="note"></p>
+      <div class="btn-row">
+        <button class="btn btn-ghost" id="modal-cancel">取消</button>
+        <button class="btn btn-stop" id="modal-ok">确认</button>
+      </div>
+    </div>
+  </div>
+  <script src="js/console.js"></script>
+</body>
+</html>

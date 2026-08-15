@@ -2,9 +2,9 @@
 
 面向 Web3 永续合约 DEX 的**多交易所网格交易系统**。
 
-Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运行。网格参数写在 `config/lighter-sol.yaml` 这类策略文件里，进程启动即可开网格，不需要 Web 页面。`config.yaml` 只保存各 DEX 的密钥、监听端口与 IP 白名单。也可用 REST API 改策略。前端页面待定。
+Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运行。同一端口托管 **Web 控制台**（`go:embed`）与 REST API。`config.yaml` 只保存各 DEX 的密钥、监听端口与 IP 白名单；网格参数走控制台 / REST，也可选策略 YAML 作首次模板。默认**不会**自动开网格。
 
-![控制台原型（规划中）](docs/images/ui-prototype.png)
+![Web 控制台](docs/images/ui-prototype.png)
 
 ---
 
@@ -33,9 +33,9 @@ Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运
 
 | 来源 | 内容 | 变更方式 | 生效方式 |
 | --- | --- | --- | --- |
-| `config.yaml` | 各 DEX 的密钥、网络、代理、限流、日志、监听端口、IP 白名单、`strategy_file` / `autostart` | 手工编辑文件 | 重启进程 |
-| 策略 YAML（如 `config/lighter-sol.yaml`） | 交易对、网格类型、区间、格数、保证金、杠杆、风控 | 手工编辑文件 | 启动时写入 SQLite；`autostart: true` 则自动开网格 |
-| SQLite / REST API | 同上策略参数 | `PUT /api/exchanges/{ex}/config` | 即时生效；下次启动若配置了 `strategy_file` 会被 YAML 覆盖 |
+| `config.yaml` | 各 DEX 的密钥、网络、代理、限流、日志、监听端口、IP 白名单、可选 `strategy_file` / `autostart` | 手工编辑文件 | 重启进程 |
+| 策略 YAML（如 `config/lighter-sol.yaml`） | 交易对、网格类型、区间、格数、保证金、杠杆、风控 | 手工编辑文件 | 仅当 SQLite **还没有**该交易所策略时作为模板；已有控制台/API 配置不会覆盖 |
+| SQLite / Web 控制台 / REST | 同上策略参数 | 页面保存或 `PUT /api/exchanges/{ex}/config` | 即时生效 |
 
 密钥永远不进数据库，也不进策略 YAML。
 
@@ -74,7 +74,7 @@ Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│  策略 YAML / REST API（当前无 Web 页面；控制台规划中）              │
+│  Web 控制台（embed）/ 策略 YAML / REST API                          │
 └──────────────────────────┬────────────────────────────────────┘
                 REST（同一端口，默认 0.0.0.0:8080）
 ┌──────────────────────────▼────────────────────────────────────┐
@@ -150,7 +150,8 @@ dex-grid/
 │       └── metrics/                # Prometheus
 ├── config/
 │   ├── config.example.yaml         # 密钥与运维示例（复制为 config.yaml）
-│   └── lighter-sol.yaml            # 默认 SOL 网格参数，autostart 时加载
+│   └── lighter-sol.yaml            # 可选 SOL 网格模板（需显式 strategy_file）
+├── web/                            # 控制台静态页，由 go:embed 打进二进制
 ├── docs/
 │   ├── DESIGN.md                   # 开发设计文档
 │   ├── GRID_CONFIG.md              # 网格配置文档
@@ -176,16 +177,16 @@ cp config/config.example.yaml config/config.yaml
 export LIGHTER_ACCOUNT_INDEX=12345          # Windows: $env:LIGHTER_ACCOUNT_INDEX="12345"
 export LIGHTER_API_KEY_PRIVATE_KEY=0x....
 
-# 3. 构建并运行（默认监听 0.0.0.0:8080，读 config/lighter-sol.yaml 自动开 SOL 网格）
+# 3. 构建并运行（默认不自动开网格）
 go build -o gridbot ./cmd/gridbot            # Windows: go build -o gridbot.exe ./cmd/gridbot
 ./gridbot
 
-# 4. 探活
+# 4. 打开控制台（同源 API）
+# http://127.0.0.1:8080/
 curl -s http://127.0.0.1:8080/healthz
-# 公网：curl -s http://<公网IP>:8080/healthz
 ```
 
-`config/lighter-sol.yaml` 里改区间、格数、保证金；`config.yaml` 里 `autostart: true` 即可无页面启动。IP 白名单见 `server.ip_whitelist`。Linux 部署见 [安装部署文档](docs/DEPLOYMENT.md)。
+在页面里选交易对、填区间后点「启动」。无页面部署时在 `config.yaml` 打开 `strategy_file` 与 `autostart: true`。IP 白名单见 `server.ip_whitelist`。Linux 部署见 [安装部署文档](docs/DEPLOYMENT.md)。
 
 ### 命令行参数
 
@@ -196,7 +197,7 @@ curl -s http://127.0.0.1:8080/healthz
 
 ### lighterctl：适配器验证工具
 
-没有 Web 页面时，用 `lighterctl` 直接核对账户与交易链路。所有会改变账户状态的操作都必须显式加 `-yes`，不加则只演练并打印参数。
+除控制台外，也可用 `lighterctl` 直接核对账户与交易链路。所有会改变账户状态的操作都必须显式加 `-yes`，不加则只演练并打印参数。
 
 ```bash
 go build -o lighterctl ./cmd/lighterctl
@@ -224,20 +225,22 @@ go build -o lighterctl ./cmd/lighterctl
 
 ## 6. 运行时操作
 
-当前没有 Web 页面。无控制台启动靠 `strategy_file` + `autostart`；运行中用 REST（默认 `http://127.0.0.1:8080`）：
+浏览器打开 `http://127.0.0.1:8080/`（与 API 同端口）。账户状态每秒刷新；价格/网格图默认 1 小时 K 线。页面数据始终对应当前策略交易对。
 
 | 操作 | 端点 | 行为 |
 | --- | --- | --- |
+| 控制台 | `GET /` | 静态页 |
 | 探活 | `GET /healthz` | 进程存活 |
-| 写策略 | `PUT /api/exchanges/{ex}/config` | 写入 SQLite（下次启动若有 `strategy_file` 会被 YAML 覆盖） |
+| 写策略 | `PUT /api/exchanges/{ex}/config` | 写入 SQLite |
 | 启动网格 | `POST /api/exchanges/{ex}/start` | 校验 → 建仓 → 铺网格 |
 | 停止策略 | `POST /api/exchanges/{ex}/stop` | 撤销本交易对挂单，**保留仓位** |
-| 调整区间 | `POST /api/exchanges/{ex}/adjust-range` | 增量迁移到新区间，保留有效挂单与持仓 |
+| 调整区间 | `POST /api/exchanges/{ex}/adjust-range` | 全撤重铺到新区间，不停止实例 |
 | 撤销挂单 | `POST /api/exchanges/{ex}/cancel-orders` | 只撤单，仓位不动 |
-| 补齐挂单 | `POST /api/exchanges/{ex}/refill` | 对账后补齐缺失层级 |
+| 补齐挂单 | `POST /api/exchanges/{ex}/refill` | 看门狗同款：缺补、多撤 |
 | 查看状态 | `GET /api/exchanges/{ex}/status` | 持仓、挂单、盈亏 |
+| K 线 | `GET /api/exchanges/{ex}/klines` | 默认 `interval=1h` |
 
-完整字段见 [网格配置文档](docs/GRID_CONFIG.md)。规划中的控制台原型见文首截图。
+完整字段见 [网格配置文档](docs/GRID_CONFIG.md)。成交由交易所 WebSocket 推送后立刻翻转格子并挂对手单；`reconcile_interval`（默认 15s）只做挂单缺补/多撤兜底。
 
 ---
 
@@ -278,10 +281,10 @@ GOOS=windows GOARCH=amd64 go build -o dist/gridbot.exe ./cmd/gridbot
 | **M1 骨架** | 配置加载、日志、Exchange 接口与注册表、Strategy 接口、Runner 事件循环、dry-run 执行器、假交易所 | 全链路跑通 |
 | **M2 网格算法** | 价位表生成、三方向配对逻辑、状态机、派生量纯函数 | 领域层单测覆盖 ≥ 80% |
 | **M3 Lighter 适配** | REST/WS 客户端、签名、nonce、市场元数据、下单撤单、订单与仓位订阅 | 主网真实成交，已完成 |
-| **M4 HTTP + 控制台** | REST 已可用；Web 页面按原型实现（待做） | 无页面启动网格；页面可完整操作（待做） |
+| **M4 HTTP + 控制台** | REST + embed 静态控制台 | 页面可配置/启停/看状态与 1h 价格曲线 |
 | **M5 建仓与风控** | 三种建仓模式、止盈止损、区间外策略、trailing、熔断 | 主网小资金实盘 |
 | **M6 持久化与对账** | SQLite 落盘、启动恢复、周期漂移检查、指标 | 长时间无人值守 |
-| **M7 行情分析** | K 线拉取、EMA/斜率/ATR、趋势判定、参数推荐与自动区间 | 「智能填充」可用 |
+| **M7 行情分析** | K 线已接入图表；EMA/斜率/ATR、趋势判定、参数推荐待做 | 「智能填充」可用 |
 | **M8 马丁网格** | 马丁策略实现 | 验证策略扩展性 |
 | **M9 多交易所** | 接入第二个 DEX（具体交易所待定） | 验证端口抽象 |
 

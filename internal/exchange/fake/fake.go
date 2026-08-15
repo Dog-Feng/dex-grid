@@ -103,8 +103,33 @@ func (e *Exchange) Ticker(context.Context, string) (exchange.Ticker, error) {
 	return e.tickerLocked(), nil
 }
 
-func (e *Exchange) Klines(context.Context, string, string, int) ([]market.Kline, error) {
-	return nil, nil
+func (e *Exchange) Klines(_ context.Context, _ string, _ string, limit int) ([]market.Kline, error) {
+	if limit <= 0 {
+		limit = 24
+	}
+	e.mu.Lock()
+	mark := e.markOrMidLocked()
+	e.mu.Unlock()
+	if !mark.IsPositive() {
+		mark = decimal.RequireFromString("100")
+	}
+	now := time.Now().UTC().Truncate(time.Hour)
+	step := mark.Mul(decimal.RequireFromString("0.002"))
+	out := make([]market.Kline, limit)
+	for i := 0; i < limit; i++ {
+		t := now.Add(-time.Duration(limit-1-i) * time.Hour)
+		off := decimal.NewFromInt(int64(i%7 - 3)).Mul(step)
+		px := mark.Add(off)
+		out[i] = market.Kline{
+			OpenTime: t,
+			Open:     px,
+			High:     px.Add(step),
+			Low:      px.Sub(step),
+			Close:    px,
+			Volume:   decimal.NewFromInt(1),
+		}
+	}
+	return out, nil
 }
 
 func (e *Exchange) SetLeverage(_ context.Context, _ string, leverage int, mode market.MarginMode) error {
@@ -329,6 +354,27 @@ func (e *Exchange) InjectPlaceError(err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.nextPlaceErr = err
+}
+
+// InjectOpenOrder 插入一笔已存活挂单，供看门狗「多挂」测试。
+func (e *Exchange) InjectOpenOrder(o order.Order) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cp := o
+	if cp.State == 0 {
+		cp.State = order.StateOpen
+	}
+	if cp.Symbol == "" {
+		cp.Symbol = e.mkt.Symbol
+	}
+	e.orders[o.ClientOrderID] = &cp
+}
+
+// DropOrder 静默删除一笔挂单，不发事件，模拟交易所丢单。
+func (e *Exchange) DropOrder(id order.ClientOrderID) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.orders, id)
 }
 
 // Resting 返回当前存活挂单（测试断言用）。

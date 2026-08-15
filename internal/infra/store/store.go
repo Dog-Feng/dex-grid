@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"dex-grid/internal/domain/order"
@@ -45,6 +46,7 @@ type Runtime struct {
 type Fill struct {
 	ID       int64               `json:"id"`
 	Exchange string              `json:"exchange"`
+	Symbol   string              `json:"symbol,omitempty"`
 	COID     order.ClientOrderID `json:"coid"`
 	Side     string              `json:"side"`
 	Price    string              `json:"price"`
@@ -77,6 +79,10 @@ func Open(path string) (*Store, error) {
 	}
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := s.migrateFillsSymbol(); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -126,7 +132,8 @@ CREATE TABLE IF NOT EXISTS fills (
     qty        TEXT NOT NULL,
     fee        TEXT NOT NULL,
     is_maker   INTEGER NOT NULL,
-    ts         INTEGER NOT NULL
+    ts         INTEGER NOT NULL,
+    symbol     TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_fills_ex_ts ON fills(exchange, ts DESC);
 CREATE TABLE IF NOT EXISTS stats (
@@ -137,6 +144,19 @@ CREATE TABLE IF NOT EXISTS stats (
     updated_at      INTEGER NOT NULL
 );
 `)
+	return err
+}
+
+// migrateFillsSymbol 给已有库补上成交表的交易对列。
+func (s *Store) migrateFillsSymbol() error {
+	_, err := s.db.Exec(`ALTER TABLE fills ADD COLUMN symbol TEXT NOT NULL DEFAULT ''`)
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "duplicate column") {
+			return err
+		}
+	}
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_fills_ex_symbol_ts ON fills(exchange, symbol, ts DESC)`)
 	return err
 }
 
@@ -226,24 +246,33 @@ func (s *Store) InsertFill(f Fill) error {
 		maker = 1
 	}
 	_, err := s.db.Exec(`
-INSERT INTO fills(exchange, coid, side, price, qty, fee, is_maker, ts)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-		f.Exchange, int64(f.COID), f.Side, f.Price, f.Qty, f.Fee, maker, f.Time.Unix())
+INSERT INTO fills(exchange, symbol, coid, side, price, qty, fee, is_maker, ts)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.Exchange, f.Symbol, int64(f.COID), f.Side, f.Price, f.Qty, f.Fee, maker, f.Time.Unix())
 	return err
 }
 
 // ListFills 返回重置统计时间点之后的成交，最新在前。
-func (s *Store) ListFills(exchange string, limit int) ([]Fill, error) {
+// symbol 非空时只返回该交易对的成交，对应页面「当前策略配置的交易对」。
+func (s *Store) ListFills(exchange, symbol string, limit int) ([]Fill, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	resetAt := int64(0)
 	_ = s.db.QueryRow(`SELECT reset_at FROM stats WHERE exchange=?`, exchange).Scan(&resetAt)
 
-	rows, err := s.db.Query(`
-SELECT id, exchange, coid, side, price, qty, fee, is_maker, ts
-FROM fills WHERE exchange=? AND ts>=? ORDER BY ts DESC, id DESC LIMIT ?`,
-		exchange, resetAt, limit)
+	q := `
+SELECT id, exchange, symbol, coid, side, price, qty, fee, is_maker, ts
+FROM fills WHERE exchange=? AND ts>=?`
+	args := []any{exchange, resetAt}
+	if symbol != "" {
+		q += ` AND (symbol=? OR symbol='')`
+		args = append(args, symbol)
+	}
+	q += ` ORDER BY ts DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +283,7 @@ FROM fills WHERE exchange=? AND ts>=? ORDER BY ts DESC, id DESC LIMIT ?`,
 		var coid int64
 		var maker int
 		var ts int64
-		if err := rows.Scan(&f.ID, &f.Exchange, &coid, &f.Side, &f.Price, &f.Qty, &f.Fee, &maker, &ts); err != nil {
+		if err := rows.Scan(&f.ID, &f.Exchange, &f.Symbol, &coid, &f.Side, &f.Price, &f.Qty, &f.Fee, &maker, &ts); err != nil {
 			return nil, err
 		}
 		f.COID = order.ClientOrderID(coid)

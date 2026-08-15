@@ -2,7 +2,7 @@
 
 版本：v0.2 · 适用于 Windows 10/11、Windows Server 2019+、主流 Linux 发行版
 
-程序编译为**单个可执行文件**，部署时只需要：可执行文件、`config.yaml`、密钥环境变量。HTTP 只提供 REST API，不托管前端页面。
+程序编译为**单个可执行文件**，部署时只需要：可执行文件、`config.yaml`、密钥环境变量。同一端口托管 Web 控制台与 REST API。
 
 ---
 
@@ -43,7 +43,7 @@
 | 项 | 要求 |
 | --- | --- |
 | Go | 1.25+ |
-| Node.js | 不需要（前端待定，当前不打包页面） |
+| Node.js | 不需要（控制台是静态页，构建时 `go:embed`） |
 | Git | 任意版本 |
 
 ### 时间同步
@@ -133,7 +133,7 @@ gridbot/
 ├── gridbot(.exe)          # 可执行文件
 ├── config.yaml            # 密钥与运维（从 config.example.yaml 复制）
 ├── config/
-│   └── lighter-sol.yaml   # 网格参数；config.yaml 里 strategy_file 指向它
+│   └── lighter-sol.yaml   # 可选网格模板；默认不自动加载
 ├── .env                   # 密钥（可选，见 4.2）；权限 600
 ├── data/                  # 运行时数据，程序自动创建
 │   ├── gridbot.db         # SQLite：策略配置、订单、成交、统计
@@ -186,11 +186,11 @@ exchanges:
       account_index: ${LIGHTER_ACCOUNT_INDEX}
       api_key_index: ${LIGHTER_API_KEY_INDEX}
       api_key_private_key: ${LIGHTER_API_KEY_PRIVATE_KEY}
-    strategy_file: config/lighter-sol.yaml
-    autostart: true
+    # strategy_file: config/lighter-sol.yaml
+    autostart: false
 ```
 
-密钥和监听端口在 `config.yaml`。网格区间、格数、保证金、杠杆写在 `config/lighter-sol.yaml`，`autostart: true` 时进程起来就开网格，不需要页面。
+密钥和监听端口在 `config.yaml`。网格区间、格数、保证金、杠杆在 **Web 控制台**（`http://<地址>:8080/`）配置，或写在 `config/lighter-sol.yaml` 并打开 `strategy_file` + `autostart: true`（无页面启动）。
 
 IP 白名单：把 `server.ip_whitelist.enabled` 设为 `true`，并在 `allow` 里填公网 IP 或 CIDR。本机 `127.0.0.1` / `::1` 始终可访问。
 
@@ -460,6 +460,8 @@ cd C:\gridbot
 Invoke-RestMethod http://127.0.0.1:8080/healthz
 ```
 
+浏览器打开 `http://127.0.0.1:8080/` 即控制台。
+
 前台运行时按 `Ctrl+C` 触发优雅退出（撤本交易对挂单、保留仓位），**不要直接关窗口或用任务管理器结束进程**。
 
 ### 7.4 方式一：任务计划程序（无需额外软件）
@@ -625,8 +627,9 @@ server:
 
 - [ ] `config.yaml` 中没有明文密钥
 - [ ] `.env` 或 `EnvironmentFile` 权限已收紧（600 / 640）
-- [ ] `strategy_file` 指向的 YAML 存在，区间/保证金/杠杆已核对
+- [ ] 浏览器能打开 `http://127.0.0.1:8080/` 控制台
 - [ ] 公网已打开 `ip_whitelist` 或 Bearer Token，或 `addr` 已改为 `127.0.0.1:8080`
+- [ ] 若使用无页面启动：`strategy_file` 指向的 YAML 存在，且 `autostart: true`
 - [ ] `data_dir` 与 `log_file` 路径存在且可写
 - [ ] `api_key_index` 没有和 Lighter 官方前端复用
 - [ ] `network` 是期望的值（测试阶段应为 `testnet`）

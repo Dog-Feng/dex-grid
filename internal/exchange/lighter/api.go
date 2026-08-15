@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strings"
+	"time"
 )
 
 const userAgent = "dex-grid/0.1"
@@ -241,6 +243,66 @@ func (c *restClient) sendTx(ctx context.Context, txType uint8, txInfo string, pr
 		return nil, err
 	}
 	return &out, nil
+}
+
+type apiCandle struct {
+	T int64 `json:"t"`
+	O num   `json:"o"`
+	H num   `json:"h"`
+	L num   `json:"l"`
+	C num   `json:"c"`
+	V num   `json:"v"`
+}
+
+type candlesResp struct {
+	resultCode
+	Resolution string      `json:"r"`
+	Candles    []apiCandle `json:"c"`
+}
+
+func (c *restClient) candles(ctx context.Context, marketID int, resolution string, start, end time.Time, countBack int) ([]apiCandle, error) {
+	params := url.Values{
+		"market_id":        {itoa(int64(marketID))},
+		"resolution":       {resolution},
+		"start_timestamp":  {itoa(start.UnixMilli())},
+		"end_timestamp":    {itoa(end.UnixMilli())},
+		"count_back":       {itoa(int64(countBack))},
+	}
+	var out candlesResp
+	if err := c.get(ctx, "/api/v1/candles", params, &out); err != nil {
+		return nil, err
+	}
+	return out.Candles, nil
+}
+
+func candleTime(t int64) time.Time {
+	if t >= 1_000_000_000_000 {
+		return time.UnixMilli(t).UTC()
+	}
+	return time.Unix(t, 0).UTC()
+}
+
+func normalizeResolution(interval string) (string, time.Duration, bool) {
+	switch strings.ToLower(strings.TrimSpace(interval)) {
+	case "", "1h", "60m", "60min":
+		return "1h", time.Hour, true
+	case "1m":
+		return "1m", time.Minute, true
+	case "5m":
+		return "5m", 5 * time.Minute, true
+	case "15m":
+		return "15m", 15 * time.Minute, true
+	case "30m":
+		return "30m", 30 * time.Minute, true
+	case "4h":
+		return "4h", 4 * time.Hour, true
+	case "12h":
+		return "12h", 12 * time.Hour, true
+	case "1d", "1D":
+		return "1d", 24 * time.Hour, true
+	default:
+		return "", 0, false
+	}
 }
 
 func boolStr(b bool) string {

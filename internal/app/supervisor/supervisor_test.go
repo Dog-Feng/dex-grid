@@ -133,3 +133,63 @@ entry:
 		t.Fatalf("autostart status = %s", view.Status)
 	}
 }
+
+func TestLoadStrategyFileSkipsExistingConfig(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "gridbot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	file := filepath.Join(t.TempDir(), "sol.yaml")
+	if err := os.WriteFile(file, []byte("symbol: SOL\ndirection: long\nleverage: 10\ngrid:\n  lower_price: \"72\"\n  upper_price: \"77\"\n  grid_count: 4\n  sizing_mode: per_grid_qty\n  per_grid_qty: \"1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Exchanges: []config.Exchange{{
+		Name: "fake", Enabled: true, MaxRetries: 2,
+		StrategyFile: file, Autostart: false,
+	}}}
+	sup := New(cfg, st, nil, slog.Default())
+	ex := fake.New(market.Market{
+		Symbol: "BTC", TickSize: d("0.1"), LotSize: d("0.001"),
+		MinQty: d("0.001"), MinNotional: d("10"), MaxLeverage: 50,
+		PriceDecimals: 1, SizeDecimals: 3,
+		MakerFeeRate: d("0.0002"), TakerFeeRate: d("0.0005"),
+	})
+	ex.SetBook(d("149.9"), d("150.1"))
+	ex.SetMark(d("150"))
+	sup.Attach(cfg.Exchanges[0], ex, 0)
+	t.Cleanup(func() { sup.Close(context.Background()) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	saved := []byte(`{"symbol":"BTC","direction":"neutral","leverage":5,"grid":{"lower_price":"100","upper_price":"200","grid_count":4,"sizing_mode":"per_grid_qty","per_grid_qty":"1"}}`)
+	if _, err := sup.PutConfig(ctx, "fake", saved); err != nil {
+		t.Fatal(err)
+	}
+	if err := sup.LoadStrategyFiles(ctx); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sup.GetConfig("fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["symbol"] != "BTC" {
+		t.Fatalf("saved config overwritten by strategy_file: %+v", got)
+	}
+
+	sup.Autostart(ctx)
+	view, err := sup.Status(ctx, "fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Status != engine.StatusStopped.String() {
+		t.Fatalf("autostart=false should stay stopped, got %s", view.Status)
+	}
+}

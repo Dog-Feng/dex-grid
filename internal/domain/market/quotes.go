@@ -76,12 +76,12 @@ func (e errUnknownPriceSource) Error() string {
 	return "unknown price source " + string(e)
 }
 
-// Kline 是一根 K 线，供行情分析模块使用。
+// Kline 是一根 K 线，供行情分析与价格曲线使用。
 type Kline struct {
-	OpenTime time.Time
-	Open     decimal.Decimal
-	High     decimal.Decimal
-	Low      decimal.Decimal
-	Close    decimal.Decimal
-	Volume   decimal.Decimal
+	OpenTime time.Time       `json:"open_time"`
+	Open     decimal.Decimal `json:"open"`
+	High     decimal.Decimal `json:"high"`
+	Low      decimal.Decimal `json:"low"`
+	Close    decimal.Decimal `json:"close"`
+	Volume   decimal.Decimal `json:"volume"`
 }

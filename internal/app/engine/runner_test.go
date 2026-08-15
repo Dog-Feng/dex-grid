@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"dex-grid/internal/domain/market"
+	"dex-grid/internal/domain/order"
 	"dex-grid/internal/domain/strategy"
 	"dex-grid/internal/domain/strategy/grid"
 	"dex-grid/internal/exchange/fake"
@@ -263,5 +264,45 @@ func TestManualStopKeepsPositionAndCancelsOrders(t *testing.T) {
 	pos, _ := ex.Position(context.Background(), "BTC")
 	if !pos.Size.Equal(before.Size) {
 		t.Fatalf("stop must keep position %s, got %s", before.Size, pos.Size)
+	}
+}
+
+func TestWatchdogCancelsExtraAndRefillsMissing(t *testing.T) {
+	r, ex := newRunner(t, grid.Neutral)
+	startOK(t, r, strategy.DefaultRiskParams())
+	r.Drain(context.Background())
+	if n := len(ex.Resting()); n != 4 {
+		t.Fatalf("resting = %d, want 4", n)
+	}
+
+	extra := order.MustEncode(order.Ref{Slot: 0, Epoch: 1, Cell: 0, Purpose: order.PurposeEntry, Seq: 1})
+	ex.InjectOpenOrder(order.Order{
+		ClientOrderID: extra,
+		Side:          order.Buy,
+		Price:         d("90"),
+		Quantity:      d("1"),
+		State:         order.StateOpen,
+	})
+	if n := len(ex.Resting()); n != 5 {
+		t.Fatalf("after inject resting = %d, want 5", n)
+	}
+	r.watchdog(context.Background())
+	if n := len(ex.Resting()); n != 4 {
+		t.Fatalf("watchdog should cancel extra, resting = %d", n)
+	}
+	for _, o := range ex.Resting() {
+		if o.ClientOrderID == extra {
+			t.Fatal("entry leftover should be cancelled")
+		}
+	}
+
+	drop := ex.Resting()[0].ClientOrderID
+	ex.DropOrder(drop)
+	if n := len(ex.Resting()); n != 3 {
+		t.Fatalf("after drop resting = %d, want 3", n)
+	}
+	r.watchdog(context.Background())
+	if n := len(ex.Resting()); n != 4 {
+		t.Fatalf("watchdog should refill missing, resting = %d", n)
 	}
 }

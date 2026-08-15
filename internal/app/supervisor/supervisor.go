@@ -11,6 +11,7 @@ import (
 
 	"dex-grid/internal/app/engine"
 	"dex-grid/internal/config"
+	"dex-grid/internal/domain/market"
 	"dex-grid/internal/domain/order"
 	"dex-grid/internal/domain/strategy"
 	"dex-grid/internal/domain/strategy/grid"
@@ -135,6 +136,24 @@ func (s *Supervisor) Symbols(ctx context.Context, name string) ([]exchange.Marke
 	return inst.ex.Markets(ctx)
 }
 
+// Klines 返回当前策略交易对（或指定 symbol）的 K 线。
+func (s *Supervisor) Klines(ctx context.Context, name, symbol, interval string, limit int) ([]market.Kline, error) {
+	inst, err := s.get(name)
+	if err != nil {
+		return nil, err
+	}
+	if symbol == "" {
+		symbol = s.strategySymbol(name, "")
+	}
+	if symbol == "" {
+		return nil, fmt.Errorf("必须指定交易对")
+	}
+	if interval == "" {
+		interval = "1h"
+	}
+	return inst.ex.Klines(ctx, symbol, interval, limit)
+}
+
 // Preview 校验并计算派生量，不保存。
 func (s *Supervisor) Preview(ctx context.Context, name string, raw []byte) (grid.Derived, error) {
 	inst, err := s.get(name)
@@ -242,12 +261,9 @@ func (s *Supervisor) Status(ctx context.Context, name string) (engine.InstanceVi
 	if acct, err := inst.ex.Account(ctx); err == nil {
 		view.Account = acct
 	}
-	symbol := view.Symbol
-	if symbol == "" {
-		if c, ok, err := s.store.LoadConfig(name); err == nil && ok {
-			symbol = c.Symbol
-			view.Symbol = symbol
-		}
+	symbol := s.strategySymbol(name, view.Symbol)
+	if symbol != "" {
+		view.Symbol = symbol
 	}
 	if symbol == "" {
 		return view, nil
@@ -259,7 +275,8 @@ func (s *Supervisor) Status(ctx context.Context, name string) (engine.InstanceVi
 			view.Mark = tick.Book.Mid()
 		}
 	}
-	if view.Status == engine.StatusStopped.String() || view.Status == engine.StatusError.String() {
+	needPos := view.Status == engine.StatusStopped.String() || view.Status == engine.StatusError.String() || view.Position.Symbol != symbol
+	if needPos {
 		if pos, err := inst.ex.Position(ctx, symbol); err == nil {
 			view.Position = pos
 			view.Residual = !pos.IsFlat()
@@ -278,12 +295,27 @@ func (s *Supervisor) Proxy() map[string]any {
 	}
 }
 
-// Trades 返回成交记录。
+// Trades 返回当前策略交易对的成交记录。
 func (s *Supervisor) Trades(name string, limit int) ([]store.Fill, error) {
 	if _, err := s.get(name); err != nil {
 		return nil, err
 	}
-	return s.store.ListFills(name, limit)
+	symbol := ""
+	if view, err := s.View(name); err == nil {
+		symbol = view.Symbol
+	}
+	symbol = s.strategySymbol(name, symbol)
+	return s.store.ListFills(name, symbol, limit)
+}
+
+func (s *Supervisor) strategySymbol(name, fallback string) string {
+	if fallback != "" {
+		return fallback
+	}
+	if c, ok, err := s.store.LoadConfig(name); err == nil && ok {
+		return c.Symbol
+	}
+	return ""
 }
 
 // Logs 返回环形缓冲里的日志。
@@ -402,12 +434,13 @@ func (s *Supervisor) ensureRunner(inst *instance, params []byte, restore bool) e
 		}
 	}
 	inst.runner = engine.New(inst.ex, strat, engine.Config{
-		Name:         inst.name,
-		Slot:         inst.slot,
-		TickInterval: s.cfg.App.TickInterval.Std(),
-		MaxRetries:   inst.exCfg.MaxRetries,
-		Log:          s.log,
-		Persist:      persistAdapter{store: s.store},
+		Name:             inst.name,
+		Slot:             inst.slot,
+		TickInterval:     s.cfg.App.TickInterval.Std(),
+		WatchdogInterval: s.cfg.App.ReconcileInterval.Std(),
+		MaxRetries:       inst.exCfg.MaxRetries,
+		Log:              s.log,
+		Persist:          persistAdapter{store: s.store},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	inst.cancel = cancel
@@ -416,9 +449,17 @@ func (s *Supervisor) ensureRunner(inst *instance, params []byte, restore bool) e
 }
 
 // LoadStrategyFiles 把各交易所 strategy_file 写入 SQLite。必须在实例未运行时调用。
+//
+// 仅在该交易所还没有已保存策略时作为初始模板；页面/API 已写入的配置不会被覆盖。
 func (s *Supervisor) LoadStrategyFiles(ctx context.Context) error {
 	for _, e := range s.cfg.EnabledExchanges() {
 		if e.StrategyFile == "" {
+			continue
+		}
+		if _, ok, err := s.store.LoadConfig(e.Name); err != nil {
+			return fmt.Errorf("交易所 %s: 读取已保存配置失败: %w", e.Name, err)
+		} else if ok {
+			s.log.Info("strategy file skipped, saved config exists", "exchange", e.Name, "file", e.StrategyFile)
 			continue
 		}
 		path := config.ResolvePath(e.StrategyFile)
@@ -518,6 +559,7 @@ func (p persistAdapter) RecordFill(exchange string, o order.Order) error {
 	}
 	return p.store.InsertFill(store.Fill{
 		Exchange: exchange,
+		Symbol:   o.Symbol,
 		COID:     o.ClientOrderID,
 		Side:     o.Side.String(),
 		Price:    o.AvgFillPrice.String(),

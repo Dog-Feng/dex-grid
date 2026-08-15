@@ -20,12 +20,13 @@ import (
 
 // Config 是 Runner 的构造参数。
 type Config struct {
-	Name         string
-	Slot         uint8
-	TickInterval time.Duration
-	MaxRetries   int
-	Log          *slog.Logger
-	Persist      Persist
+	Name             string
+	Slot             uint8
+	TickInterval     time.Duration
+	WatchdogInterval time.Duration // 运行中对照交易所挂单：缺补、多撤。0 = 15s
+	MaxRetries       int
+	Log              *slog.Logger
+	Persist          Persist
 }
 
 // Runner 驱动一个交易所上的一个网格实例。
@@ -52,16 +53,20 @@ type Runner struct {
 	stream       <-chan exchange.StreamEvent
 	streamCancel context.CancelFunc
 
-	entering bool
-	entryP   strategy.EntryParams
-	riskP    strategy.RiskParams
-	stopping bool
+	entering     bool
+	entryP       strategy.EntryParams
+	riskP        strategy.RiskParams
+	stopping     bool
+	lastWatchdog time.Time
 }
 
 // New 构造一个处于 Stopped 的 Runner。调用 Run 或 Do 之后才开始工作。
 func New(ex exchange.StreamingExchange, strat strategy.Strategy, cfg Config) *Runner {
 	if cfg.TickInterval <= 0 {
 		cfg.TickInterval = time.Second
+	}
+	if cfg.WatchdogInterval <= 0 {
+		cfg.WatchdogInterval = 15 * time.Second
 	}
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = 3
@@ -111,6 +116,9 @@ func (r *Runner) Run(ctx context.Context) error {
 		case t := <-ticker.C:
 			if r.status == StatusRunning || r.status == StatusStarting || r.status == StatusPaused {
 				r.dispatch(ctx, strategy.TickEvent{Now: t})
+			}
+			if r.status == StatusRunning && !r.entering {
+				r.maybeWatchdog(ctx, t)
 			}
 		}
 	}
@@ -549,6 +557,86 @@ func (r *Runner) resubscribe(ctx context.Context) error {
 		return err
 	}
 	return r.reconcile(ctx)
+}
+
+func (r *Runner) maybeWatchdog(ctx context.Context, now time.Time) {
+	if r.cfg.WatchdogInterval <= 0 {
+		return
+	}
+	if !r.lastWatchdog.IsZero() && now.Sub(r.lastWatchdog) < r.cfg.WatchdogInterval {
+		return
+	}
+	r.lastWatchdog = now
+	r.watchdog(ctx)
+}
+
+// watchdog 对照交易所真实挂单：本实例多余的撤掉，缺失的格子补挂。
+// 只动本 slot 且属于当前交易对的订单；解不出 COID 的手工单不动。
+func (r *Runner) watchdog(ctx context.Context) {
+	if r.symbol == "" || r.exec == nil || r.entering {
+		return
+	}
+	orders, err := r.ex.OpenOrders(ctx, r.symbol)
+	if err != nil {
+		r.log.Warn("watchdog open orders failed", "err", err)
+		return
+	}
+	pos, err := r.ex.Position(ctx, r.symbol)
+	if err != nil {
+		r.log.Warn("watchdog position failed", "err", err)
+		return
+	}
+	acct, err := r.ex.Account(ctx)
+	if err != nil {
+		r.log.Warn("watchdog account failed", "err", err)
+		return
+	}
+
+	cells := r.strat.View().GridCount
+	var cancels []strategy.Action
+	var ours []order.Order
+	seen := map[uint16]bool{}
+	for _, o := range orders {
+		if !o.ClientOrderID.Valid() {
+			continue
+		}
+		ref := o.ClientOrderID.Decode()
+		if ref.Slot != r.cfg.Slot {
+			continue
+		}
+		extra := r.epoch > 0 && ref.Epoch != r.epoch
+		switch ref.Purpose {
+		case order.PurposeEntry:
+			extra = true // 网格运行中不允许残留建仓单
+		case order.PurposeOpen, order.PurposeClose:
+			if int(ref.Cell) >= cells {
+				extra = true
+			} else if seen[ref.Cell] {
+				extra = true
+			} else {
+				seen[ref.Cell] = true
+			}
+		default:
+			extra = true
+		}
+		if extra {
+			cancels = append(cancels, strategy.CancelOrder{ClientOrderID: o.ClientOrderID})
+			continue
+		}
+		ours = append(ours, o)
+	}
+	if len(cancels) > 0 {
+		r.log.Info("watchdog cancel extras", "n", len(cancels))
+		r.execApplyQuiet(ctx, cancels)
+	}
+	r.state.Position = pos
+	r.state.Account = acct
+	r.dispatch(ctx, strategy.ResyncEvent{
+		Position: pos,
+		Account:  acct,
+		Orders:   ours,
+		Now:      time.Now().UTC(),
+	})
 }
 
 func (r *Runner) reconcile(ctx context.Context) error {

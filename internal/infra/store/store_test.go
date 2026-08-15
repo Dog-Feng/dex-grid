@@ -46,17 +46,25 @@ func TestConfigAndRuntimeRoundTrip(t *testing.T) {
 func TestFillsRespectResetAt(t *testing.T) {
 	s := openTemp(t)
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	_ = s.InsertFill(Fill{Exchange: "lighter", COID: 1, Side: "buy", Price: "100", Qty: "1", Fee: "0", Time: t0})
-	_ = s.InsertFill(Fill{Exchange: "lighter", COID: 2, Side: "sell", Price: "110", Qty: "1", Fee: "0", Time: t0.Add(time.Hour)})
+	_ = s.InsertFill(Fill{Exchange: "lighter", Symbol: "SOL", COID: 1, Side: "buy", Price: "100", Qty: "1", Fee: "0", Time: t0})
+	_ = s.InsertFill(Fill{Exchange: "lighter", Symbol: "SOL", COID: 2, Side: "sell", Price: "110", Qty: "1", Fee: "0", Time: t0.Add(time.Hour)})
+	_ = s.InsertFill(Fill{Exchange: "lighter", Symbol: "BTC", COID: 3, Side: "buy", Price: "90", Qty: "1", Fee: "0", Time: t0.Add(2 * time.Hour)})
 	if err := s.ResetStats("lighter", t0.Add(30*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	fills, err := s.ListFills("lighter", 10)
+	fills, err := s.ListFills("lighter", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(fills) != 1 || fills[0].COID != order.ClientOrderID(2) {
-		t.Fatalf("after reset got %+v", fills)
+	if len(fills) != 2 {
+		t.Fatalf("after reset without symbol filter got %+v", fills)
+	}
+	sol, err := s.ListFills("lighter", "SOL", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sol) != 1 || sol[0].COID != order.ClientOrderID(2) || sol[0].Symbol != "SOL" {
+		t.Fatalf("SOL fills after reset got %+v", sol)
 	}
 }
 
