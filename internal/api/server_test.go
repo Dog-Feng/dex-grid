@@ -168,3 +168,27 @@ func TestStartRequiresConfig(t *testing.T) {
 		t.Fatalf("start without config: %d %+v", code, env)
 	}
 }
+
+func TestIPWhitelist(t *testing.T) {
+	s, _ := setupAPI(t)
+	s.cfg.IPWhitelist.Enabled = true
+	s.cfg.IPWhitelist.Allow = []string{"203.0.113.10", "10.0.0.0/8"}
+	h := s.Handler()
+
+	assertHealth := func(remote string, want int) {
+		t.Helper()
+		req := httptest.NewRequest("GET", "/healthz", nil)
+		req.RemoteAddr = remote
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Fatalf("remote %s: status = %d, want %d", remote, rec.Code, want)
+		}
+	}
+
+	assertHealth("127.0.0.1:1234", 200)
+	assertHealth("[::1]:1234", 200)
+	assertHealth("203.0.113.10:9", 200)
+	assertHealth("10.1.2.3:9", 200)
+	assertHealth("198.51.100.1:9", 403)
+}

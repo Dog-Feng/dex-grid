@@ -105,7 +105,11 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if err := sup.LoadStrategyFiles(ctx); err != nil {
+		return err
+	}
 	sup.RestoreRunning(ctx)
+	sup.Autostart(ctx)
 
 	srv := api.New(sup, cfg.Server)
 	errCh := make(chan error, 1)

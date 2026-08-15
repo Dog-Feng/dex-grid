@@ -1,0 +1,39 @@
+# Lighter SOL 永续网格参数。不含密钥。
+#
+# 在 config.yaml 里挂上：
+#   exchanges:
+#     - name: lighter
+#       strategy_file: config/lighter-sol.yaml
+#       autostart: true
+# 进程启动后会写入 SQLite 并自动开网格，不需要 Web 页面。
+#
+# 价格/数量/金额用字符串，避免 YAML 解析成 float。
+# 未列出的字段用系统默认：逐仓、等差、Maker 跟价、区间外暂停、停止时撤单留仓。
+
+symbol: SOL
+direction: long          # long | short | neutral
+leverage: 10
+margin_mode: isolated
+preset: stable
+
+grid:
+  lower_price: "72"
+  upper_price: "77"
+  grid_count: 25
+  spacing_mode: arithmetic
+  sizing_mode: margin      # 按总保证金分配每格数量
+  margin: "1000"
+  qty_mode: equal_notional
+  trailing_up: false
+  trailing_down: false
+  max_active_orders: 0     # 0 = 全挂
+
+entry:
+  mode: maker_follow
+  timeout: 5m
+  on_timeout: market
+
+risk:
+  out_of_range: pause
+  price_source: mark
+  close_on_stop: false

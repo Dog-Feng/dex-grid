@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -30,12 +31,12 @@ type Server struct {
 func New(sup *supervisor.Supervisor, cfg config.Server) *Server {
 	s := &Server{sup: sup, cfg: cfg, mux: http.NewServeMux()}
 	s.routes()
-	s.http = &http.Server{Addr: cfg.Addr, Handler: s.withAuth(s.mux)}
+	s.http = &http.Server{Addr: cfg.Addr, Handler: s.withAccess(s.mux)}
 	return s
 }
 
 // Handler 返回已包装鉴权的 handler，供 httptest 使用。
-func (s *Server) Handler() http.Handler { return s.withAuth(s.mux) }
+func (s *Server) Handler() http.Handler { return s.withAccess(s.mux) }
 
 // ListenAndServe 阻塞服务。
 func (s *Server) ListenAndServe() error { return s.http.ListenAndServe() }
@@ -65,6 +66,22 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/proxy", s.handleProxy)
 }
 
+func (s *Server) withAccess(next http.Handler) http.Handler {
+	return s.withIPWhitelist(s.withAuth(next))
+}
+
+func (s *Server) withIPWhitelist(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.cfg.IPWhitelist.Enabled {
+			ip := clientIP(r)
+			if !ipAllowed(ip, s.cfg.IPWhitelist.Allow) {
+				writeError(w, http.StatusForbidden, "FORBIDDEN", "来源 IP 不在白名单", "")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.Auth.Enabled && strings.HasPrefix(r.URL.Path, "/api/") {
@@ -292,4 +309,38 @@ func writeErr(w http.ResponseWriter, err error) {
 		status, code = http.StatusConflict, "NOT_READY"
 	}
 	writeError(w, status, code, msg, "")
+}
+
+func clientIP(r *http.Request) net.IP {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return net.ParseIP(host)
+}
+
+func ipAllowed(ip net.IP, allow []string) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	for _, raw := range allow {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if strings.Contains(raw, "/") {
+			_, n, err := net.ParseCIDR(raw)
+			if err == nil && n.Contains(ip) {
+				return true
+			}
+			continue
+		}
+		if parsed := net.ParseIP(raw); parsed != nil && parsed.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }

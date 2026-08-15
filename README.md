@@ -2,9 +2,9 @@
 
 面向 Web3 永续合约 DEX 的**多交易所网格交易系统**。
 
-Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运行。策略参数经 REST API 写入 SQLite，`config.yaml` 只保存各 DEX 的密钥与运维参数。前端页面待定。
+Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运行。网格参数写在 `config/lighter-sol.yaml` 这类策略文件里，进程启动即可开网格，不需要 Web 页面。`config.yaml` 只保存各 DEX 的密钥、监听端口与 IP 白名单。也可用 REST API 改策略。前端页面待定。
 
-![控制台原型](docs/images/ui-prototype.png)
+![控制台原型（规划中）](docs/images/ui-prototype.png)
 
 ---
 
@@ -25,19 +25,19 @@ Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运
 这是贯穿全系统的最重要约束：
 
 - 每个交易所**同时只运行一个网格实例**（Lighter 就只有一个 Lighter 实例）
-- 一个实例在同一时刻只跑**一个永续合约交易对、一套策略**
-- 页面上一个交易所对应一个 Tab，Tab 内是这个实例的全部配置与状态
+- 一个实例同一时刻只跑**一个永续合约交易对、一套策略**（YAML 或 REST）
 
 带来的简化：交易所连接与实例一一对应，无需并发下单，nonce 天然串行，`ClientOrderID` 里不需要实例槽位，状态存储不需要实例维度的分片。**这个约束换来了整个系统复杂度的大幅下降，不要轻易打破它。**
 
-### 配置的两个来源
+### 配置来源
 
 | 来源 | 内容 | 变更方式 | 生效方式 |
 | --- | --- | --- | --- |
-| `config.yaml` | 各 DEX 的密钥、网络、代理、限流、日志、监听端口 | 手工编辑文件 | 重启进程 |
-| SQLite（页面下发） | 交易对、网格类型、区间、格数、每格数量、杠杆、风控、区间外策略 | Web 控制台表单 | 即时生效，无需重启 |
+| `config.yaml` | 各 DEX 的密钥、网络、代理、限流、日志、监听端口、IP 白名单、`strategy_file` / `autostart` | 手工编辑文件 | 重启进程 |
+| 策略 YAML（如 `config/lighter-sol.yaml`） | 交易对、网格类型、区间、格数、保证金、杠杆、风控 | 手工编辑文件 | 启动时写入 SQLite；`autostart: true` 则自动开网格 |
+| SQLite / REST API | 同上策略参数 | `PUT /api/exchanges/{ex}/config` | 即时生效；下次启动若配置了 `strategy_file` 会被 YAML 覆盖 |
 
-密钥永远不进数据库，策略参数永远不进 YAML。
+密钥永远不进数据库，也不进策略 YAML。
 
 ---
 
@@ -45,13 +45,13 @@ Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运
 
 | 交易所 | 阶段 | 状态 |
 | --- | --- | --- |
-| Lighter (zkLighter) | 第一阶段 | 规划中 |
+| Lighter (zkLighter) | 第一阶段 | 已接入，可主网实盘 |
 
-后续接入哪些 DEX 待定。架构上新增一个交易所只需实现 `exchange.Exchange` 接口并在 `main.go` 追加一行注册，前端 Tab 由 `/api/exchanges` 返回的能力驱动，不写死。
+后续接入哪些 DEX 待定。架构上新增一个交易所只需实现 `exchange.Exchange` 接口并在 `main.go` 追加一行注册。
 
 | 策略 | 标的 | 方向 | 阶段 | 状态 |
 | --- | --- | --- | --- | --- |
-| 普通合约网格 | 永续合约 | 做多 / 做空 / 中性 | 第一阶段 | 规划中 |
+| 普通合约网格 | 永续合约 | 做多 / 做空 / 中性 | 第一阶段 | 已实现 |
 | 马丁合约网格 | 永续合约 | 做多 / 做空 | 第二阶段 | 未开始 |
 
 **不支持现货网格**，这是明确的设计边界而不是待办项。
@@ -74,12 +74,11 @@ Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│  Web 控制台（静态资源 embed 进二进制）                            │
-│  总览 · Lighter · （后续 DEX 动态追加） · IP 配置                 │
+│  策略 YAML / REST API（当前无 Web 页面；控制台规划中）              │
 └──────────────────────────┬────────────────────────────────────┘
-                REST + WebSocket（同一端口）
+                REST（同一端口，默认 0.0.0.0:8080）
 ┌──────────────────────────▼────────────────────────────────────┐
-│  api  HTTP 层：路由 · 参数校验 · 命令下发 · 实时推送               │
+│  api  HTTP 层：路由 · 参数校验 · 命令下发 · IP 白名单               │
 └──────────────────────────┬────────────────────────────────────┘
               命令 channel（阻塞等回执，保证单线程模型）
 ┌──────────────────────────▼────────────────────────────────────┐
@@ -107,7 +106,7 @@ Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运
 
 **策略输出意图而非直接下单。** 策略处理事件后返回一组 `Action`（下单 / 撤单 / 平仓 / 停止），由 `Executor` 翻译成交易所调用。策略因此 100% 可单测，交易所差异全部收敛在适配器。
 
-**HTTP 请求不直接碰状态。** 页面点「启动」「调整区间」「补齐挂单」时，API 把命令投进 Runner 的事件 channel 并等待回执。Runner 仍然是单 goroutine 顺序处理，HTTP 的并发不会破坏领域状态的一致性。
+**HTTP 请求不直接碰状态。** `POST /start`、`/stop`、`/adjust-range` 等把命令投进 Runner 的事件 channel 并等待回执。Runner 仍然是单 goroutine 顺序处理，HTTP 的并发不会破坏领域状态的一致性。
 
 详见 [开发设计文档](docs/DESIGN.md)。
 
@@ -146,13 +145,12 @@ dex-grid/
 │   │   └── lighter/                # Lighter 适配器（REST + WS + 签名）
 │   └── infra/
 │       ├── store/                  # SQLite：策略配置、订单、成交、统计
-│       ├── logx/                   # slog + 内存环形缓冲（供页面日志面板）
+│       ├── logx/                   # slog + 内存环形缓冲
 │       ├── proxy/                  # HTTP/SOCKS5 代理与连通性探测
 │       └── metrics/                # Prometheus
-├── web/                            # 前端源码与构建产物（go:embed 打包）
-│   ├── src/
-│   └── dist/
-├── config/config.example.yaml
+├── config/
+│   ├── config.example.yaml         # 密钥与运维示例（复制为 config.yaml）
+│   └── lighter-sol.yaml            # 默认 SOL 网格参数，autostart 时加载
 ├── docs/
 │   ├── DESIGN.md                   # 开发设计文档
 │   ├── GRID_CONFIG.md              # 网格配置文档
@@ -178,7 +176,7 @@ cp config/config.example.yaml config/config.yaml
 export LIGHTER_ACCOUNT_INDEX=12345          # Windows: $env:LIGHTER_ACCOUNT_INDEX="12345"
 export LIGHTER_API_KEY_PRIVATE_KEY=0x....
 
-# 3. 构建并运行（默认监听 0.0.0.0:8080，无需 -config）
+# 3. 构建并运行（默认监听 0.0.0.0:8080，读 config/lighter-sol.yaml 自动开 SOL 网格）
 go build -o gridbot ./cmd/gridbot            # Windows: go build -o gridbot.exe ./cmd/gridbot
 ./gridbot
 
@@ -187,7 +185,7 @@ curl -s http://127.0.0.1:8080/healthz
 # 公网：curl -s http://<公网IP>:8080/healthz
 ```
 
-策略参数通过 REST API 写入 SQLite，不需要改 `config.yaml`。Linux 公网部署见 [安装部署文档](docs/DEPLOYMENT.md)。
+`config/lighter-sol.yaml` 里改区间、格数、保证金；`config.yaml` 里 `autostart: true` 即可无页面启动。IP 白名单见 `server.ip_whitelist`。Linux 部署见 [安装部署文档](docs/DEPLOYMENT.md)。
 
 ### 命令行参数
 
@@ -198,7 +196,7 @@ curl -s http://127.0.0.1:8080/healthz
 
 ### lighterctl：适配器验证工具
 
-控制台还没实现之前，用 `lighterctl` 直接核对账户与交易链路。所有会改变账户状态的操作都必须显式加 `-yes`，不加则只演练并打印参数。
+没有 Web 页面时，用 `lighterctl` 直接核对账户与交易链路。所有会改变账户状态的操作都必须显式加 `-yes`，不加则只演练并打印参数。
 
 ```bash
 go build -o lighterctl ./cmd/lighterctl
@@ -224,49 +222,32 @@ go build -o lighterctl ./cmd/lighterctl
 
 ---
 
-## 6. 控制台功能
+## 6. 运行时操作
 
-按原型图，每个交易所 Tab 包含四个区域：
+当前没有 Web 页面。无控制台启动靠 `strategy_file` + `autostart`；运行中用 REST（默认 `http://127.0.0.1:8080`）：
 
-### 市场与趋势（左上）
+| 操作 | 端点 | 行为 |
+| --- | --- | --- |
+| 探活 | `GET /healthz` | 进程存活 |
+| 写策略 | `PUT /api/exchanges/{ex}/config` | 写入 SQLite（下次启动若有 `strategy_file` 会被 YAML 覆盖） |
+| 启动网格 | `POST /api/exchanges/{ex}/start` | 校验 → 建仓 → 铺网格 |
+| 停止策略 | `POST /api/exchanges/{ex}/stop` | 撤销本交易对挂单，**保留仓位** |
+| 调整区间 | `POST /api/exchanges/{ex}/adjust-range` | 增量迁移到新区间，保留有效挂单与持仓 |
+| 撤销挂单 | `POST /api/exchanges/{ex}/cancel-orders` | 只撤单，仓位不动 |
+| 补齐挂单 | `POST /api/exchanges/{ex}/refill` | 对账后补齐缺失层级 |
+| 查看状态 | `GET /api/exchanges/{ex}/status` | 持仓、挂单、盈亏 |
 
-选择交易对与 K 线周期，展示趋势分析：EMA 快慢线差值、回归斜率、ATR 波动率，输出「震荡 / 上涨 / 下跌」判定与推荐策略及强度。一键「采用推荐策略 + 自动区间」把分析结果填进策略表单。
-
-分析模块会给出一条硬约束提示：**单格间距必须能覆盖双边手续费**，否则网格越跑越亏。
-
-### 策略配置（左下）
-
-网格类型（中性 / 做多 / 做空）、风格预设（稳健 / 激进 / 成交少更安全）、上下边界、网格数量、每格数量、杠杆、区间外策略。表单下方实时显示派生量：单格间距与百分比、每格毛利、名义敞口、约需保证金。
-
-运行时操作按钮：
-
-| 按钮 | 行为 |
-| --- | --- |
-| 启动网格 | 校验 → 建仓 → 铺网格 |
-| 停止策略 | 撤销本交易对挂单，**保留仓位** |
-| 调整区间（不停止网格） | 增量迁移到新区间，保留有效挂单与持仓 |
-| 撤销所有挂单（保留持仓） | 只撤单，仓位不动，用于临时避险 |
-| 补齐网格挂单（一键补格） | 对账后补齐缺失层级，用于挂单被交易所清理后恢复 |
-
-### 账户状态（右上）
-
-运行状态、持仓与均价、最新价、强平价、账户余额与权益、已实现/未实现盈亏、总盈亏与收益率、挂单数与完成格数（含「挂单目标 / 已确认 / 待重试」三个计数，直观反映铺单进度）。
-
-另有「重置统计」（盈亏与成交计数清零，不动挂单持仓）与「重连交易所」（重建连接，不动挂单持仓）。
-
-### 图表 / 成交记录 / 运行日志（右下）
-
-价格走势叠加网格线，成交记录表，实时滚动日志。三者都通过 WebSocket 推送，无需轮询。
+完整字段见 [网格配置文档](docs/GRID_CONFIG.md)。规划中的控制台原型见文首截图。
 
 ---
 
 ## 7. 运行时行为约定
 
-1. **单实例单 goroutine**：一个交易所实例的所有事件（行情、成交回报、定时器、页面命令）在同一 goroutine 顺序处理，领域状态无锁。
+1. **单实例单 goroutine**：一个交易所实例的所有事件（行情、成交回报、定时器、HTTP 命令）在同一 goroutine 顺序处理，领域状态无锁。
 2. **命令走 channel**：HTTP handler 不直接改状态，投递命令并等回执，超时返回 504。
 3. **意图幂等**：每笔订单携带确定性 `ClientOrderID`（编码交易所槽位 + 轮次 + 层级 + 用途 + 重挂序号），重放安全。
 4. **启动先对账**：恢复运行前先拉交易所真实挂单与仓位比对，撤孤儿单、补缺失单。
-5. **失败不静默**：错误按类型分流（可重试 / 参数错 / 保证金不足 / post-only 被拒），连续失败达阈值则熔断并在页面告警。
+5. **失败不静默**：错误按类型分流（可重试 / 参数错 / 保证金不足 / post-only 被拒），连续失败达阈值则熔断并写日志。
 6. **停止只撤单**：停策略或关进程一律「撤销本交易对挂单 → 保留仓位 → 落盘终态」。仅止盈/止损会市价平仓。
 7. **精度先规整后发送**：价格按 `tick_size`、数量按 `lot_size` 规整，规整后为 0 直接丢弃并告警。
 
@@ -277,7 +258,7 @@ go build -o lighterctl ./cmd/lighterctl
 | 项 | 做法 |
 | --- | --- |
 | 编译 | 纯 Go，**无 CGO**（SQLite 用 `modernc.org/sqlite`），可直接交叉编译 |
-| 产物 | 前端 `dist` 通过 `go:embed` 打进二进制，部署只需一个可执行文件 + 一个 yaml |
+| 产物 | 纯 Go 静态二进制，部署只需可执行文件 + `config.yaml` + 策略 YAML |
 | 路径 | 一律 `filepath.Join`，不硬编码分隔符；数据目录支持相对与绝对路径 |
 | 服务化 | Linux 用 systemd，Windows 用计划任务或 NSSM，脚本都在 `scripts/` |
 | 换行 | 仓库 `.gitattributes` 统一 LF，脚本按平台区分 `.sh` / `.ps1` |
@@ -297,14 +278,14 @@ GOOS=windows GOARCH=amd64 go build -o dist/gridbot.exe ./cmd/gridbot
 | **M1 骨架** | 配置加载、日志、Exchange 接口与注册表、Strategy 接口、Runner 事件循环、dry-run 执行器、假交易所 | 全链路跑通 |
 | **M2 网格算法** | 价位表生成、三方向配对逻辑、状态机、派生量纯函数 | 领域层单测覆盖 ≥ 80% |
 | **M3 Lighter 适配** | REST/WS 客户端、签名、nonce、市场元数据、下单撤单、订单与仓位订阅 | 主网真实成交，已完成 |
-| **M4 HTTP + 控制台** | REST 端点、WebSocket 推送、前端页面按原型实现、embed 打包 | 页面可完整操作 |
+| **M4 HTTP + 控制台** | REST 已可用；Web 页面按原型实现（待做） | 无页面启动网格；页面可完整操作（待做） |
 | **M5 建仓与风控** | 三种建仓模式、止盈止损、区间外策略、trailing、熔断 | 主网小资金实盘 |
 | **M6 持久化与对账** | SQLite 落盘、启动恢复、周期漂移检查、指标 | 长时间无人值守 |
 | **M7 行情分析** | K 线拉取、EMA/斜率/ATR、趋势判定、参数推荐与自动区间 | 「智能填充」可用 |
 | **M8 马丁网格** | 马丁策略实现 | 验证策略扩展性 |
 | **M9 多交易所** | 接入第二个 DEX（具体交易所待定） | 验证端口抽象 |
 
-**扩展性验收标准**：新增交易所只允许改 `internal/exchange/<name>/` 与 `main.go` 一行注册，外加前端加一个 Tab 配置项；新增策略只允许改 `internal/domain/strategy/<name>/` 与配置结构体。若必须改 `app` 层，说明抽象有缺陷，先修抽象。
+**扩展性验收标准**：新增交易所只允许改 `internal/exchange/<name>/` 与 `main.go` 一行注册；新增策略只允许改 `internal/domain/strategy/<name>/` 与配置结构体。若必须改 `app` 层，说明抽象有缺陷，先修抽象。
 
 ---
 
@@ -316,12 +297,12 @@ GOOS=windows GOARCH=amd64 go build -o dist/gridbot.exe ./cmd/gridbot
 - 实盘从最小资金开始，**必须配置止损价**（区间外策略默认只是挂起等待回归，本身不构成保护）
 - 使用逐仓模式，控制单实例风险敞口
 - 密钥只通过环境变量注入，永远不提交到 Git
-- 默认监听 `0.0.0.0:8080` 且无鉴权，公网可直接调用启动/停止等 API；不需要对外时改成 `127.0.0.1:8080`
+- 默认监听 `0.0.0.0:8080` 且无鉴权。公网部署请打开 `server.ip_whitelist` 或 Bearer Token，或不需要对外时改成 `127.0.0.1:8080`
 
 ---
 
 ## 11. 相关文档
 
 - [开发设计文档 docs/DESIGN.md](docs/DESIGN.md) —— 分层职责、核心接口、网格算法、事件与命令流、API 契约、Lighter 适配、测试策略
-- [网格配置文档 docs/GRID_CONFIG.md](docs/GRID_CONFIG.md) —— `config.yaml` 字段、页面策略参数、派生量公式、校验规则
+- [网格配置文档 docs/GRID_CONFIG.md](docs/GRID_CONFIG.md) —— `config.yaml`、策略 YAML、REST 字段、派生量公式、校验规则
 - [安装部署文档 docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) —— Windows / Linux 安装、服务化、代理、升级、备份、排错

@@ -1,6 +1,6 @@
 # dex-grid 开发设计文档
 
-版本：v0.2（第一阶段：Lighter + 普通合约网格 + Web 控制台）
+版本：v0.2（第一阶段：Lighter + 普通合约网格。当前无 Web 页面，策略 YAML / REST 启动；控制台规划中）
 
 本文描述分层职责、核心抽象、网格算法、事件与命令流、HTTP API 契约、Lighter 适配细节与工程约定。配置字段规范见 [GRID_CONFIG.md](GRID_CONFIG.md)，部署见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
@@ -77,7 +77,7 @@ Lighter 主网的实际分布：235 个市场 = 227 个永续 + 8 个现货（`E
 | **单线程状态** | 行情、回报、定时器、页面命令全走同一个 goroutine，领域状态无锁 |
 | **能力协商** | 交易所差异用 `Capabilities` 描述，上层按能力降级 |
 | **确定性幂等** | `ClientOrderID` 由 (交易所, 轮次, 层级, 用途, 序号) 确定性计算 |
-| **配置双源** | 凭证/运维在 `config.yaml`（重启生效），策略参数在 SQLite（页面下发，即时生效） |
+| **配置双源** | 凭证/运维在 `config.yaml`（重启生效）；策略参数可写在 `strategy_file`（启动时加载）或经 REST 写入 SQLite | |
 | **不过度设计** | 只抽象 `Exchange` 与 `Strategy` 两个端口（两者都确定有多实现）；日志直接用 `*slog.Logger`，不包接口；不引入 DI 容器、ORM、事件总线 |
 
 ---
@@ -85,7 +85,7 @@ Lighter 主网的实际分布：235 个市场 = 227 个永续 + 8 个现货（`E
 ## 2. 分层与依赖
 
 ```
-   web/  前端（embed 进二进制）
+   策略 YAML / REST（Web 控制台规划中，当前不 embed 前端）
         │  REST + WebSocket
    ┌────▼──────────────────────────────────────────┐
    │ api    路由 · DTO 校验 · 命令下发 · 实时推送      │
@@ -1097,11 +1097,11 @@ const (
 | --- | --- |
 | CGO | **必须 `CGO_ENABLED=0`**。SQLite 用 `modernc.org/sqlite`，不用 `mattn/go-sqlite3` |
 | 路径 | 一律 `filepath.Join`；数据目录同时支持相对与绝对路径，相对路径基于可执行文件所在目录而非工作目录（Windows 服务的工作目录常常不是安装目录） |
-| 前端资源 | `go:embed web/dist` 打进二进制，部署只需一个可执行文件 |
+| 前端资源 | 当前不 embed 页面；HTTP 只提供 REST。规划中的控制台再 `go:embed` |
 | 换行 | `.gitattributes` 统一 LF；`*.ps1`、`*.bat` 标记为 CRLF |
 | 信号 | `signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)`；`syscall.SIGTERM` 在 Windows 上也有定义，同一份代码即可 |
 | 文件锁 | 用 `data/gridbot.lock`（`O_CREATE\|O_EXCL`）防止同一数据目录被两个进程打开 —— 这会导致 nonce 冲突和重复下单 |
-| 时区 | 内部一律 UTC，只在页面展示时转本地时区 |
+| 时区 | 内部一律 UTC |
 | 构建 | `scripts/build.ps1` 与 `scripts/build.sh` 输出一致的产物命名 |
 
 **文件锁是必须的**。用户很容易在 Windows 上双击两次 exe，两个进程用同一份配置连同一个 Lighter 账户，nonce 会立刻错乱、订单会重复。
@@ -1167,7 +1167,7 @@ const (
 
 不引入：DI 框架、ORM、大型 web 框架、通用事件总线。
 
-前端：不强制框架选型，但需满足「构建产物是纯静态文件，可被 `go:embed` 打包」。
+前端：当前未实现。规划中的控制台需满足「构建产物是纯静态文件，可被 `go:embed` 打包」。
 
 ---
 
@@ -1180,7 +1180,7 @@ const (
 3. 若原生 client order id 格式不兼容 48 位整数，实现降级的字符串映射
 4. `main.go` **追加**一行 `exchange.Register("<name>", <name>.New)`（不可插入到中间，会改变 slot）
 5. `config.yaml` 增加该交易所的凭证段
-6. 前端增加一个 Tab（Tab 内容完全由 `/api/exchanges` 返回的能力驱动，不写死）
+6. 在 `config.yaml` 增加该交易所的凭证段与可选 `strategy_file`
 
 **不允许**改动 `app` 与 `domain`。若必须改，说明 `Exchange` 或 `Capabilities` 抽象不足，先修抽象。
 

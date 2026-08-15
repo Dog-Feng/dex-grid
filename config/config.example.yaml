@@ -1,7 +1,7 @@
 # dex-grid 配置示例
 #
-# 这里只放【密钥与运维参数】。交易对、网格区间、格数、杠杆等策略参数
-# 全部在 Web 控制台配置，保存在 data/gridbot.db，改动无需重启。
+# 这里只放【密钥与运维参数】。网格区间、格数、杠杆等也可以写在 strategy_file
+#（如 config/lighter-sol.yaml），进程启动时自动写入 SQLite 并按 autostart 开网格。
 #
 # 复制为 config.yaml 后修改。字段说明见 docs/GRID_CONFIG.md，部署见 docs/DEPLOYMENT.md
 #
@@ -28,6 +28,12 @@ server:
     token: ${GRIDBOT_TOKEN}
   metrics_enabled: true
   cors_origins: ["*"]        # 允许任意来源调用 API；收紧时可改成具体 Origin
+  ip_whitelist:
+    enabled: false           # true 后只允许 allow 列表里的 IP（本机 127.0.0.1 / ::1 始终放行）
+    allow:
+      - 127.0.0.1
+      # - 1.2.3.4
+      # - 10.0.0.0/8
 
 proxy:
   # 国内网络访问部分 DEX 需要代理。对 REST 与 WebSocket 同时生效。
@@ -66,6 +72,9 @@ exchanges:
     reconnect:
       initial: 1s
       max: 30s
+
+    strategy_file: config/lighter-sol.yaml   # 网格参数文件，启动时加载
+    autostart: true                          # 启动进程后自动开网格，不需要页面
 
   # 后续接入的交易所在这里追加一段，格式同上（当前只实现了 lighter）
   # - name: <exchange>

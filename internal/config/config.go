@@ -1,7 +1,7 @@
 // Package config 负责加载 config.yaml。
 //
-// 这里只承载【密钥与运维参数】。交易对、网格区间、格数、杠杆等策略参数
-// 存在 SQLite 里由控制台下发，不走这个文件。
+// 这里只承载【密钥与运维参数】。网格参数可写在 strategy_file，启动时加载。
+// 交易对、网格区间、格数、杠杆等策略参数也可以走 SQLite（API 下发）。
 package config
 
 import (
@@ -51,15 +51,22 @@ type App struct {
 }
 
 type Server struct {
-	Addr           string   `yaml:"addr"`
-	Auth           Auth     `yaml:"auth"`
-	MetricsEnabled bool     `yaml:"metrics_enabled"`
-	CORSOrigins    []string `yaml:"cors_origins"`
+	Addr           string      `yaml:"addr"`
+	Auth           Auth        `yaml:"auth"`
+	IPWhitelist    IPWhitelist `yaml:"ip_whitelist"`
+	MetricsEnabled bool        `yaml:"metrics_enabled"`
+	CORSOrigins    []string    `yaml:"cors_origins"`
 }
 
 type Auth struct {
 	Enabled bool   `yaml:"enabled"`
 	Token   string `yaml:"token"`
+}
+
+// IPWhitelist 限制可访问 HTTP API 的来源 IP。关闭时不检查。
+type IPWhitelist struct {
+	Enabled bool     `yaml:"enabled"`
+	Allow   []string `yaml:"allow"` // 单个 IP 或 CIDR，如 1.2.3.4、10.0.0.0/8
 }
 
 type Proxy struct {
@@ -88,6 +95,10 @@ type Exchange struct {
 	Timeout    Duration  `yaml:"timeout"`
 	MaxRetries int       `yaml:"max_retries"`
 	Reconnect  Reconnect `yaml:"reconnect"`
+	// StrategyFile 指向网格参数 YAML（如 config/lighter-sol.yaml）。
+	// 启动时写入 SQLite；Autostart 为 true 时接着启动该交易所的网格。
+	StrategyFile string `yaml:"strategy_file"`
+	Autostart    bool   `yaml:"autostart"`
 }
 
 type Credentials struct {
@@ -205,6 +216,9 @@ func (c *Config) Validate() error {
 
 	if c.Server.Auth.Enabled && strings.TrimSpace(c.Server.Auth.Token) == "" {
 		return fmt.Errorf("server.auth.enabled 为 true 时必须提供 server.auth.token（建议用环境变量注入）")
+	}
+	if c.Server.IPWhitelist.Enabled && len(c.Server.IPWhitelist.Allow) == 0 {
+		return fmt.Errorf("server.ip_whitelist.enabled 为 true 时必须至少配置一条 allow")
 	}
 
 	if c.Proxy.Enabled {

@@ -131,7 +131,9 @@ CGO_ENABLED=0 go build -trimpath -o gridbot ./cmd/gridbot
 ```
 gridbot/
 ├── gridbot(.exe)          # 可执行文件
-├── config.yaml            # 配置（从 config.example.yaml 复制）
+├── config.yaml            # 密钥与运维（从 config.example.yaml 复制）
+├── config/
+│   └── lighter-sol.yaml   # 网格参数；config.yaml 里 strategy_file 指向它
 ├── .env                   # 密钥（可选，见 4.2）；权限 600
 ├── data/                  # 运行时数据，程序自动创建
 │   ├── gridbot.db         # SQLite：策略配置、订单、成交、统计
@@ -172,6 +174,9 @@ server:
   auth:
     enabled: false
   cors_origins: ["*"]
+  ip_whitelist:
+    enabled: false
+    allow: ["127.0.0.1"]
 
 exchanges:
   - name: lighter
@@ -181,9 +186,13 @@ exchanges:
       account_index: ${LIGHTER_ACCOUNT_INDEX}
       api_key_index: ${LIGHTER_API_KEY_INDEX}
       api_key_private_key: ${LIGHTER_API_KEY_PRIVATE_KEY}
+    strategy_file: config/lighter-sol.yaml
+    autostart: true
 ```
 
-**只有密钥和运维参数在这里。** 交易对、区间、格数、杠杆等策略参数全部在网页上配置，保存在 `data/gridbot.db`。
+密钥和监听端口在 `config.yaml`。网格区间、格数、保证金、杠杆写在 `config/lighter-sol.yaml`，`autostart: true` 时进程起来就开网格，不需要页面。
+
+IP 白名单：把 `server.ip_whitelist.enabled` 设为 `true`，并在 `allow` 里填公网 IP 或 CIDR。本机 `127.0.0.1` / `::1` 始终可访问。
 
 ### 4.2 密钥注入
 
@@ -539,7 +548,7 @@ New-NetFirewallRule -DisplayName "gridbot api" -Direction Inbound `
 
 ## 8. 代理配置
 
-国内网络访问部分 DEX 需要代理。两种配置方式，**优先用配置文件**（更明确，且支持页面上的连通性探测）。
+国内网络访问部分 DEX 需要代理。两种配置方式，**优先用配置文件**（更明确，且支持 `GET /api/proxy` 探测）。
 
 ### 配置文件（推荐）
 
@@ -550,7 +559,7 @@ proxy:
   health_interval: 60s
 ```
 
-对 REST 与 WebSocket 同时生效。控制台顶部的代理状态灯与「IP 配置」Tab 展示探测结果。
+对 REST 与 WebSocket 同时生效。连通性探测结果见 `GET /api/proxy`。
 
 ### 环境变量（兜底）
 
@@ -586,11 +595,19 @@ server:
   auth:
     enabled: false
   cors_origins: ["*"]
+  ip_whitelist:
+    enabled: false
+    allow: ["127.0.0.1"]
 ```
 
-访问入口：`http://<公网IP>:8080/healthz` 与 `/api/*`。根路径 `/` 不托管页面（前端待定）。
+访问入口：`http://<公网IP>:8080/healthz` 与 `/api/*`。根路径 `/` 不托管页面。
 
-若以后要加鉴权，把 `auth.enabled` 设为 `true` 并配置 `GRIDBOT_TOKEN` 即可，不是启动前提。
+建议至少打开一项访问控制：
+
+- `server.ip_whitelist.enabled: true`，`allow` 里填你的公网 IP 或 CIDR（本机 `127.0.0.1` / `::1` 始终放行）
+- 或 `auth.enabled: true` 并配置 `GRIDBOT_TOKEN`
+
+不需要对外时把 `addr` 改成 `127.0.0.1:8080`。
 
 ---
 
@@ -608,6 +625,8 @@ server:
 
 - [ ] `config.yaml` 中没有明文密钥
 - [ ] `.env` 或 `EnvironmentFile` 权限已收紧（600 / 640）
+- [ ] `strategy_file` 指向的 YAML 存在，区间/保证金/杠杆已核对
+- [ ] 公网已打开 `ip_whitelist` 或 Bearer Token，或 `addr` 已改为 `127.0.0.1:8080`
 - [ ] `data_dir` 与 `log_file` 路径存在且可写
 - [ ] `api_key_index` 没有和 Lighter 官方前端复用
 - [ ] `network` 是期望的值（测试阶段应为 `testnet`）
@@ -759,8 +778,8 @@ Register-ScheduledTask -TaskName "gridbot-backup" -Action $a -Trigger $t -RunLev
 | 大量 post-only 被拒 | 价格穿过挂单层级，属正常现象 | 观察「待重试」计数是否能回落到 0。持续不降说明行情单边运行过快，考虑放宽格距 |
 | 「批量下单失败：接口限流」 | 请求速率超限 | 调低 `rate_limit.rps`，或减少网格数、启用 `max_active_orders` |
 | nonce 相关错误反复出现 | `api_key_index` 与其他程序（含官方前端）冲突 | 换一个独立的 `api_key_index` |
-| 挂单数少于「挂单目标」 | 部分下单失败 | 点「补齐网格挂单」；检查保证金是否充足 |
-| 启动后停在 error 状态 | 对账发现仓位偏差超容忍度 | 查看日志中的期望值与实际值对比，人工确认后在页面上选择纠偏或手动处理 |
+| 挂单数少于「挂单目标」 | 部分下单失败 | `POST /api/exchanges/{ex}/refill`；检查保证金是否充足 |
+| 启动后停在 error 状态 | 对账发现仓位偏差超容忍度 | 查看日志中的期望值与实际值对比，人工确认后处理 |
 | 时间戳/签名相关拒绝 | 系统时间不准 | 同步 NTP |
 
 ### 日志与诊断
@@ -780,13 +799,13 @@ Select-String -Path C:\gridbot\logs\gridbot.log -Pattern "error" -CaseSensitive:
 
 排查具体问题时把 `log_level` 临时调成 `debug` 并重启，会输出每笔请求的详细信息。**注意 debug 日志量很大，问题解决后记得调回 `info`。**
 
-控制台的日志面板读的是内存环形缓冲，只保留最近若干条，完整历史看日志文件。
+完整历史看日志文件。`GET /api/exchanges/{ex}/logs` 读的是内存环形缓冲，只保留最近若干条。
 
 ---
 
 ## 14. 卸载
 
-**卸载前务必先在页面上停止所有实例并确认交易所侧无残留挂单与仓位。**
+**卸载前务必先停止网格并确认交易所侧无残留挂单与仓位。** 停止：`POST /api/exchanges/lighter/stop`，或给进程发 SIGTERM（只撤本交易对挂单、保留仓位）。
 
 ### Linux
 

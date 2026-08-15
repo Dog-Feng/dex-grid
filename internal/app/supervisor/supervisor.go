@@ -415,6 +415,49 @@ func (s *Supervisor) ensureRunner(inst *instance, params []byte, restore bool) e
 	return nil
 }
 
+// LoadStrategyFiles 把各交易所 strategy_file 写入 SQLite。必须在实例未运行时调用。
+func (s *Supervisor) LoadStrategyFiles(ctx context.Context) error {
+	for _, e := range s.cfg.EnabledExchanges() {
+		if e.StrategyFile == "" {
+			continue
+		}
+		path := config.ResolvePath(e.StrategyFile)
+		raw, err := config.LoadStrategyFile(path)
+		if err != nil {
+			return fmt.Errorf("交易所 %s: %w", e.Name, err)
+		}
+		if _, err := s.PutConfig(ctx, e.Name, raw); err != nil {
+			return fmt.Errorf("交易所 %s: 应用策略文件 %s 失败: %w", e.Name, path, err)
+		}
+		s.log.Info("strategy file loaded", "exchange", e.Name, "file", path)
+	}
+	return nil
+}
+
+// Autostart 按配置启动尚未运行的实例。
+func (s *Supervisor) Autostart(ctx context.Context) {
+	for _, e := range s.cfg.EnabledExchanges() {
+		if !e.Autostart {
+			continue
+		}
+		inst, err := s.get(e.Name)
+		if err != nil {
+			s.log.Error("autostart skipped", "exchange", e.Name, "err", err)
+			continue
+		}
+		if inst.runner != nil {
+			st := inst.runner.Status()
+			if st == engine.StatusRunning || st == engine.StatusStarting {
+				continue
+			}
+		}
+		s.log.Info("autostart", "exchange", e.Name)
+		if _, err := s.Start(ctx, e.Name); err != nil {
+			s.log.Error("autostart failed", "exchange", e.Name, "err", err)
+		}
+	}
+}
+
 // RestoreRunning 进程启动时把上次 running 的实例拉起来。
 func (s *Supervisor) RestoreRunning(ctx context.Context) {
 	s.mu.RLock()

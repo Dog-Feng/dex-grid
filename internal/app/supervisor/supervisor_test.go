@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -73,5 +74,62 @@ func TestStartStopNeutralGrid(t *testing.T) {
 	}
 	if view.Status != engine.StatusStopped.String() {
 		t.Fatalf("status after stop = %s", view.Status)
+	}
+}
+
+func TestLoadStrategyFileAndAutostart(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "gridbot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	file := filepath.Join(t.TempDir(), "btc.yaml")
+	body := []byte(`
+symbol: BTC
+direction: long
+leverage: 5
+grid:
+  lower_price: "100"
+  upper_price: "200"
+  grid_count: 4
+  sizing_mode: per_grid_qty
+  per_grid_qty: "1"
+entry:
+  mode: market
+  slice_count: 1
+`)
+	if err := os.WriteFile(file, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{Exchanges: []config.Exchange{{
+		Name: "fake", Enabled: true, MaxRetries: 2,
+		StrategyFile: file, Autostart: true,
+	}}}
+	sup := New(cfg, st, nil, slog.Default())
+	ex := fake.New(market.Market{
+		Symbol: "BTC", TickSize: d("0.1"), LotSize: d("0.001"),
+		MinQty: d("0.001"), MinNotional: d("10"), MaxLeverage: 50,
+		PriceDecimals: 1, SizeDecimals: 3,
+		MakerFeeRate: d("0.0002"), TakerFeeRate: d("0.0005"),
+	})
+	ex.SetBook(d("149.9"), d("150.1"))
+	ex.SetMark(d("150"))
+	sup.Attach(cfg.Exchanges[0], ex, 0)
+	t.Cleanup(func() { sup.Close(context.Background()) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := sup.LoadStrategyFiles(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sup.Autostart(ctx)
+	view, err := sup.Status(ctx, "fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Status != engine.StatusRunning.String() && view.Status != engine.StatusStarting.String() {
+		t.Fatalf("autostart status = %s", view.Status)
 	}
 }

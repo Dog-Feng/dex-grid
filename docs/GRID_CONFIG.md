@@ -4,14 +4,14 @@
 
 配置分两处，职责不重叠：
 
-| | `config.yaml` | Web 控制台（存 SQLite） |
+| | `config.yaml` | 策略 YAML / REST API（存 SQLite） |
 | --- | --- | --- |
-| 内容 | 各 DEX 密钥、网络、代理、限流、日志、监听端口 | 交易对、网格类型、区间、格数、每格数量、杠杆、建仓方式、风控 |
-| 变更 | 手工编辑文件 | 页面表单 |
-| 生效 | 重启进程 | 即时，无需重启 |
+| 内容 | 各 DEX 密钥、网络、代理、限流、日志、监听端口、IP 白名单 | 交易对、网格类型、区间、格数、保证金、杠杆、建仓方式、风控 |
+| 变更 | 手工编辑文件 | `strategy_file` 或 `PUT /api/exchanges/{ex}/config` |
+| 生效 | 重启进程 | `strategy_file` 在启动时加载；API 即时生效 |
 | 安全 | 密钥用环境变量注入 | 不含任何密钥 |
 
-**每个 DEX 只有一个实例**，所以 `config.yaml` 里一个交易所一段配置，页面上一个交易所一个 Tab，一一对应。
+**每个 DEX 只有一个实例**，所以 `config.yaml` 里一个交易所一段配置，策略 YAML / REST 也按交易所名对应。
 
 通用约定：
 
@@ -25,7 +25,7 @@
 
 ```yaml
 app:      # 全局运行参数
-server:   # HTTP 控制台
+server:   # HTTP API、鉴权、IP 白名单
 proxy:    # 网络代理
 exchanges: # 各 DEX 凭证与连接参数
 ```
@@ -52,12 +52,14 @@ exchanges: # 各 DEX 凭证与连接参数
 | `auth.token` | string | — | 访问令牌，仅 `auth.enabled = true` 时必填，**用环境变量注入** |
 | `metrics_enabled` | bool | `true` | 是否暴露 `/metrics` |
 | `cors_origins` | []string | `["*"]` | 允许的跨域来源。`*` 表示任意 Origin；收紧时填具体地址 |
+| `ip_whitelist.enabled` | bool | `false` | 是否只允许白名单 IP 访问 HTTP API |
+| `ip_whitelist.allow` | []string | 空 | 单个 IP 或 CIDR。开启后本机 `127.0.0.1` / `::1` 始终放行 |
 
-> 鉴权为可选项。开启后所有 `/api/*` 校验 `Authorization: Bearer <token>`。未开启时任何人都能调用启动/停止等写接口。
+> 鉴权与 IP 白名单都是可选项，可单独或同时开启。未开启时任何人都能调用启动/停止等写接口。
 
 ## 3. proxy
 
-对应页面「IP 配置」Tab 与顶部「代理正常」状态灯。国内网络访问部分 DEX 需要代理。
+国内网络访问部分 DEX 需要代理。连通性探测结果见 `GET /api/proxy`。
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -79,7 +81,7 @@ exchanges: # 各 DEX 凭证与连接参数
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `name` | string | — | 交易所标识，当前仅 `lighter` |
-| `enabled` | bool | `true` | 关闭后该 Tab 在页面上置灰 |
+| `enabled` | bool | `true` | 关闭后该交易所不启动、不加载策略文件 |
 | `network` | string | `mainnet` | `mainnet` / `testnet` |
 | `base_url` / `ws_url` | string | 按 network 推导 | 覆盖默认端点 |
 | `rate_limit.rps` | int | `10` | 每秒请求数上限 |
@@ -88,6 +90,8 @@ exchanges: # 各 DEX 凭证与连接参数
 | `max_retries` | int | `3` | 可重试错误的最大重试次数 |
 | `reconnect.initial` | duration | `1s` | WS 重连初始退避 |
 | `reconnect.max` | duration | `30s` | WS 重连最大退避 |
+| `strategy_file` | string | 空 | 网格参数 YAML 路径，如 `config/lighter-sol.yaml`。启动时写入 SQLite |
+| `autostart` | bool | `false` | `true` 时进程起来后自动启动该交易所网格，不需要页面 |
 
 ### 4.2 Lighter 专有字段
 
@@ -121,6 +125,9 @@ server:
     token: ${GRIDBOT_TOKEN}
   metrics_enabled: true
   cors_origins: ["*"]
+  ip_whitelist:
+    enabled: false
+    allow: ["127.0.0.1"]
 
 proxy:
   enabled: false
@@ -143,13 +150,28 @@ exchanges:
     rate_limit:
       rps: 10
       burst: 20
+    strategy_file: config/lighter-sol.yaml
+    autostart: true
 ```
 
 ---
 
-# 第二部分：页面策略参数
+# 第二部分：策略参数（YAML 文件或 REST API）
 
-以下参数在控制台表单填写，通过 `PUT /api/exchanges/{ex}/config` 保存到 SQLite。这里同时给出**表单字段**与**JSON 字段名**，供前后端对接。
+无 Web 页面时，把参数写在 `config/lighter-sol.yaml` 这类文件里，并在 `config.yaml` 中设置：
+
+```yaml
+exchanges:
+  - name: lighter
+    strategy_file: config/lighter-sol.yaml
+    autostart: true
+```
+
+进程启动会：加载策略文件 → 写入 SQLite → 自动开网格。也可用 `PUT /api/exchanges/{ex}/config` 再 `POST .../start`。
+
+仓库默认的 `config/lighter-sol.yaml`：SOL 做多、区间 72–77、25 格、保证金 1000、杠杆 10x，其余为系统默认。
+
+以下参数在策略 YAML / JSON 中字段名相同。
 
 ## 6. 基础参数
 
@@ -530,7 +552,7 @@ k | 触发价  | 保证金  | 名义    | 累计名义 | 持仓均价 | 止盈�
 改 `config.yaml` 需要重启进程。重启后：
 
 - 策略配置从 SQLite 恢复，不受影响
-- 若某交易所被改为 `enabled: false` 而它当时处于 Running，**启动时会拒绝并提示**：需要先在页面上停止该实例再禁用，避免留下无人管理的挂单与仓位
+- 若某交易所被改为 `enabled: false` 而它当时处于 Running，**启动时会拒绝并提示**：需要先 `POST /stop` 再禁用，避免留下无人管理的挂单与仓位
 - 若交易所凭证变更（换了 API Key），启动对账会发现挂单归属仍然有效（`ClientOrderID` 与账户绑定而非与 key 绑定），正常恢复
 
 ## 20. 前端表单映射
@@ -577,7 +599,7 @@ lighterctl market -m 2       # 查看 market_index=2 的元数据与最小下单
 
 | 后端结构 | 前端形态 |
 | --- | --- |
-| `GET /api/exchanges` | Tab 列表，按能力决定哪些控件可用 |
+| `GET /api/exchanges` | 已启用交易所列表与能力（规划中的前端 Tab 数据源） |
 | `symbol` | 交易对可搜索下拉，见 20.1 |
 | `direction` | 中性 / 做多 / 做空 三选一按钮组 |
 | `preset` | 稳健 / 激进 / 成交少更安全 三选一 |
