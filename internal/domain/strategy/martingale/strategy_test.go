@@ -285,7 +285,7 @@ func TestTakeProfitRestartsCycle(t *testing.T) {
 	}
 	confirm(t, s, tp)
 	next := fill(t, s, tp, epoch0.Add(time.Second))
-	var ensure, stop, cancelAll int
+	var ensure, stop, cancelAll, closePos int
 	for _, a := range next {
 		switch a.(type) {
 		case strategy.EnsurePosition:
@@ -294,13 +294,18 @@ func TestTakeProfitRestartsCycle(t *testing.T) {
 			stop++
 		case strategy.CancelAll:
 			cancelAll++
+		case strategy.ClosePosition:
+			closePos++
 		}
 	}
-	if ensure != 1 || stop != 0 || cancelAll != 1 {
-		t.Fatalf("restart acts ensure=%d stop=%d cancelAll=%d", ensure, stop, cancelAll)
+	if ensure != 1 || stop != 0 || cancelAll != 1 || closePos != 1 {
+		t.Fatalf("restart acts ensure=%d stop=%d cancelAll=%d close=%d", ensure, stop, cancelAll, closePos)
 	}
 	if s.phase != strategy.PhaseEntering {
 		t.Fatalf("phase = %s", s.phase)
+	}
+	if s.View().Epoch <= 1 {
+		t.Fatalf("epoch = %d, want advanced for next cycle", s.View().Epoch)
 	}
 	if s.View().Stats.CompletedGrids != 1 {
 		t.Fatalf("cycles = %d", s.View().Stats.CompletedGrids)

@@ -422,6 +422,7 @@ func (t *Trigger) placeNext(now time.Time) []strategy.Action {
 	t.lastSlice = now
 	t.sliceIdx++
 
+	reduceOnly := t.currentSize().Mul(rem).IsNegative()
 	return []strategy.Action{strategy.PlaceOrder{
 		ClientOrderID: coid,
 		Side:          side,
@@ -429,6 +430,7 @@ func (t *Trigger) placeNext(now time.Time) []strategy.Action {
 		Price:         price,
 		Quantity:      qty,
 		TIF:           tif,
+		ReduceOnly:    reduceOnly,
 	}}
 }
 

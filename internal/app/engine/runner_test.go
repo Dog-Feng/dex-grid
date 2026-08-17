@@ -10,6 +10,7 @@ import (
 	"dex-grid/internal/domain/order"
 	"dex-grid/internal/domain/strategy"
 	"dex-grid/internal/domain/strategy/grid"
+	"dex-grid/internal/domain/strategy/martingale"
 	"dex-grid/internal/exchange/fake"
 
 	"github.com/shopspring/decimal"
@@ -304,5 +305,102 @@ func TestWatchdogCancelsExtraAndRefillsMissing(t *testing.T) {
 	r.watchdog(context.Background())
 	if n := len(ex.Resting()); n != 4 {
 		t.Fatalf("watchdog should refill missing, resting = %d", n)
+	}
+}
+
+func TestMartingaleCycleRestartKeepsNewEpochOrders(t *testing.T) {
+	ex := fake.New(testMarket())
+	ex.SetBook(d("149.9"), d("150.1"))
+	ex.SetMark(d("150"))
+
+	p := martingale.DefaultParams()
+	p.Symbol = "BTC"
+	p.Leverage = 5
+	p.Martingale.InitialMargin = d("50")
+	p.Martingale.AddMargin = d("50")
+	p.Martingale.MaxAddTimes = 2
+	p.Martingale.TakeProfitPct = d("1.5")
+	p.Martingale.AddDropPct = d("2")
+	p.Entry.Mode = strategy.EntryMarket
+	p.Entry.SliceCount = 1
+	p.Entry.FillTolerance = d("0.01")
+	p.Entry.MaxSlippage = d("0.05")
+	p.ApplyDefaults()
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := martingale.New(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := New(ex, s, Config{Name: "fake", Slot: 0, TickInterval: time.Second, MaxRetries: 2})
+	res := r.Do(context.Background(), CmdStart, StartPayload{
+		Symbol: "BTC",
+		Entry: strategy.EntryParams{
+			Mode:          strategy.EntryMarket,
+			SliceCount:    1,
+			FillTolerance: d("0.01"),
+			MaxSlippage:   d("0.05"),
+		},
+		Risk: strategy.DefaultRiskParams(),
+	})
+	if !res.OK {
+		t.Fatalf("start: %s", res.Message)
+	}
+	r.Drain(context.Background())
+
+	pos, _ := ex.Position(context.Background(), "BTC")
+	if !pos.Size.IsPositive() {
+		t.Fatalf("expected long inventory after first entry, got %s", pos.Size)
+	}
+	epoch1 := r.View().Strategy.Epoch
+	if epoch1 == 0 {
+		t.Fatal("strategy epoch should be assigned on start")
+	}
+
+	var tpPx decimal.Decimal
+	for _, o := range ex.Resting() {
+		if o.ReduceOnly && o.Side == order.Sell {
+			tpPx = o.Price
+			break
+		}
+	}
+	if !tpPx.IsPositive() {
+		t.Fatal("missing reduce-only take-profit")
+	}
+
+	ex.SetBook(tpPx, tpPx.Add(d("0.1")))
+	ex.SetMark(tpPx)
+	ex.Trade(tpPx)
+	r.Drain(context.Background())
+	r.Drain(context.Background())
+
+	pos, _ = ex.Position(context.Background(), "BTC")
+	if pos.Size.IsNegative() {
+		t.Fatalf("restart opened a short, size=%s", pos.Size)
+	}
+
+	epoch2 := r.View().Strategy.Epoch
+	if epoch2 <= epoch1 {
+		t.Fatalf("epoch did not advance after cycle: %d -> %d", epoch1, epoch2)
+	}
+	if r.epoch != epoch2 {
+		t.Fatalf("runner epoch %d != strategy epoch %d (watchdog would cancel new adds)", r.epoch, epoch2)
+	}
+
+	adds := 0
+	for _, o := range ex.Resting() {
+		if o.ClientOrderID.Decode().Purpose == order.PurposeOpen {
+			adds++
+		}
+	}
+	if adds == 0 {
+		t.Fatal("expected add orders after cycle restart")
+	}
+	before := len(ex.Resting())
+	r.watchdog(context.Background())
+	if n := len(ex.Resting()); n < before {
+		t.Fatalf("watchdog cancelled new-epoch adds: %d -> %d", before, n)
 	}
 }

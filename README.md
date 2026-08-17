@@ -286,7 +286,7 @@ GOOS=windows GOARCH=amd64 go build -o dist/gridbot.exe ./cmd/gridbot
 | **M5 建仓与风控** | 三种建仓模式、止盈止损、区间外策略、trailing、熔断 | 主网小资金实盘 |
 | **M6 持久化与对账** | SQLite 落盘、启动恢复、周期漂移检查、指标 | 长时间无人值守 |
 | **M7 行情分析** | K 线已接入图表；EMA/斜率/ATR、趋势判定、参数推荐待做 | 图表可用 |
-| **M8 马丁网格** | 马丁策略（做多/做空）、预挂加仓、加仓后 Modify 止盈、控制台表单 | 已实现 |
+| **M8 马丁网格** | 马丁策略（做多/做空）、预挂加仓、加仓后 Modify 止盈、止盈后同步 epoch 再开下一轮 | 已实现 |
 | **M9 多交易所** | 接入第二个 DEX（具体交易所待定） | 验证端口抽象 |
 
 **扩展性验收标准**：新增交易所只允许改 `internal/exchange/<name>/` 与 `main.go` 一行注册；新增策略只允许改 `internal/domain/strategy/<name>/` 与配置结构体。若必须改 `app` 层，说明抽象有缺陷，先修抽象。

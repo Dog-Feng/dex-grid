@@ -191,14 +191,12 @@ func (s *Strategy) OnEvent(ev strategy.Event) ([]strategy.Action, error) {
 		if s.phase != strategy.PhaseEntering {
 			return nil, nil
 		}
-		next := s.position.Add(e.Filled)
-		if s.target.Sub(next).Abs().LessThan(s.target.Sub(s.position).Abs()) {
-			s.position = next
-		}
+		// EnsurePosition 完成即视为仓位已到首单目标；不要用本地被清零的仓位去加成交量。
+		s.position = s.target
 		if s.mark.IsPositive() {
 			s.entryPx = s.mark
 		}
-		if s.avgPrice.IsZero() && s.mark.IsPositive() {
+		if !s.avgPrice.IsPositive() && s.mark.IsPositive() {
 			s.avgPrice = s.mark
 		}
 		_ = s.rebuildPlan(s.entryPx)

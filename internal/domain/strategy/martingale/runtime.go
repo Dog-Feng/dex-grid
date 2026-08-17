@@ -228,7 +228,9 @@ func (s *Strategy) handleTPFill(o order.Order, now time.Time) []strategy.Action 
 	}
 	s.target = s.entryTarget()
 	s.phase = strategy.PhaseEntering
-	return append(acts, strategy.EnsurePosition{Target: s.target})
+	// 先市价减仓清掉止盈没平干净的残留，再建首单。
+	// 否则 Runner 若还拿着止盈前的仓位快照，会把「建仓」做成反向空单。
+	return append(acts, strategy.ClosePosition{Urgency: strategy.UrgencyMarket}, strategy.EnsurePosition{Target: s.target})
 }
 
 func (s *Strategy) noteFill(o order.Order) {

@@ -442,6 +442,7 @@ func (r *Runner) apply(ctx context.Context, acts []strategy.Action, now time.Tim
 	if len(acts) == 0 || r.stopping {
 		return
 	}
+	r.syncEpoch()
 	if r.guard != nil && r.guard.BlockOpens() {
 		acts = risk.FilterOpens(acts)
 		if len(acts) == 0 {
@@ -476,6 +477,8 @@ func (r *Runner) startEntry(ctx context.Context, req strategy.EnsurePosition, no
 		r.log.Info("entry already in progress, ignore EnsurePosition")
 		return
 	}
+	r.syncEpoch()
+	r.refreshPosition(ctx)
 	r.trig = entry.New(r.entryP, r.state.Market, r.cfg.Slot, r.epoch)
 	acts := r.trig.Start(req.Target, r.state.Position.Size, r.state.Book, r.state.Mark, now)
 	if !r.trig.Active() {
@@ -532,6 +535,21 @@ func (r *Runner) refreshPosition(ctx context.Context) {
 	}
 }
 
+func (r *Runner) syncEpoch() {
+	if r.strat == nil {
+		return
+	}
+	ep := r.strat.View().Epoch
+	if ep == r.epoch {
+		return
+	}
+	r.log.Info("epoch advanced", "from", r.epoch, "to", ep)
+	r.epoch = ep
+	if r.exec != nil {
+		r.exec.SetEpoch(ep)
+	}
+}
+
 func (r *Runner) subscribe(ctx context.Context) error {
 	if r.streamCancel != nil {
 		r.streamCancel()
@@ -567,6 +585,7 @@ func (r *Runner) maybeWatchdog(ctx context.Context, now time.Time) {
 		return
 	}
 	r.lastWatchdog = now
+	r.syncEpoch()
 	r.watchdog(ctx)
 }
 
