@@ -72,6 +72,7 @@ func (b *Buffer) List(exchange, level string, limit int) []Record {
 type Handler struct {
 	inner slog.Handler
 	buf   *Buffer
+	attrs []slog.Attr
 }
 
 // NewHandler 包装 inner，每条日志额外写入 buf。
@@ -91,11 +92,11 @@ func (h *Handler) Handle(ctx context.Context, rec slog.Record) error {
 			Message: rec.Message,
 			Attrs:   map[string]string{},
 		}
+		for _, a := range h.attrs {
+			collectAttr(&r, a)
+		}
 		rec.Attrs(func(a slog.Attr) bool {
-			if a.Key == "exchange" {
-				r.Exchange = a.Value.String()
-			}
-			r.Attrs[a.Key] = a.Value.String()
+			collectAttr(&r, a)
 			return true
 		})
 		if len(r.Attrs) == 0 {
@@ -106,12 +107,26 @@ func (h *Handler) Handle(ctx context.Context, rec slog.Record) error {
 	return h.inner.Handle(ctx, rec)
 }
 
+func collectAttr(r *Record, a slog.Attr) {
+	if a.Equal(slog.Attr{}) {
+		return
+	}
+	if a.Key == "exchange" {
+		r.Exchange = a.Value.String()
+	}
+	if r.Attrs == nil {
+		r.Attrs = map[string]string{}
+	}
+	r.Attrs[a.Key] = a.Value.String()
+}
+
 func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &Handler{inner: h.inner.WithAttrs(attrs), buf: h.buf}
+	combined := append(append([]slog.Attr{}, h.attrs...), attrs...)
+	return &Handler{inner: h.inner.WithAttrs(attrs), buf: h.buf, attrs: combined}
 }
 
 func (h *Handler) WithGroup(name string) slog.Handler {
-	return &Handler{inner: h.inner.WithGroup(name), buf: h.buf}
+	return &Handler{inner: h.inner.WithGroup(name), buf: h.buf, attrs: h.attrs}
 }
 
 // Setup 按配置构造 slog 默认 logger，并返回环形缓冲。

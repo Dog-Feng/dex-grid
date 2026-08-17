@@ -34,6 +34,20 @@ func TestHandlerWritesBuffer(t *testing.T) {
 	}
 }
 
+func TestHandlerCapturesLoggerWithExchange(t *testing.T) {
+	buf := NewBuffer(10)
+	h := NewHandler(slog.NewTextHandler(discard{}, nil), buf)
+	log := slog.New(h).With("exchange", "lighter")
+	log.Info("epoch advanced", "from", 1, "to", 2)
+	got := buf.List("lighter", "", 1)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 log, got %d: %+v", len(got), buf.List("", "", 10))
+	}
+	if got[0].Message != "epoch advanced" || got[0].Exchange != "lighter" {
+		t.Fatalf("got %+v", got[0])
+	}
+}
+
 type discard struct{}
 
 func (discard) Write(p []byte) (int, error) { return len(p), nil }
