@@ -767,6 +767,39 @@ func TestSyncFromOrdersIgnoresPurposeEntry(t *testing.T) {
 	}
 }
 
+func TestRunningGridDoesNotReenterOnPositionDrift(t *testing.T) {
+	s := newStrategy(t, smallParams(Long))
+	if _, err := s.Init(testState("150", "0")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.OnEvent(strategy.EntryDoneEvent{Filled: d("2"), Now: epoch0}); err != nil {
+		t.Fatal(err)
+	}
+	if s.phase != strategy.PhaseRunning {
+		t.Fatalf("phase = %s", s.phase)
+	}
+	acts, err := s.OnEvent(strategy.ResyncEvent{
+		Position: position.Position{Size: d("3")},
+		Now:      epoch0.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := countAction[strategy.EnsurePosition](acts); n != 0 {
+		t.Fatalf("看门狗对账时仓位大于初始目标，不应再触发建仓/减仓，got %d", n)
+	}
+	acts, err = s.OnEvent(strategy.ResyncEvent{
+		Position: position.Position{Size: d("1")},
+		Now:      epoch0.Add(2 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := countAction[strategy.EnsurePosition](acts); n != 0 {
+		t.Fatalf("看门狗对账时仓位小于初始目标，不应再补建仓，got %d", n)
+	}
+}
+
 // --- 测试辅助 ---
 
 func findPlacement(t *testing.T, acts []strategy.Action, price string) strategy.PlaceOrder {

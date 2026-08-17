@@ -1,8 +1,8 @@
 # dex-grid 开发设计文档
 
-版本：v0.2（第一阶段：Lighter + 普通合约网格。Web 控制台已 embed，默认不自动开网格）
+版本：v0.3（Lighter + 普通合约网格 + 马丁网格。Web 控制台已 embed，默认不自动开网格）
 
-本文描述分层职责、核心抽象、网格算法、事件与命令流、HTTP API 契约、Lighter 适配细节与工程约定。配置字段规范见 [GRID_CONFIG.md](GRID_CONFIG.md)，部署见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+本文描述分层职责、核心抽象、网格算法、事件与命令流、HTTP API 契约与工程约定。Lighter 协议、签名、nonce、改单与主网踩坑见 [LIGHTER.md](LIGHTER.md)。配置字段规范见 [GRID_CONFIG.md](GRID_CONFIG.md)，部署见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
 ---
 
@@ -20,7 +20,7 @@
 10. [风控、止盈止损与区间外策略](#10-风控止盈止损与区间外策略)
 11. [Trailing 网格](#11-trailing-网格)
 12. [行情分析与参数推荐](#12-行情分析与参数推荐)
-13. [Lighter 适配器](#13-lighter-适配器)
+13. [Lighter 适配器](#13-lighter-适配器)（正文在 [LIGHTER.md](LIGHTER.md)）
 14. [持久化与对账](#14-持久化与对账)
 15. [错误处理与限流](#15-错误处理与限流)
 16. [可观测性与日志面板](#16-可观测性与日志面板)
@@ -144,14 +144,16 @@ type Exchange interface {
     Name() string
     Capabilities() Capabilities
 
+    Markets(ctx context.Context) ([]MarketInfo, error)      // 页面交易对下拉（仅永续）
     Market(ctx context.Context, symbol string) (market.Market, error)
-    Symbols(ctx context.Context) ([]string, error)          // 页面交易对下拉
+    Ticker(ctx context.Context, symbol string) (Ticker, error)
     Klines(ctx context.Context, symbol, interval string, limit int) ([]market.Kline, error)
 
     SetLeverage(ctx context.Context, symbol string, leverage int, mode market.MarginMode) error
 
     // 入参出参都是切片，单笔传长度为 1。适配器按 Capabilities 决定批量还是串行。
     PlaceOrders(ctx context.Context, reqs []PlaceRequest) ([]PlaceResult, error)
+    ModifyOrders(ctx context.Context, reqs []ModifyRequest) ([]ModifyResult, error)
     CancelOrders(ctx context.Context, reqs []CancelRequest) ([]CancelResult, error)
     CancelAll(ctx context.Context, symbol string) error
 
@@ -160,10 +162,12 @@ type Exchange interface {
     Position(ctx context.Context, symbol string) (position.Position, error)
     Account(ctx context.Context) (account.Snapshot, error)  // 余额、权益、保证金率
 
-    // 单一事件流：订单簿 + 订单回报 + 仓位/账户更新合并成一个 channel
-    Subscribe(ctx context.Context, symbol string) (<-chan StreamEvent, error)
-
     Close() error
+}
+
+// 事件流与交易端口分开：REST 可先交付，WS 后补。
+type Streamer interface {
+    Subscribe(ctx context.Context, symbol string) (<-chan StreamEvent, error)
 }
 
 type Capabilities struct {
@@ -179,10 +183,11 @@ type Capabilities struct {
 
 **设计说明**
 
-- `PlaceOrders` 天然收批量，避免上层出现单笔/批量两套路径。铺 80 格网格时批量是刚需。
+- `PlaceOrders` / `ModifyOrders` / `CancelOrders` 天然收批量，避免上层出现单笔/批量两套路径。铺 80 格网格时批量是刚需；Lighter 目前 `BatchPlace=0`，Executor 拆成串行。
 - 事件合流成单 channel 而非多个，让 Runner 的 select 只有三个分支（事件、命令、定时器），也避免多 channel 之间乱序导致「先收到成交、后收到挂单确认」这类难处理的时序问题。
 - `PostOnly` 为 false 时直接拒绝启动，不做静默降级 —— 全 maker 是本系统的核心前提。
-- `Symbols` 与 `Klines` 是为页面加的，属于只读查询，放在 Exchange 接口里比单开一个接口更简单。
+- `ModifyOrder` 为 true 时改价改量（马丁止盈主路径）；为 false 时 Executor 降级成撤旧单再挂同一 `ClientOrderID`。改单失败不得把旧单当成 `Rejected` 清掉，否则会双挂。
+- `Markets` 与 `Klines` 是为页面加的只读查询。事件流在 `Streamer` 上，不塞进交易端口。
 
 ### 3.2 Strategy 端口
 
@@ -228,6 +233,12 @@ type PlaceOrder struct {
     Quantity      decimal.Decimal
     TIF           order.TIF
     ReduceOnly    bool
+}
+type ModifyOrder struct { // 改已存活挂单的价和量，ClientOrderID 不变
+    ClientOrderID order.ClientOrderID
+    Price         decimal.Decimal
+    Quantity      decimal.Decimal
+    // Side/Type/TIF/ReduceOnly 供无改单能力时降级撤+挂
 }
 type CancelOrder   struct{ ClientOrderID order.ClientOrderID }
 type CancelAll     struct{}
@@ -451,11 +462,11 @@ func (r *Runner) dispatch(ctx context.Context, ev strategy.Event) {
 func (e *Executor) Apply(ctx context.Context, acts []strategy.Action) Results
 ```
 
-1. **归类合并**：连续 `PlaceOrder` 合并成批，`CancelOrder` 合并成批。
-2. **顺序保证**：先执行全部撤单，再执行下单。避免中间态挂单数超限或保证金不足。
-3. **批量拆分**：按 `Capabilities.BatchPlace` 切片。
+1. **归类合并**：`PlaceOrder` / `ModifyOrder` / `CancelOrder` 各自成批。
+2. **顺序保证**：设杠杆 → 撤单 → **改单** → 平仓 → 下单。改单在撤单之后、新挂之前，避免改一张马上要撤的单。
+3. **批量拆分**：按 `Capabilities.BatchPlace` 切片；改单目前按 1 笔发。
 4. **限流**：per-exchange 令牌桶。
-5. **重试**：只对可重试错误退避重试，带上限。
+5. **重试**：只对可重试错误退避重试，带上限。改单失败**不**发 `Rejected` 回灌，旧单留在盘上。
 6. **进度计数**：维护「挂单目标 / 已确认 / 待重试」三个计数供页面显示（80 格网格铺满即 80 / 80 / 0）。
 7. **dry-run**：`-dry-run` 时换成 `LogExecutor`，只打印不发送。
 
@@ -797,119 +808,14 @@ epoch' = epoch + 1
 
 ## 13. Lighter 适配器
 
-### 13.1 端点与协议
+协议、签名、nonce、改单、事件流与主网踩坑已独立成篇：[LIGHTER.md](LIGHTER.md)。
 
-| 项 | 值 |
-| --- | --- |
-| REST 主网 | `https://mainnet.zklighter.elliot.ai` |
-| REST 测试网 | `https://testnet.zklighter.elliot.ai` |
-| WS | `wss://mainnet.zklighter.elliot.ai/stream` |
-| 下单 | 本地签名 L2 交易 → `POST /api/v1/sendTx` / `sendTxBatch`，或 WS `jsonapi/sendtx` / `jsonapi/sendtxbatch` |
-| 签名库 | `github.com/elliottech/lighter-go`（官方 Go 实现） |
+这里只保留与系统抽象相关的要点：
 
-优先走 WS 发送交易（`tx_send_channel: ws`），延迟更低且与订阅共用连接；REST 作为降级通道。
-
-### 13.2 常量映射
-
-交易类型：`L2CreateOrder=14`、`L2CancelOrder=15`、`L2CancelAllOrders=16`、`L2ModifyOrder=17`、`L2UpdateLeverage=20`、`L2CreateGroupedOrders=28`
-
-订单类型：`Limit=0`、`Market=1`、`StopLoss=2`、`StopLossLimit=3`、`TakeProfit=4`、`TakeProfitLimit=5`、`TWAP=6`
-
-Time-In-Force：`ImmediateOrCancel=0`、`GoodTillTime=1`、`PostOnly=2`
-
-保证金模式：`CrossMargin=0`、`IsolatedMargin=1`
-
-分组类型：`OTO=1`、`OCO=2`、`OTOCO=3`（单组最多 3 笔）
-
-| domain | Lighter |
-| --- | --- |
-| `TIFPostOnly` | `TimeInForce=2`，`OrderType=0` |
-| `TIFGTC` | `TimeInForce=1`（GoodTillTime）+ `ExpiredAt`；Lighter 无永久单，用 `order_expiry`（默认 28 天，上限 30 天） |
-| `TypeMarket` | `OrderType=1`，`TimeInForce=0`（IOC）+ 滑点保护价 |
-| `ReduceOnly` | `ReduceOnly=1` |
-
-### 13.3 精度换算
-
-价格是 `uint32`、数量是 `int64`，按市场元数据小数位缩放：
-
-```go
-priceInt = uint32(price.Shift(int32(m.PriceDecimals)).IntPart())
-sizeInt  = int64(qty.Shift(int32(m.SizeDecimals)).IntPart())
-```
-
-边界（来自 `constants.go`）：`MinOrderPrice=1`、`MaxOrderPrice=2^32−1`、`MinOrderBaseAmount=1`、`MaxOrderBaseAmount=2^48−1`。适配器换算后校验，越界返回明确错误而不是让交易所拒绝。
-
-市场元数据来自 `GET /api/v1/orderBooks` 与 `/api/v1/orderBookDetails`（含 `market_id`、`price_decimals`、`size_decimals`、`min_base_amount`、`min_quote_amount`、`supported_leverage`），启动时拉取并缓存，映射成 `domain/market.Market`。
-
-### 13.4 Nonce 管理
-
-Lighter 每笔签名交易带 nonce，同一 `(account_index, api_key_index)` 下必须严格递增无空洞。
-
-**因为一个交易所只有一个实例，所有交易天然来自同一个 goroutine 序列**，nonce 管理退化为一个简单的单调计数器，不需要跨实例分配器：
-
-```go
-type nonceTracker struct {
-    next int64            // 无需 mutex：只被适配器的发送队列 goroutine 访问
-}
-```
-
-仍需处理的边界情况：
-
-- 启动时通过 `GET /api/v1/nextNonce` 拉初始值。
-- 发送失败且**确认**交易未被接受 → 回退计数器复用该 nonce。
-- 网络超时**无法确认**是否被接受 → 不回退，标记「疑似空洞」，触发一次 `nextNonce` 校准；若服务端 nonce 已前进说明交易实际被接受，据此修正本地状态。
-- `sendTxBatch` 一次分配连续的一段 nonce。
-
-适配器内部用一个**单 goroutine 的发送队列**串行化所有出站交易（即使 Executor 并发调用），这是 nonce 正确性的最终保证。
-
-### 13.5 事件流订阅
-
-`wss://mainnet.zklighter.elliot.ai/stream`，订阅三个频道后归并到单个 `chan StreamEvent`：
-
-| 频道 | 映射 | 说明 |
-| --- | --- | --- |
-| `ticker/{market_id}` | → `Ticker.Book` | 最优买卖价。交易所直接推 BBO |
-| `market_stats/{market_id}` | → `Ticker.Mark/Index/Last` | 标记价与指数价 |
-| `account_market/{market_id}/{account_id}` | → `Order` / `Position` | 订单回报与仓位，需要 auth token |
-
-**为什么不订阅 `order_book`**：那个频道推的是增量档位变化，要用出最优价就得在本地维护完整订单簿并校验 `begin_nonce` 的连续性。而策略只需要买一卖一，`ticker` 频道直接给，省掉一整套订单簿维护与序号对账的代码。
-
-**为什么要额外订阅 `market_stats`**：`ticker` 频道不带标记价，而风控默认按标记价触发（抗插针）。适配器把两个频道的最新值合并成一个完整的 `Ticker` 再发出去——两者到达顺序不确定，所以是「各更新各的字段，然后发合并后的快照」。`market_stats` 还没到时标记价先用中间价顶上，这段时间的风控判定会略有偏差，好过没有价格。
-
-**账户频道用一个就够**：`account_market` 同时带 `orders`、`position`、`trades`，不必再订 `account_orders`。
-
-**重连**：指数退避（配置 `reconnect.initial` → `reconnect.max`，默认 1s → 30s）。每次连上先发 `Resync` 事件，Runner 收到后触发全量对账——断线期间可能有成交，本地状态不能假定还准确。auth token 每次重连重新生成，避免长时间断线后用过期令牌订阅被拒。
-
-**保活**：服务端要求客户端至少每 2 分钟发一帧，否则主动断开。适配器每 45 秒发一次 `{"type":"ping"}`。同时给读操作设了 90 秒超时：`ticker` 频道很活跃，这么久没消息说明连接已经僵死，主动断开重连比干等强。
-
-### 13.6 主网实测记录
-
-以下都是接入时在主网上核对过的，与文档描述不一致的地方以这里为准。
-
-| 项 | 实测结果 |
-| --- | --- |
-| 市场数量 | `/orderBooks` 返回 235 个（227 永续 + 8 现货），`/orderBookDetails` 只返回 227 个永续。**返回顺序不是按 market_id 排的**，页面下拉必须自己排序 |
-| 现货识别 | `market_type` 字段为 `"spot"`，`market_id` 从 2048 起，符号带斜杠（`ETH/USDC`）。注意 `ETH` 永续（id 0）与 `ETH/USDC` 现货（id 2048）并存，按符号查找不会混淆，但按 index 指定时要当心 |
-| 下架合约 | `status` 为 `"inactive"`，主网上有 17 个。它们的 `mark_price` 和成交额都是 0，盘口为空 |
-| `market_index = 2` | SOL 永续，`size_decimals = 3`、`price_decimals = 3`、最大杠杆 25x |
-| 手续费 | 全市场 `maker_fee` 与 `taker_fee` 都是 `"0.0000"`。字段是百分数字符串，需要除以 100 才是费率 |
-| 最小下单额 | 所有市场 `min_quote_amount` 统一为 10 USDC，另有各自的 `min_base_amount`，**两者取大** |
-| 保证金率单位 | `/orderBookDetails` 里是万分之一的整数（`maintenance_margin_fraction: 240` = 2.4%）；`/account` 的持仓里却是百分数字符串（`initial_margin_fraction: "5.00"` = 5%）。同一语义两种表示，转换时容易搞错 |
-| `is_ask` / `reduce_only` | 下单请求里是 `0/1`，查询挂单返回的是 `true/false`。解析时要能同时接受两种 |
-| `/orderBookOrders` | 返回的是**逐笔挂单**而不是按价格聚合的档位。取第一条能得到最优价，但它的数量只是那一笔的量 |
-| `/api/v1/candles` | 公开 K 线，控制台价格曲线使用。旧路径 `/candlesticks` 主网 403，已弃用 |
-| `CancelAllOrders` | Lighter 原生全撤是**账户级**。适配器的 `CancelAll(symbol)` **不得**调用它，改为拉取该市场活动单再逐笔撤销，避免误撤其他交易对（包括手动挂的单） |
-| WS `account_market` 的 `position` | 文档写的是数组，实际推送的是**单个对象**。解析要能同时吃两种形态 |
-| WS 订单回报延迟 | 从 `sendTx` 返回到收到对应的订单事件约 3-6 秒，这是排序器的入块时间，不是网络延迟 |
-| WS 市价单的 `price` | 回报里的 `price` 是下单时填的滑点保护上限，不是成交价。成交价要看 `filled_quote_amount / filled_base_amount` |
-
-单笔下单到可查询的时延在 2-4 秒，市价单成交后仓位在 4 秒内可见。
-
-### 13.7 参考实现
-
-- `github.com/elliottech/lighter-go` —— 官方签名与交易类型定义（**必须依赖**）
-- `github.com/elliottech/lighter-python` —— 官方 Python SDK，行为对照
-- `github.com/defi-maker/golighter` —— 社区 Go 封装（OpenAPI 生成的 REST + WS），可参考或直接依赖以减少工作量
+- 适配器只做端口翻译，不含网格 / 马丁语义。
+- `Capabilities.ModifyOrder = true`。马丁加仓后改止盈走 `ModifyOrders`，数量与仓位一致，不撤旧单重挂。
+- `CancelAll(symbol)` 按市场逐笔撤，禁止调用账户级 `CancelAllOrders`。
+- nonce 靠单实例 + 发送锁保证递增；文件锁防止双开进程。
 
 ---
 
@@ -1108,29 +1014,35 @@ const (
 
 ---
 
-## 18. 马丁网格设计预留
+## 18. 马丁网格
 
-第二阶段实现，确认能复用现有抽象：复用 `Strategy` 接口、`entry` 建仓触发器、`Executor`、`Guard`、对账机制；`ClientOrderID` 的 `level` 位段改为表示「第几次加仓」。
+已实现。复用 `Strategy` 接口、`entry` 建仓触发器、`Executor`、`Guard`、对账；`ClientOrderID` 的 `Cell` 位段表示「第几次加仓」，止盈用 `PurposeTakeProfit`。
 
-核心状态机（做多）：
+方向仅 `long` / `short`（无中性）。保证金默认全仓。止盈后重开默认无限循环（`max_cycles = 0`）。
+
+核心状态机（做多；做空把跌/涨对调）：
 
 ```
 建仓（首单，保证金 = initial_margin）
-  ├─ 价格达到 均价 × (1 + take_profit_pct) → 全平 → 周期结束 → 重新建仓
+  ├─ 价格达到 均价 × (1 + take_profit_pct) → reduce-only 止盈全平 → 周期结束 → 重新建仓
   └─ 价格跌到 基准价 × (1 − add_drop_pct) → 加仓
         本次保证金 = add_margin × add_multiplier^(已加仓次数)
-        重算均价 → 撤销并重挂止盈单
+        仓位增加、均价下移
+        Modify 止盈单：新价按新均价计算，数量 = 当前仓位绝对值
         已加仓次数 == max_add_times → 停止加仓，只留止盈单
 ```
 
 要点：
 
-- 加仓单预先按计划价格全部 post-only 挂出，成交即加仓，避免轮询滞后
-- 止盈单每次加仓后需重挂（均价变了），有 `ModifyOrder` 能力时用改单优化
-- `add_multiplier > 1` 时资金需求指数增长，保存配置时必须预计算**总资金需求**与**加满仓后的强平价**并在页面展示，超过可用余额直接拒绝
-- 马丁没有天然止损，`stop_loss_price` 从可选变为强烈建议，未配置时页面黄色警告
+- 加仓单按计划价 post-only 预挂，成交即加仓，避免轮询滞后。
+- **加仓后改止盈，不撤旧单重挂。** 有 `ModifyOrder` 时 `ModifyOrders`；没有则 Executor 降级撤+挂。改单失败保留旧止盈，禁止当成拒单清掉（否则双挂）。
+- 启动时若已有同向仓且数量 ≥ 首单，不反向平，直接挂加仓与止盈；反向仓拒绝启动，要求先平。
+- 看门狗只在 `Idle` / `Entering` 才 `EnsurePosition`。Running 后仓位随加仓变化，不得把仓位拉回初始首单量。
+- Maker 建仓跟价：已有在途单则改价，不发第二笔；盘口未到则等 tick，不连打。
+- `add_multiplier > 1` 时资金指数增长；保存时预计算总保证金与加满仓强平价，超过可用余额拒绝。预览按**首单**保证金拦截即可启动，加满仓需求在计划表里展示。
+- 马丁没有天然止损，`stop_loss_price` 强烈建议配置。
 
-配置字段见 [GRID_CONFIG.md](GRID_CONFIG.md)。
+配置字段见 [GRID_CONFIG.md](GRID_CONFIG.md)。Lighter 改单协议见 [LIGHTER.md](LIGHTER.md)。
 
 ---
 

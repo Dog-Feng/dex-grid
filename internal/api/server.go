@@ -16,6 +16,7 @@ import (
 
 	"dex-grid/internal/app/supervisor"
 	"dex-grid/internal/config"
+	"dex-grid/internal/domain/strategy"
 	"dex-grid/internal/domain/strategy/grid"
 	"dex-grid/web"
 )
@@ -325,6 +326,11 @@ func writeErr(w http.ResponseWriter, err error) {
 	var issue *grid.Issue
 	if errors.As(err, &issue) {
 		writeError(w, http.StatusBadRequest, issue.Code, issue.Message, issue.Field)
+		return
+	}
+	var sissue *strategy.Issue
+	if errors.As(err, &sissue) {
+		writeError(w, http.StatusBadRequest, sissue.Code, sissue.Message, sissue.Field)
 		return
 	}
 	msg := err.Error()

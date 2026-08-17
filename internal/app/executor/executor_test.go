@@ -167,6 +167,49 @@ func TestClosePositionMarket(t *testing.T) {
 	}
 }
 
+func TestApplyModifiesRestingOrder(t *testing.T) {
+	ex := fake.New(testMarket())
+	ex.SetBook(d("149.9"), d("150.1"))
+	e := newExec(ex)
+	id := coid(0, 0)
+	e.Apply(context.Background(), []strategy.Action{
+		strategy.PlaceOrder{
+			ClientOrderID: id, Side: order.Sell, Type: order.Limit,
+			Price: d("175"), Quantity: d("1"), TIF: order.PostOnly, ReduceOnly: true,
+		},
+	})
+
+	res := e.Apply(context.Background(), []strategy.Action{
+		strategy.ModifyOrder{
+			ClientOrderID: id, Side: order.Sell, Type: order.Limit,
+			Price: d("160"), Quantity: d("2"), TIF: order.PostOnly, ReduceOnly: true,
+		},
+	})
+	if res.Fatal != nil {
+		t.Fatal(res.Fatal)
+	}
+	if res.Failures != 0 {
+		t.Fatalf("failures = %d", res.Failures)
+	}
+	resting := ex.Resting()
+	if len(resting) != 1 {
+		t.Fatalf("resting = %d, want 1", len(resting))
+	}
+	if resting[0].ClientOrderID != id {
+		t.Fatalf("coid changed: %d", resting[0].ClientOrderID)
+	}
+	if !resting[0].Price.Equal(d("160")) || !resting[0].Quantity.Equal(d("2")) {
+		t.Fatalf("modified order = px %s qty %s", resting[0].Price, resting[0].Quantity)
+	}
+	if len(res.Events) != 1 {
+		t.Fatalf("events = %d", len(res.Events))
+	}
+	oe, ok := res.Events[0].(strategy.OrderEvent)
+	if !ok || oe.Order.State != order.StateOpen {
+		t.Fatalf("event = %+v", res.Events[0])
+	}
+}
+
 func TestInvalidParamEmitsRejectedAndCountsFailure(t *testing.T) {
 	ex := fake.New(testMarket())
 	ex.SetBook(d("149.9"), d("150.1"))

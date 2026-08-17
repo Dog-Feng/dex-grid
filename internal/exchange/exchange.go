@@ -44,6 +44,7 @@ type Exchange interface {
 	SetLeverage(ctx context.Context, symbol string, leverage int, mode market.MarginMode) error
 
 	PlaceOrders(ctx context.Context, reqs []PlaceRequest) ([]PlaceResult, error)
+	ModifyOrders(ctx context.Context, reqs []ModifyRequest) ([]ModifyResult, error)
 	CancelOrders(ctx context.Context, reqs []CancelRequest) ([]CancelResult, error)
 	// CancelAll 撤销指定交易对上的全部挂单，不得波及其他市场。
 	CancelAll(ctx context.Context, symbol string) error
@@ -134,6 +135,20 @@ type PlaceRequest struct {
 type PlaceResult struct {
 	ClientOrderID order.ClientOrderID
 	ExchangeID    string
+	TxHash        string
+	Err           error
+}
+
+// ModifyRequest 改已存活挂单的价格和数量，ClientOrderID 不变。
+type ModifyRequest struct {
+	Symbol        string
+	ClientOrderID order.ClientOrderID
+	Price         decimal.Decimal
+	Quantity      decimal.Decimal
+}
+
+type ModifyResult struct {
+	ClientOrderID order.ClientOrderID
 	TxHash        string
 	Err           error
 }

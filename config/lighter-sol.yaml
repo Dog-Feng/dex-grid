@@ -13,7 +13,7 @@
 symbol: SOL
 direction: long          # long | short | neutral
 leverage: 10
-margin_mode: isolated
+margin_mode: cross
 preset: stable
 
 grid:

@@ -22,6 +22,7 @@ import (
 	"dex-grid/internal/infra/store"
 
 	_ "dex-grid/internal/domain/strategy/grid"
+	_ "dex-grid/internal/domain/strategy/martingale"
 	_ "dex-grid/internal/exchange/lighter"
 )
 

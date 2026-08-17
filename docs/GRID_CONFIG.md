@@ -1,6 +1,6 @@
 # dex-grid 网格配置文档
 
-版本：v0.2
+版本：v0.3
 
 配置分两处，职责不重叠：
 
@@ -183,7 +183,7 @@ exchanges:
 | 策略类型 | `strategy` | string | `grid` | `grid` / `martingale` |
 | 网格类型 | `direction` | string | `neutral` | `neutral`（中性）/ `long`（做多）/ `short`（做空） |
 | 杠杆 (x) | `leverage` | int | — | 1 - 市场上限 |
-| 保证金模式 | `margin_mode` | string | `isolated` | `isolated`（逐仓，推荐）/ `cross`（全仓） |
+| 保证金模式 | `margin_mode` | string | `cross` | `cross`（全仓，默认）/ `isolated`（逐仓） |
 | 风格 | `preset` | string | `stable` | `stable`（稳健）/ `aggressive`（激进）/ `safe`（成交少更安全）。仅影响「智能填充」的推荐值，不影响运行 |
 
 ## 7. grid —— 普通网格参数
@@ -378,7 +378,7 @@ exchanges:
 | 规则 | 提示 |
 | --- | --- |
 | 开启 trailing 但未设 `stop_loss_price` | 追价无止损风险大 |
-| `margin_mode = cross` | 建议使用逐仓隔离风险 |
+| `margin_mode = isolated` | 逐仓时可用保证金仅该仓，强平价更近，确认仓位规模足够 |
 | `leverage > 20` | 高杠杆，强平价距区间边界很近时额外提示具体数值 |
 | 强平价落在网格区间内 | **区间未跑完就会强平**，这是致命配置，必须醒目提示 |
 | `out_of_range = pause` 且无止损 | 价格长期不回归时仓位一直挂着，无任何保护 |
@@ -471,9 +471,11 @@ Content-Type: application/json
 
 ---
 
-# 第四部分：马丁网格参数（第二阶段）
+# 第四部分：马丁网格参数
 
-`strategy = martingale`，`direction` 仅支持 `long` / `short`。
+`strategy = martingale`，`direction` 仅支持 `long` / `short`。控制台不展示「最大周期数」，提交 `max_cycles: 0`（止盈后无限重开）。
+
+加仓成交后**修改**已有止盈单（Lighter `ModifyOrder`），不撤了再挂：新止盈价按新持仓均价计算，数量必须等于当前仓位。详见 [LIGHTER.md](LIGHTER.md) 第 8.2 节。
 
 ## 15. 字段总表
 
@@ -487,7 +489,7 @@ Content-Type: application/json
 | 加仓金额倍数 | `martingale.add_multiplier` | string | `"1.0"` | 第 k 次加仓保证金 = `add_margin × add_multiplier^(k−1)` |
 | 加仓间距基准 | `martingale.add_drop_mode` | string | `from_last` | `from_last`（距上次成交价）/ `from_avg`（距持仓均价） |
 | 止盈后重开 | `martingale.cycle_restart` | bool | `true` | |
-| 最大周期数 | `martingale.max_cycles` | int | `0` | `0` = 不限 |
+| 最大周期数 | `martingale.max_cycles` | int | `0` | `0` = 不限。控制台已去掉该输入，始终按 0 提交 |
 | 预挂加仓单 | `martingale.preplace_adds` | bool | `true` | 提前把加仓单全部 post-only 挂出，反应更快 |
 
 杠杆、保证金模式、建仓方式、风控参数与普通网格共用（第 6、8、9 节）。

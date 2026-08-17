@@ -95,7 +95,7 @@ func (e *Executor) ConsecutiveFails() int { return e.fails }
 // ResetFails 在一次成功的交易操作后清零连续失败。
 func (e *Executor) ResetFails() { e.fails = 0 }
 
-// Apply 同步执行一组意图。顺序：设杠杆 → 撤单 → 平仓 → 下单。
+// Apply 同步执行一组意图。顺序：设杠杆 → 撤单 → 改单 → 平仓 → 下单。
 //
 // EnsurePosition 与 Stop 不在这里执行，原样带回给 Runner。
 func (e *Executor) Apply(ctx context.Context, acts []strategy.Action) Results {
@@ -108,6 +108,7 @@ func (e *Executor) Apply(ctx context.Context, acts []strategy.Action) Results {
 		leverage  *strategy.SetLeverage
 		cancelAll bool
 		cancels   []strategy.CancelOrder
+		modifies  []strategy.ModifyOrder
 		places    []strategy.PlaceOrder
 		closePos  *strategy.ClosePosition
 	)
@@ -120,6 +121,8 @@ func (e *Executor) Apply(ctx context.Context, acts []strategy.Action) Results {
 			cancelAll = true
 		case strategy.CancelOrder:
 			cancels = append(cancels, v)
+		case strategy.ModifyOrder:
+			modifies = append(modifies, v)
 		case strategy.PlaceOrder:
 			places = append(places, v)
 		case strategy.ClosePosition:
@@ -140,10 +143,8 @@ func (e *Executor) Apply(ctx context.Context, acts []strategy.Action) Results {
 		if err := e.withRetry(ctx, "set_leverage", func() error {
 			return e.ex.SetLeverage(ctx, e.opts.Symbol, leverage.Leverage, leverage.Mode)
 		}); err != nil {
-			e.noteError(err, &res)
-			if res.Fatal != nil {
-				return res
-			}
+			e.opts.Log.Warn("set_leverage failed, continue", "err", err)
+			e.recordClass(exchange.ClassOf(err), &res)
 		}
 	}
 
@@ -158,6 +159,13 @@ func (e *Executor) Apply(ctx context.Context, acts []strategy.Action) Results {
 		}
 	} else if len(cancels) > 0 {
 		e.cancel(ctx, cancels, now, &res)
+		if res.Fatal != nil {
+			return res
+		}
+	}
+
+	if len(modifies) > 0 {
+		e.modify(ctx, modifies, now, &res)
 		if res.Fatal != nil {
 			return res
 		}
@@ -266,6 +274,110 @@ func (e *Executor) place(ctx context.Context, places []strategy.PlaceOrder, now 
 
 	if e.progress.Confirmed > 0 && res.Failures == 0 {
 		e.fails = 0
+	}
+}
+
+func (e *Executor) modify(ctx context.Context, mods []strategy.ModifyOrder, now time.Time, res *Results) {
+	if !e.ex.Capabilities().ModifyOrder {
+		e.opts.Log.Warn("exchange has no modify, falling back to cancel+place")
+		cancels := make([]strategy.CancelOrder, len(mods))
+		places := make([]strategy.PlaceOrder, len(mods))
+		for i, m := range mods {
+			cancels[i] = strategy.CancelOrder{ClientOrderID: m.ClientOrderID}
+			places[i] = strategy.PlaceOrder{
+				ClientOrderID: m.ClientOrderID,
+				Side:          m.Side,
+				Type:          m.Type,
+				Price:         m.Price,
+				Quantity:      m.Quantity,
+				TIF:           m.TIF,
+				ReduceOnly:    m.ReduceOnly,
+			}
+		}
+		e.cancel(ctx, cancels, now, res)
+		if res.Fatal != nil {
+			return
+		}
+		e.place(ctx, places, now, res)
+		return
+	}
+
+	reqs := make([]exchange.ModifyRequest, len(mods))
+	for i, m := range mods {
+		reqs[i] = exchange.ModifyRequest{
+			Symbol:        e.opts.Symbol,
+			ClientOrderID: m.ClientOrderID,
+			Price:         m.Price,
+			Quantity:      m.Quantity,
+		}
+	}
+
+	pending := reqs
+	byID := make(map[order.ClientOrderID]strategy.ModifyOrder, len(mods))
+	for _, m := range mods {
+		byID[m.ClientOrderID] = m
+	}
+	for attempt := 0; attempt <= e.opts.MaxRetries && len(pending) > 0; attempt++ {
+		if attempt > 0 {
+			if err := e.opts.Sleep(ctx, backoff(e.opts.RetryWait, attempt-1)); err != nil {
+				res.Fatal = err
+				return
+			}
+		}
+		var retry []exchange.ModifyRequest
+		for _, chunk := range chunks(pending, 1) {
+			if err := e.waitLimit(ctx); err != nil {
+				res.Fatal = err
+				return
+			}
+			results, err := e.ex.ModifyOrders(ctx, chunk)
+			if err != nil {
+				class := exchange.ClassOf(err)
+				if class == exchange.ClassFatal {
+					res.Fatal = err
+					e.fails++
+					return
+				}
+				if class.Retryable() && attempt < e.opts.MaxRetries {
+					retry = append(retry, chunk...)
+					continue
+				}
+				e.recordClass(class, res)
+				e.opts.Log.Warn("modify_order failed, keep resting order", "err", err, "coid", chunk[0].ClientOrderID)
+				continue
+			}
+			for i, r := range results {
+				req := chunk[i]
+				src := byID[req.ClientOrderID]
+				if r.Err == nil {
+					res.Events = append(res.Events, strategy.OrderEvent{
+						Order: order.Order{
+							ClientOrderID: req.ClientOrderID,
+							Symbol:        e.opts.Symbol,
+							Side:          src.Side,
+							Type:          src.Type,
+							TIF:           src.TIF,
+							Price:         req.Price,
+							Quantity:      req.Quantity,
+							ReduceOnly:    src.ReduceOnly,
+							State:         order.StateOpen,
+							UpdatedAt:     now,
+						},
+						Now: now,
+					})
+					continue
+				}
+				class := exchange.ClassOf(r.Err)
+				if class.Retryable() && attempt < e.opts.MaxRetries {
+					retry = append(retry, req)
+					continue
+				}
+				e.recordClass(class, res)
+				e.opts.Log.Warn("modify_order rejected, keep resting order",
+					"err", r.Err, "coid", req.ClientOrderID)
+			}
+		}
+		pending = retry
 	}
 }
 

@@ -27,7 +27,6 @@ const (
 const (
 	WarnNoStopLoss      = "NO_STOP_LOSS"
 	WarnTrailingNoStop  = "TRAILING_WITHOUT_STOP_LOSS"
-	WarnCrossMargin     = "CROSS_MARGIN"
 	WarnHighLeverage    = "HIGH_LEVERAGE"
 	WarnLiqInsideRange  = "LIQUIDATION_INSIDE_RANGE"
 	WarnThinProfit      = "THIN_PROFIT_MARGIN"

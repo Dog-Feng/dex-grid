@@ -24,6 +24,17 @@ type PlaceOrder struct {
 	ReduceOnly    bool
 }
 
+// ModifyOrder 改挂单价和数量，不撤单重挂。ClientOrderID 必须是已在交易所存活的订单。
+type ModifyOrder struct {
+	ClientOrderID order.ClientOrderID
+	Side          order.Side
+	Type          order.Type
+	Price         decimal.Decimal
+	Quantity      decimal.Decimal
+	TIF           order.TIF
+	ReduceOnly    bool
+}
+
 // CancelOrder 撤销指定订单。
 type CancelOrder struct {
 	ClientOrderID order.ClientOrderID
@@ -67,6 +78,7 @@ type Stop struct {
 }
 
 func (PlaceOrder) actionMarker()     {}
+func (ModifyOrder) actionMarker()    {}
 func (CancelOrder) actionMarker()    {}
 func (CancelAll) actionMarker()      {}
 func (SetLeverage) actionMarker()    {}

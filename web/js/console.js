@@ -155,6 +155,22 @@ function fmtTime(v) {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+function fmtRuntime(resetAt, running) {
+  if (!running || !resetAt) return "—";
+  const start = new Date(resetAt).getTime();
+  if (!Number.isFinite(start) || start < Date.parse("2020-01-01")) return "—";
+  const sec = Math.floor((Date.now() - start) / 1000);
+  if (!(sec >= 0)) return "—";
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  const p = (n) => String(n).padStart(2, "0");
+  if (d > 0) return `${d}天 ${p(h)}:${p(m)}:${p(s)}`;
+  if (h > 0) return `${h}小时 ${p(m)}:${p(s)}`;
+  return `${m}分 ${p(s)}秒`;
+}
+
 function titleCase(name) {
   if (!name) return "—";
   return name.charAt(0).toUpperCase() + name.slice(1);
@@ -189,40 +205,91 @@ function setConn(ok, text) {
   $("conn-text").textContent = text;
 }
 
+function isMartingale() {
+  return (selected("kind") || "grid") === "martingale";
+}
+
+function principalOf(cfg) {
+  if (!cfg) return 0;
+  if (cfg.strategy === "martingale" || cfg.martingale) {
+    return Number((cfg.martingale || {}).initial_margin) || 0;
+  }
+  const g = cfg.grid || {};
+  if (g.sizing_mode === "margin") return Number(g.margin) || 0;
+  const qty = Number(g.per_grid_qty) || 0;
+  const count = Number(g.grid_count) || 0;
+  const mid = (Number(g.lower_price) + Number(g.upper_price)) / 2;
+  const lev = Number(cfg.leverage) || 1;
+  if (qty > 0 && count > 0 && mid > 0 && lev > 0) return (qty * count * mid) / lev;
+  return 0;
+}
+
+function annualizedReturn(pnl, capital, resetAt) {
+  if (!(capital > 0) || !Number.isFinite(pnl)) return "";
+  const start = resetAt ? new Date(resetAt).getTime() : NaN;
+  if (!Number.isFinite(start)) return "";
+  const days = (Date.now() - start) / 86400000;
+  if (!(days > 1 / 1440)) return ""; // 不足 1 分钟不展示
+  return ((pnl / capital) * (365 / days) * 100).toFixed(2);
+}
+
 function collectParams() {
   const prev = state.config || {};
-  const grid = { ...(prev.grid || {}) };
   const entry = { ...(prev.entry || {}) };
   const risk = { ...(prev.risk || {}) };
+  entry.mode = $("entry-mode").value;
+  if (entry.mode === "limit_price") entry.price = $("entry-price").value;
+  const kind = selected("kind") || "grid";
+  const out = {
+    ...prev,
+    strategy: kind,
+    symbol: $("symbol").value,
+    direction: selected("direction") || "long",
+    leverage: Number($("leverage").value) || 1,
+    margin_mode: $("margin-mode").value,
+    entry,
+    risk,
+    order: prev.order || {},
+  };
+  delete out.preset;
+  if (kind === "martingale") {
+    if (out.direction === "neutral") out.direction = "long";
+    out.martingale = {
+      ...(prev.martingale || {}),
+      add_drop_pct: $("mg-drop").value,
+      take_profit_pct: $("mg-tp").value,
+      initial_margin: $("mg-initial").value,
+      add_margin: $("mg-add").value,
+      max_add_times: Number($("mg-times").value) || 1,
+      add_multiplier: $("mg-mult").value,
+      add_drop_mode: $("mg-mode").value,
+      cycle_restart: $("mg-restart").value === "true",
+      max_cycles: 0,
+      preplace_adds: $("mg-preplace").value === "true",
+    };
+    if ($("mg-sl").value) out.risk = { ...out.risk, stop_loss_price: $("mg-sl").value };
+    else if (out.risk) delete out.risk.stop_loss_price;
+    return out;
+  }
+  const grid = { ...(prev.grid || {}) };
   grid.lower_price = $("lower").value;
   grid.upper_price = $("upper").value;
   grid.grid_count = Number($("count").value);
   grid.sizing_mode = $("sizing").value;
   if (grid.sizing_mode === "margin") grid.margin = $("margin").value;
   else grid.per_grid_qty = $("qty").value;
-  entry.mode = $("entry-mode").value;
-  if (entry.mode === "limit_price") entry.price = $("entry-price").value;
-  risk.out_of_range = $("out-of-range").value;
-  return {
-    ...prev,
-    symbol: $("symbol").value,
-    direction: selected("direction") || "long",
-    leverage: Number($("leverage").value) || 1,
-    margin_mode: $("margin-mode").value,
-    preset: selected("preset") || "stable",
-    grid,
-    entry,
-    risk,
-    order: prev.order || {},
-  };
+  out.grid = grid;
+  out.risk = { ...out.risk, out_of_range: $("out-of-range").value };
+  return out;
 }
 
 function fillForm(cfg) {
   if (!cfg || !cfg.symbol) return;
   state.config = cfg;
+  const kind = cfg.strategy === "martingale" || cfg.martingale ? "martingale" : "grid";
+  selectMode("kind", kind);
   setSymbol(cfg.symbol, false);
-  selectMode("direction", cfg.direction || "neutral");
-  selectMode("preset", cfg.preset || "stable");
+  selectMode("direction", cfg.direction || "long");
   const g = cfg.grid || {};
   if (g.lower_price != null) $("lower").value = dec(g.lower_price);
   if (g.upper_price != null) $("upper").value = dec(g.upper_price);
@@ -237,6 +304,18 @@ function fillForm(cfg) {
   if (cfg.risk && cfg.risk.out_of_range) $("out-of-range").value = cfg.risk.out_of_range;
   if (cfg.entry && cfg.entry.mode) $("entry-mode").value = cfg.entry.mode;
   if (cfg.entry && cfg.entry.price != null) $("entry-price").value = dec(cfg.entry.price);
+  const mg = cfg.martingale || {};
+  if (mg.add_drop_pct != null) $("mg-drop").value = dec(mg.add_drop_pct);
+  if (mg.take_profit_pct != null) $("mg-tp").value = dec(mg.take_profit_pct);
+  if (mg.initial_margin != null) $("mg-initial").value = dec(mg.initial_margin);
+  if (mg.add_margin != null) $("mg-add").value = dec(mg.add_margin);
+  if (mg.max_add_times != null) $("mg-times").value = String(mg.max_add_times);
+  if (mg.add_multiplier != null) $("mg-mult").value = dec(mg.add_multiplier);
+  if (mg.add_drop_mode) $("mg-mode").value = mg.add_drop_mode;
+  if (mg.cycle_restart != null) $("mg-restart").value = String(mg.cycle_restart);
+  if (mg.preplace_adds != null) $("mg-preplace").value = String(mg.preplace_adds);
+  if (cfg.risk && cfg.risk.stop_loss_price) $("mg-sl").value = dec(cfg.risk.stop_loss_price);
+  updateKind();
   updateEntryHint();
   updateDerived();
 }
@@ -271,8 +350,16 @@ function applyStatus(st) {
   $("st-eq").textContent = num(acct.equity, 2);
   setSigned($("st-real"), realized);
   setSigned($("st-unreal"), unreal);
-  $("st-liq").textContent = pos.liquidation_price ? dec(pos.liquidation_price) : "—";
+  $("st-liq").textContent = pos.liquidation_price ? num(pos.liquidation_price, 2) : "—";
+  const apr = annualizedReturn(Number(realized || 0) + Number(unreal || 0), principalOf(cfg), stats.reset_at);
+  if (apr === "") {
+    $("st-apr").textContent = "—";
+    $("st-apr").classList.remove("up", "down");
+  } else {
+    setSigned($("st-apr"), apr);
+  }
   $("st-grids").textContent = String(stats.completed_grids ?? 0);
+  $("st-runtime").textContent = fmtRuntime(stats.reset_at, running);
 
   const phase = PHASE_LABEL[strat.phase] || STATUS_LABEL[status] || status || "—";
   const dirTxt = DIR_LABEL[dir] ? DIR_LABEL[dir] + "网格" : "网格";
@@ -308,28 +395,30 @@ function applyStatus(st) {
   $("ov-ex").textContent = ex;
   $("ov-exname").textContent = net ? `${ex} ${String(net).toUpperCase()}` : ex;
 
-  $("btn-start").textContent = `启动 ${ex} 网格`;
+  $("btn-start").textContent = isMartingale() ? `启动 ${ex} 马丁` : `启动 ${ex} 网格`;
+  const gridsLbl = $("st-grids") && $("st-grids").previousElementSibling;
+  if (gridsLbl) gridsLbl.textContent = isMartingale() ? "完成周期" : "完成格";
   $("btn-goto-ex").textContent = `进入 ${ex} 控制台 →`;
   lockForm(running);
   drawChart();
 }
 
 function lockForm(running) {
-  const freeze = ["symbol-trigger", "leverage", "margin-mode", "sizing", "margin", "qty", "entry-mode", "entry-price", "out-of-range"];
+  const freeze = ["symbol-trigger", "leverage", "margin-mode", "sizing", "margin", "qty", "entry-mode", "entry-price", "out-of-range", "mg-drop", "mg-tp", "mg-initial", "mg-add", "mg-times", "mg-mult", "mg-mode", "mg-restart", "mg-preplace", "mg-sl"];
   freeze.forEach((id) => {
     const el = $(id);
     if (el) el.disabled = running;
   });
-  document.querySelectorAll('.mode-btn[data-group="direction"], .mode-btn[data-group="preset"]').forEach((el) => {
+  document.querySelectorAll('.mode-btn[data-group="direction"], .mode-btn[data-group="kind"]').forEach((el) => {
     el.style.pointerEvents = running ? "none" : "";
     el.style.opacity = running ? "0.55" : "";
   });
   $("btn-start").disabled = running;
   $("btn-stop").disabled = !running;
-  $("btn-adjust").disabled = !running;
+  $("btn-adjust").disabled = !running || isMartingale();
+  $("btn-adjust").hidden = isMartingale();
   $("btn-cancel").disabled = !running;
   $("btn-refill").disabled = !running;
-  $("btn-smart").disabled = running;
 }
 
 function renderTrades(list) {
@@ -389,22 +478,42 @@ function renderChips(system, exchanges) {
 }
 
 function updateKind() {
-  const kind = selected("kind") || "grid";
-  const grid = $("grid-config");
-  const mart = $("martingale-box");
-  const isGrid = kind === "grid";
-  grid.hidden = !isGrid;
-  mart.hidden = isGrid;
-  if (isGrid) drawChart();
+  const mart = isMartingale();
+  $("grid-fields").hidden = mart;
+  $("martingale-fields").hidden = !mart;
+  const neu = document.querySelector('.mode-btn[data-group="direction"][data-value="neutral"]');
+  if (neu) neu.hidden = mart;
+  if (mart && selected("direction") === "neutral") selectMode("direction", "long");
+  $("btn-adjust").hidden = mart;
+  drawChart();
 }
 
 function updateDerived() {
+  const box = $("derived");
+  const warn = $("warn");
+  if (isMartingale()) {
+    const drop = Number($("mg-drop").value);
+    const times = Number($("mg-times").value);
+    const initial = Number($("mg-initial").value);
+    const add = Number($("mg-add").value);
+    const mult = Number($("mg-mult").value) || 1;
+    if (!(drop > 0) || times < 1 || !(initial > 0) || !(add > 0)) {
+      box.innerHTML = "";
+      warn.classList.add("show");
+      warn.textContent = "加仓间距、次数与保证金必须大于 0。";
+      return;
+    }
+    let total = initial;
+    for (let k = 0; k < times; k++) total += add * Math.pow(mult, k);
+    box.innerHTML = `加满仓保证金约 <b>${total.toFixed(2)} USDC</b> · 预挂 <b>${times + 1}</b> 笔（加仓 + 止盈）`;
+    warn.classList.remove("show");
+    schedulePreview();
+    return;
+  }
   const lower = Number($("lower").value);
   const upper = Number($("upper").value);
   const count = Number($("count").value);
   const leverage = Number($("leverage").value) || 1;
-  const box = $("derived");
-  const warn = $("warn");
   if (!(upper > lower) || count < 2) {
     box.innerHTML = "";
     warn.classList.add("show");
@@ -443,6 +552,25 @@ function applyPreview(d) {
   if (!d) return;
   const box = $("derived");
   const warn = $("warn");
+  if (isMartingale() || d.levels) {
+    const margin = Number(d.total_margin ?? d.margin_required);
+    const liq = Number(d.liquidation_price);
+    const orders = d.order_count;
+    const dd = Number(d.max_drawdown_pct);
+    box.innerHTML =
+      `加满仓保证金 <b>${Number.isFinite(margin) ? margin.toFixed(2) : "—"} USDC</b> · ` +
+      `强平价 <b>${Number.isFinite(liq) ? liq.toFixed(2) : "—"}</b> · ` +
+      `最大回撤 <b>${Number.isFinite(dd) ? dd.toFixed(1) : "—"}%</b> · ` +
+      `挂单 <b>${orders ?? "—"}</b> 笔`;
+    const ws = Array.isArray(d.warnings) ? d.warnings : [];
+    if (ws.length) {
+      warn.classList.add("show");
+      warn.textContent = ws.map((w) => w.message || w).join(" ");
+    } else {
+      warn.classList.remove("show");
+    }
+    return;
+  }
   const step = Number(d.step);
   const stepPct = Number(d.step_pct);
   const profit = Number(d.net_grid_profit ?? d.grid_profit);
@@ -497,7 +625,7 @@ function updateEntryHint() {
     market: "立即市价建仓（唯一 taker 路径）。",
     limit_price: "在指定价挂 post-only，等成交。",
   };
-  hint.textContent = (dir === "long" ? "做多先建底仓（上方卖格数量之和）。" : "做空先建空仓。") + " " + map[mode];
+  hint.textContent = (isMartingale() ? "做多先建首单仓位。" : "做多先建底仓（上方卖格数量之和）。") + " " + map[mode];
 }
 
 function bindModes() {
@@ -610,7 +738,7 @@ function fmtAxisTime(ms) {
 
 function drawChart() {
   const canvas = $("chart");
-  if (!canvas || $("grid-config").hidden) return;
+  if (!canvas || !$("strategy-form")) return;
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth;
@@ -760,7 +888,7 @@ async function refreshKlines(force) {
 }
 
 function bindForms() {
-  ["lower", "upper", "count", "leverage", "margin", "qty", "entry-price"].forEach((id) => {
+  ["lower", "upper", "count", "leverage", "margin", "qty", "entry-price", "mg-drop", "mg-tp", "mg-initial", "mg-add", "mg-times", "mg-mult", "mg-sl"].forEach((id) => {
     const el = $(id);
     if (!el) return;
     el.addEventListener("input", () => {
@@ -777,6 +905,10 @@ function bindForms() {
   $("entry-mode").addEventListener("change", updateEntryHint);
   $("out-of-range").addEventListener("change", schedulePreview);
   $("margin-mode").addEventListener("change", schedulePreview);
+  ["mg-mode", "mg-restart", "mg-preplace"].forEach((id) => {
+    const el = $(id);
+    if (el) el.addEventListener("change", schedulePreview);
+  });
 }
 
 async function loadBootstrap() {
@@ -848,21 +980,6 @@ function bindActions() {
     });
   });
   $("btn-goto-ex").onclick = () => switchTab("lighter");
-  $("btn-smart").onclick = () => {
-    const st = state.status || {};
-    const mark = Number(st.mark);
-    const same = $("symbol").value && $("symbol").value === strategySymbol();
-    $("count").value = $("count").value || "25";
-    if (!$("margin").value) $("margin").value = "1000";
-    if (!$("leverage").value) $("leverage").value = "10";
-    if (same && Number.isFinite(mark) && mark > 0) {
-      const width = mark * 0.04;
-      $("lower").value = (mark - width).toFixed(3);
-      $("upper").value = (mark + width).toFixed(3);
-    }
-    updateDerived();
-    toast("已按当前策略交易对标记价填充区间");
-  };
   $("btn-start").onclick = () =>
     openModal("启动网格", "将保存当前配置并启动。校验通过后建仓、再铺网格。停止时只撤本交易对挂单、保留仓位。", async () => {
       try {

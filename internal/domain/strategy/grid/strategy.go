@@ -19,6 +19,22 @@ func init() {
 	strategy.Register(Name, func(params []byte) (strategy.Strategy, error) {
 		return New(params)
 	})
+	strategy.RegisterPreview(Name, func(params []byte, in strategy.PreviewContext) (any, error) {
+		p := DefaultParams()
+		if len(params) > 0 {
+			if err := json.Unmarshal(params, &p); err != nil {
+				return nil, fmt.Errorf("grid: invalid params: %w", err)
+			}
+		}
+		p.ApplyDefaults()
+		return Preview(PreviewInput{
+			Params:        p,
+			Market:        in.Market,
+			Mark:          in.Mark,
+			Available:     in.Available,
+			MaxOpenOrders: in.MaxOpenOrders,
+		})
+	})
 }
 
 // positionTolerance 是判定「仓位已到位」的相对容忍度。
@@ -96,8 +112,8 @@ func (s *Strategy) Init(st strategy.State) ([]strategy.Action, error) {
 
 	if s.restored && s.grid != nil {
 		// 从快照恢复：沿用原有网格与轮次，按对账结果同步格子状态。
-		s.syncFromOrders(st.Orders)
-		return s.resumeActions(st.Now), nil
+		cancels := s.syncFromOrders(st.Orders)
+		return append(cancels, s.resumeActions(st.Now)...), nil
 	}
 
 	if st.Epoch >= order.MaxEpoch {
@@ -170,8 +186,8 @@ func (s *Strategy) OnEvent(ev strategy.Event) ([]strategy.Action, error) {
 
 	case strategy.ResyncEvent:
 		s.position = e.Position.Size
-		s.syncFromOrders(e.Orders)
-		return s.resumeActions(e.Now), nil
+		cancels := s.syncFromOrders(e.Orders)
+		return append(cancels, s.resumeActions(e.Now)...), nil
 
 	default:
 		return nil, nil
@@ -516,12 +532,15 @@ func (s *Strategy) placeActions(now time.Time) []strategy.Action {
 }
 
 // resumeActions 在恢复运行或重连对账后决定下一步。
+//
+// 建仓只允许在尚未进入 Running 时发生。网格运行中仓位会随买卖腿增减，
+// 若这里再 EnsurePosition 拉回初始目标，就会把刚成交的格子立刻反向平掉。
 func (s *Strategy) resumeActions(now time.Time) []strategy.Action {
-	if s.needsEntry() {
-		s.phase = strategy.PhaseEntering
-		return []strategy.Action{strategy.EnsurePosition{Target: s.target}}
-	}
 	if s.phase == strategy.PhaseIdle || s.phase == strategy.PhaseEntering {
+		if s.needsEntry() {
+			s.phase = strategy.PhaseEntering
+			return []strategy.Action{strategy.EnsurePosition{Target: s.target}}
+		}
 		s.phase = strategy.PhaseRunning
 	}
 	if acts, handled := s.checkRange(now); handled {
@@ -533,16 +552,18 @@ func (s *Strategy) resumeActions(now time.Time) []strategy.Action {
 	return s.placeActions(now)
 }
 
-// syncFromOrders 用对账结果同步格子状态。
-func (s *Strategy) syncFromOrders(orders []order.Order) {
+// syncFromOrders 用对账结果同步格子状态，并撤掉本策略不认的多余单。
+func (s *Strategy) syncFromOrders(orders []order.Order) []strategy.Action {
 	if s.grid == nil {
-		return
+		return nil
 	}
 	for i := range s.grid.Cells {
 		s.grid.Cells[i].State = CellEmpty
 		s.grid.Cells[i].COID = 0
 		s.grid.Cells[i].PendingSince = time.Time{}
 	}
+	var extra []strategy.Action
+	seen := map[int]bool{}
 	for _, o := range orders {
 		if !o.ClientOrderID.Valid() || !o.State.IsActive() {
 			continue
@@ -551,15 +572,26 @@ func (s *Strategy) syncFromOrders(orders []order.Order) {
 		if ref.Purpose == order.PurposeEntry {
 			continue
 		}
-		if ref.Slot != s.slot || ref.Epoch != s.epoch || int(ref.Cell) >= len(s.grid.Cells) {
+		reject := ref.Slot != s.slot || ref.Epoch != s.epoch || int(ref.Cell) >= len(s.grid.Cells)
+		if !reject {
+			switch ref.Purpose {
+			case order.PurposeOpen, order.PurposeClose:
+			default:
+				reject = true
+			}
+		}
+		if reject || seen[int(ref.Cell)] {
+			extra = append(extra, strategy.CancelOrder{ClientOrderID: o.ClientOrderID})
 			continue
 		}
+		seen[int(ref.Cell)] = true
 		c := &s.grid.Cells[ref.Cell]
 		c.State = CellResting
 		c.COID = o.ClientOrderID
 		c.Seq = ref.Seq
 		c.Side = o.Side
 	}
+	return extra
 }
 
 func (s *Strategy) clearCells() {

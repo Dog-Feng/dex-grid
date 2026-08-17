@@ -15,6 +15,7 @@ import (
 	"dex-grid/internal/domain/order"
 	"dex-grid/internal/domain/strategy"
 	"dex-grid/internal/domain/strategy/grid"
+	_ "dex-grid/internal/domain/strategy/martingale"
 	"dex-grid/internal/exchange"
 	"dex-grid/internal/infra/logx"
 	"dex-grid/internal/infra/store"
@@ -155,38 +156,41 @@ func (s *Supervisor) Klines(ctx context.Context, name, symbol, interval string, 
 }
 
 // Preview 校验并计算派生量，不保存。
-func (s *Supervisor) Preview(ctx context.Context, name string, raw []byte) (grid.Derived, error) {
+func (s *Supervisor) Preview(ctx context.Context, name string, raw []byte) (any, error) {
 	inst, err := s.get(name)
 	if err != nil {
-		return grid.Derived{}, err
+		return nil, err
 	}
-	p, err := parseParams(raw)
+	common, err := strategy.ParseCommon(raw)
 	if err != nil {
-		return grid.Derived{}, err
+		return nil, err
 	}
-	mkt, err := inst.ex.Market(ctx, p.Symbol)
+	mkt, err := inst.ex.Market(ctx, common.Symbol)
 	if err != nil {
-		return grid.Derived{}, err
+		return nil, err
 	}
-	tick, err := inst.ex.Ticker(ctx, p.Symbol)
+	tick, err := inst.ex.Ticker(ctx, common.Symbol)
 	if err != nil {
-		return grid.Derived{}, err
+		return nil, err
 	}
 	acct, err := inst.ex.Account(ctx)
 	if err != nil {
-		return grid.Derived{}, err
+		return nil, err
 	}
 	mark := tick.Mark
 	if !mark.IsPositive() {
 		mark = tick.Book.Mid()
 	}
-	return grid.Preview(grid.PreviewInput{
-		Params:        p,
+	in := strategy.PreviewContext{
 		Market:        mkt,
 		Mark:          mark,
 		Available:     acct.Available,
 		MaxOpenOrders: inst.ex.Capabilities().MaxOpenOrders,
-	})
+	}
+	if pos, err := inst.ex.Position(ctx, common.Symbol); err == nil {
+		in.Position = pos.Size
+	}
+	return strategy.RunPreview(strategy.NameOf(raw), raw, in)
 }
 
 // GetConfig 返回已保存的策略参数 JSON。
@@ -205,33 +209,33 @@ func (s *Supervisor) GetConfig(name string) (json.RawMessage, error) {
 }
 
 // PutConfig 校验并保存策略配置。运行中拒绝。
-func (s *Supervisor) PutConfig(ctx context.Context, name string, raw []byte) (grid.Derived, error) {
+func (s *Supervisor) PutConfig(ctx context.Context, name string, raw []byte) (any, error) {
 	inst, err := s.get(name)
 	if err != nil {
-		return grid.Derived{}, err
+		return nil, err
 	}
 	if inst.runner != nil {
 		st := inst.runner.Status()
 		if st == engine.StatusRunning || st == engine.StatusStarting {
-			return grid.Derived{}, fmt.Errorf("实例运行中，不能修改配置")
+			return nil, fmt.Errorf("实例运行中，不能修改配置")
 		}
 	}
 	derived, err := s.Preview(ctx, name, raw)
 	if err != nil {
-		return grid.Derived{}, err
+		return nil, err
 	}
-	p, err := parseParams(raw)
+	common, err := strategy.ParseCommon(raw)
 	if err != nil {
-		return grid.Derived{}, err
+		return nil, err
 	}
 	if err := s.store.SaveConfig(store.Config{
 		Exchange:  name,
-		Symbol:    p.Symbol,
-		Strategy:  grid.Name,
-		Direction: p.Direction.String(),
-		Params:    json.RawMessage(mustJSON(p)),
+		Symbol:    common.Symbol,
+		Strategy:  common.Strategy,
+		Direction: common.Direction,
+		Params:    json.RawMessage(append([]byte(nil), raw...)),
 	}); err != nil {
-		return grid.Derived{}, err
+		return nil, err
 	}
 	return derived, nil
 }
@@ -339,17 +343,17 @@ func (s *Supervisor) Start(ctx context.Context, name string) (engine.InstanceVie
 	if !ok {
 		return engine.InstanceView{}, fmt.Errorf("尚未保存策略配置")
 	}
-	p, err := parseParams(c.Params)
+	common, err := strategy.ParseCommon(c.Params)
 	if err != nil {
 		return engine.InstanceView{}, err
 	}
-	if err := s.ensureRunner(inst, c.Params, false); err != nil {
+	if err := s.ensureRunner(inst, common.Strategy, c.Params, false); err != nil {
 		return engine.InstanceView{}, err
 	}
 	res := inst.runner.Call(ctx, engine.CmdStart, engine.StartPayload{
-		Symbol: p.Symbol,
-		Entry:  p.Entry,
-		Risk:   p.Risk,
+		Symbol: common.Symbol,
+		Entry:  common.Entry,
+		Risk:   common.Risk,
 	})
 	if !res.OK {
 		return res.View, fmt.Errorf("%s", res.Message)
@@ -412,17 +416,23 @@ func (s *Supervisor) command(ctx context.Context, name string, kind engine.Comma
 	return res.View, nil
 }
 
-func (s *Supervisor) ensureRunner(inst *instance, params []byte, restore bool) error {
+func (s *Supervisor) ensureRunner(inst *instance, name string, params []byte, restore bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if inst.runner != nil && inst.runner.Status() != engine.StatusStopped && inst.runner.Status() != engine.StatusError {
-		return nil
+	if inst.runner != nil {
+		st := inst.runner.Status()
+		if st == engine.StatusRunning || st == engine.StatusStarting {
+			return nil
+		}
 	}
 	if inst.cancel != nil {
 		inst.cancel()
 		inst.cancel = nil
 	}
-	strat, err := strategy.New(grid.Name, params)
+	if name == "" {
+		name = strategy.NameOf(params)
+	}
+	strat, err := strategy.New(name, params)
 	if err != nil {
 		return err
 	}
@@ -517,28 +527,6 @@ func (s *Supervisor) RestoreRunning(ctx context.Context) {
 			s.log.Error("restore failed", "exchange", name, "err", err)
 		}
 	}
-}
-
-func parseParams(raw []byte) (grid.Params, error) {
-	p := grid.DefaultParams()
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return p, fmt.Errorf("策略参数无法解析: %w", err)
-		}
-	}
-	p.ApplyDefaults()
-	if p.Symbol == "" {
-		return p, fmt.Errorf("必须指定交易对")
-	}
-	return p, nil
-}
-
-func mustJSON(v any) []byte {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return []byte("{}")
-	}
-	return b
 }
 
 type persistAdapter struct{ store *store.Store }

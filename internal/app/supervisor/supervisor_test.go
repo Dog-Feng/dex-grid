@@ -193,3 +193,55 @@ func TestLoadStrategyFileSkipsExistingConfig(t *testing.T) {
 		t.Fatalf("autostart=false should stay stopped, got %s", view.Status)
 	}
 }
+
+func TestStartStopMartingale(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "gridbot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	sup := New(&config.Config{}, st, nil, slog.Default())
+	ex := fake.New(market.Market{
+		Symbol: "SOL", TickSize: d("0.01"), LotSize: d("0.001"),
+		MinQty: d("0.001"), MinNotional: d("1"), MaxLeverage: 50,
+		PriceDecimals: 2, SizeDecimals: 3,
+		MakerFeeRate: d("0.0002"), TakerFeeRate: d("0.0005"),
+		MaintMarginRate: d("0.025"),
+	})
+	ex.SetBook(d("99.9"), d("100.1"))
+	ex.SetMark(d("100"))
+	sup.Attach(config.Exchange{Name: "fake", Enabled: true, MaxRetries: 2}, ex, 0)
+	t.Cleanup(func() { sup.Close(context.Background()) })
+
+	params := map[string]any{
+		"strategy": "martingale", "symbol": "SOL", "direction": "long", "leverage": 10,
+		"martingale": map[string]any{
+			"add_drop_pct": "2", "take_profit_pct": "1.5",
+			"initial_margin": "50", "add_margin": "50",
+			"max_add_times": 3, "add_multiplier": "1",
+		},
+		"entry": map[string]any{"mode": "market", "slice_count": 1},
+	}
+	raw, _ := json.Marshal(params)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if _, err := sup.PutConfig(ctx, "fake", raw); err != nil {
+		t.Fatal(err)
+	}
+	view, err := sup.Start(ctx, "fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Status != engine.StatusRunning.String() && view.Status != engine.StatusStarting.String() {
+		t.Fatalf("status after start = %s", view.Status)
+	}
+	time.Sleep(80 * time.Millisecond)
+	if n := len(ex.Resting()); n == 0 {
+		t.Fatal("expected martingale orders after start")
+	}
+	if _, err := sup.Stop(ctx, "fake"); err != nil {
+		t.Fatal(err)
+	}
+}

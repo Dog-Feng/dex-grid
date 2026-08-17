@@ -123,6 +123,33 @@ func TestMarketFillsImmediately(t *testing.T) {
 	}
 }
 
+func TestModifyRestingOrder(t *testing.T) {
+	ex := New(testMarket())
+	ex.SetBook(d("99"), d("101"))
+	ctx := context.Background()
+	id := coid(4)
+	_, err := ex.PlaceOrders(ctx, []exchange.PlaceRequest{{
+		Symbol: "BTC", ClientOrderID: id, Side: order.Sell,
+		Type: order.Limit, Price: d("110"), Quantity: d("1"), TIF: order.PostOnly,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := ex.ModifyOrders(ctx, []exchange.ModifyRequest{{
+		Symbol: "BTC", ClientOrderID: id, Price: d("108"), Quantity: d("2"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].Err != nil {
+		t.Fatalf("modify = %+v", res)
+	}
+	resting := ex.Resting()
+	if len(resting) != 1 || !resting[0].Price.Equal(d("108")) || !resting[0].Quantity.Equal(d("2")) {
+		t.Fatalf("resting = %+v", resting)
+	}
+}
+
 func TestCancelAll(t *testing.T) {
 	ex := New(testMarket())
 	ex.SetBook(d("99"), d("101"))

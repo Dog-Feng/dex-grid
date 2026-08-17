@@ -472,7 +472,7 @@ func (r *Runner) apply(ctx context.Context, acts []strategy.Action, now time.Tim
 }
 
 func (r *Runner) startEntry(ctx context.Context, req strategy.EnsurePosition, now time.Time) {
-	if r.entering && r.trig != nil && r.trig.Active() {
+	if r.entering {
 		r.log.Info("entry already in progress, ignore EnsurePosition")
 		return
 	}
@@ -592,10 +592,8 @@ func (r *Runner) watchdog(ctx context.Context) {
 		return
 	}
 
-	cells := r.strat.View().GridCount
 	var cancels []strategy.Action
 	var ours []order.Order
-	seen := map[uint16]bool{}
 	for _, o := range orders {
 		if !o.ClientOrderID.Valid() {
 			continue
@@ -604,22 +602,8 @@ func (r *Runner) watchdog(ctx context.Context) {
 		if ref.Slot != r.cfg.Slot {
 			continue
 		}
-		extra := r.epoch > 0 && ref.Epoch != r.epoch
-		switch ref.Purpose {
-		case order.PurposeEntry:
-			extra = true // 网格运行中不允许残留建仓单
-		case order.PurposeOpen, order.PurposeClose:
-			if int(ref.Cell) >= cells {
-				extra = true
-			} else if seen[ref.Cell] {
-				extra = true
-			} else {
-				seen[ref.Cell] = true
-			}
-		default:
-			extra = true
-		}
-		if extra {
+		// 编排层只丢掉明显不属于本轮的单；「缺哪笔、多哪笔」由策略 Resync 裁决。
+		if (r.epoch > 0 && ref.Epoch != r.epoch) || ref.Purpose == order.PurposeEntry {
 			cancels = append(cancels, strategy.CancelOrder{ClientOrderID: o.ClientOrderID})
 			continue
 		}

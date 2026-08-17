@@ -72,13 +72,11 @@
 
             <label>网格类型</label>
             <div class="modes">
-              <div class="mode-btn sel" data-group="kind" data-value="grid">普通网格<small>第一阶段</small></div>
-              <div class="mode-btn" data-group="kind" data-value="martingale">马丁网格<small>第二阶段</small></div>
+              <div class="mode-btn sel" data-group="kind" data-value="grid">普通网格</div>
+              <div class="mode-btn" data-group="kind" data-value="martingale">马丁网格</div>
             </div>
 
-            <div id="martingale-box" class="note" hidden>马丁网格尚未实现。请选择普通网格后再配置参数。</div>
-
-            <div id="grid-config">
+            <div id="strategy-form">
               <label>交易对</label>
               <div class="combo" id="symbol-combo">
                 <button type="button" class="combo-trigger" id="symbol-trigger" aria-expanded="false">
@@ -100,34 +98,28 @@
               <div class="modes">
                 <div class="mode-btn" data-group="direction" data-value="neutral">中性<small>两边开仓</small></div>
                 <div class="mode-btn sel" data-group="direction" data-value="long">做多<small>先建底仓</small></div>
-                <div class="mode-btn" data-group="direction" data-value="short">做空<small>先建空仓</small></div>
+                <div class="mode-btn" data-group="direction" data-value="short">做空<small>先建空头</small></div>
               </div>
-              <label>风格</label>
-              <div class="modes">
-                <div class="mode-btn sel" data-group="preset" data-value="stable">稳健</div>
-                <div class="mode-btn" data-group="preset" data-value="aggressive">激进</div>
-                <div class="mode-btn" data-group="preset" data-value="safe">成交少更安全</div>
+              <div class="row">
+                <div>
+                  <label>杠杆</label>
+                  <input id="leverage" type="number" value="10" min="1" />
+                </div>
+                <div>
+                  <label>保证金模式</label>
+                  <select id="margin-mode">
+                    <option value="cross" selected>全仓 cross</option>
+                    <option value="isolated">逐仓 isolated</option>
+                  </select>
+                </div>
               </div>
-              <button class="btn btn-smart" id="btn-smart">智能填充参数</button>
+              <div id="grid-fields">
               <div class="row">
                 <div><label>下边界</label><input id="lower" value="72" /></div>
                 <div><label>上边界</label><input id="upper" value="77" /></div>
               </div>
               <div class="row">
                 <div><label>格子数量</label><input id="count" type="number" value="25" min="2" /></div>
-                <div>
-                  <label>杠杆</label>
-                  <input id="leverage" type="number" value="10" min="1" />
-                </div>
-              </div>
-              <div class="row">
-                <div>
-                  <label>保证金模式</label>
-                  <select id="margin-mode">
-                    <option value="isolated" selected>逐仓 isolated</option>
-                    <option value="cross">全仓 cross</option>
-                  </select>
-                </div>
                 <div>
                   <label>数量输入</label>
                   <select id="sizing">
@@ -143,6 +135,48 @@
                 <option value="pause" selected>暂停网格，等待回归（不撤单）</option>
                 <option value="stop_and_cancel">停止网格并撤销挂单（留仓）</option>
               </select>
+              </div>
+
+              <div id="martingale-fields" hidden>
+                <div class="row">
+                  <div><label>跌多少加仓 (%)</label><input id="mg-drop" value="2.0" /></div>
+                  <div><label>单周期止盈 (%)</label><input id="mg-tp" value="1.5" /></div>
+                </div>
+                <div class="row">
+                  <div><label>初次保证金</label><input id="mg-initial" value="50" /></div>
+                  <div><label>加仓保证金</label><input id="mg-add" value="50" /></div>
+                </div>
+                <div class="row">
+                  <div><label>最大加仓次数</label><input id="mg-times" type="number" value="5" min="1" max="20" /></div>
+                  <div><label>加仓倍数</label><input id="mg-mult" value="1.0" /></div>
+                </div>
+                <div class="row">
+                  <div>
+                    <label>加仓间距基准</label>
+                    <select id="mg-mode">
+                      <option value="from_last" selected>距上次成交价</option>
+                      <option value="from_avg">距持仓均价</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label>止盈后重开</label>
+                    <select id="mg-restart">
+                      <option value="true" selected>是（无限循环）</option>
+                      <option value="false">否（止盈即停）</option>
+                    </select>
+                  </div>
+                </div>
+                <div>
+                  <label>预挂加仓单</label>
+                  <select id="mg-preplace">
+                    <option value="true" selected>是</option>
+                    <option value="false">否</option>
+                  </select>
+                </div>
+                <label>止损价（强烈建议）</label>
+                <input id="mg-sl" value="" placeholder="留空则不设硬止损" />
+              </div>
+
               <div id="derived" class="derived"></div>
               <div id="warn" class="warn-box"></div>
 
@@ -184,7 +218,9 @@
               <div class="status-item"><div class="lbl">已实现</div><div class="val" id="st-real">—</div></div>
               <div class="status-item"><div class="lbl">未实现</div><div class="val" id="st-unreal">—</div></div>
               <div class="status-item"><div class="lbl">强平价</div><div class="val" id="st-liq">—</div></div>
+              <div class="status-item"><div class="lbl">年化收益率</div><div class="val" id="st-apr">—</div></div>
               <div class="status-item"><div class="lbl">完成格</div><div class="val" id="st-grids">—</div></div>
+              <div class="status-item"><div class="lbl">策略运行时长</div><div class="val" id="st-runtime">—</div></div>
             </div>
             <div class="watchdog" id="st-watch">
               挂单看门狗 · 目标 <b>—</b> / 已确认 <b>—</b> · 更新于 —

@@ -604,6 +604,58 @@ func (a *Adapter) placeOne(ctx context.Context, req exchange.PlaceRequest) (stri
 	})
 }
 
+func (a *Adapter) ModifyOrders(ctx context.Context, reqs []exchange.ModifyRequest) ([]exchange.ModifyResult, error) {
+	results := make([]exchange.ModifyResult, len(reqs))
+	for i, req := range reqs {
+		results[i] = exchange.ModifyResult{ClientOrderID: req.ClientOrderID}
+		hash, err := a.modifyOne(ctx, req)
+		if err != nil {
+			results[i].Err = err
+			continue
+		}
+		results[i].TxHash = hash
+	}
+	return results, nil
+}
+
+func (a *Adapter) modifyOne(ctx context.Context, req exchange.ModifyRequest) (string, error) {
+	cm, err := a.lookup(ctx, req.Symbol)
+	if err != nil {
+		return "", err
+	}
+	m := cm.model
+
+	invalid := func(err error) (string, error) {
+		return "", exchange.Classify(exchange.ClassInvalidParam, "modify_order", err)
+	}
+	if !req.ClientOrderID.Valid() {
+		return invalid(fmt.Errorf("lighter: 客户端订单号 %d 非法", req.ClientOrderID))
+	}
+	price := m.RoundPrice(req.Price, market.RoundNearest)
+	qty := m.RoundQty(req.Quantity)
+	if err := m.CheckOrder(price, qty); err != nil {
+		return invalid(fmt.Errorf("lighter: %s 改单不满足市场限制: %w", req.Symbol, err))
+	}
+	priceInt, err := priceToInt(price, m.PriceDecimals)
+	if err != nil {
+		return invalid(err)
+	}
+	sizeInt, err := sizeToInt(qty, m.SizeDecimals)
+	if err != nil {
+		return invalid(err)
+	}
+
+	return a.tx.send(ctx, "modify_order", func(ops *ltypes.TransactOpts) (txtypes.TxInfo, error) {
+		return a.tx.tx.GetModifyOrderTransaction(&ltypes.ModifyOrderTxReq{
+			MarketIndex:  int16(cm.detail.MarketID),
+			Index:        int64(req.ClientOrderID),
+			BaseAmount:   sizeInt,
+			Price:        priceInt,
+			TriggerPrice: txtypes.NilOrderTriggerPrice,
+		}, ops)
+	})
+}
+
 func (a *Adapter) CancelOrders(ctx context.Context, reqs []exchange.CancelRequest) ([]exchange.CancelResult, error) {
 	results := make([]exchange.CancelResult, len(reqs))
 	for i, req := range reqs {

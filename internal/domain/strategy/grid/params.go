@@ -216,7 +216,7 @@ type Params struct {
 func DefaultParams() Params {
 	return Params{
 		Direction:  Neutral,
-		MarginMode: market.MarginIsolated,
+		MarginMode: market.MarginCross,
 		Grid: GridParams{
 			SpacingMode:       Arithmetic,
 			SizingMode:        PerGridQty,

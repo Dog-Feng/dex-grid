@@ -283,10 +283,6 @@ func collectWarnings(p Params, m market.Market, g *Grid, d Derived, in PreviewIn
 				"未设置止损价。区间外策略默认只是挂起等待回归，本身不构成保护"))
 		}
 	}
-	if p.MarginMode == market.MarginCross {
-		ws = append(ws, warnf(WarnCrossMargin, "margin_mode",
-			"使用全仓模式，单个策略的亏损会波及整个账户，建议改用逐仓"))
-	}
 	if p.Leverage > highLeverageThreshold {
 		ws = append(ws, warnf(WarnHighLeverage, "leverage",
 			"%d 倍杠杆属于高杠杆，价格小幅逆向波动即可能强平", p.Leverage))

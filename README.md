@@ -52,7 +52,7 @@ Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运
 | 策略 | 标的 | 方向 | 阶段 | 状态 |
 | --- | --- | --- | --- | --- |
 | 普通合约网格 | 永续合约 | 做多 / 做空 / 中性 | 第一阶段 | 已实现 |
-| 马丁合约网格 | 永续合约 | 做多 / 做空 | 第二阶段 | 未开始 |
+| 马丁合约网格 | 永续合约 | 做多 / 做空 | 第二阶段 | 已实现（控制台可切换） |
 
 **不支持现货网格**，这是明确的设计边界而不是待办项。
 
@@ -104,11 +104,11 @@ Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运
 
 ### 两个关键解耦点
 
-**策略输出意图而非直接下单。** 策略处理事件后返回一组 `Action`（下单 / 撤单 / 平仓 / 停止），由 `Executor` 翻译成交易所调用。策略因此 100% 可单测，交易所差异全部收敛在适配器。
+**策略输出意图而非直接下单。** 策略处理事件后返回一组 `Action`（下单 / 改单 / 撤单 / 平仓 / 停止），由 `Executor` 翻译成交易所调用。策略因此 100% 可单测，交易所差异全部收敛在适配器。
 
 **HTTP 请求不直接碰状态。** `POST /start`、`/stop`、`/adjust-range` 等把命令投进 Runner 的事件 channel 并等待回执。Runner 仍然是单 goroutine 顺序处理，HTTP 的并发不会破坏领域状态的一致性。
 
-详见 [开发设计文档](docs/DESIGN.md)。
+详见 [开发设计文档](docs/DESIGN.md)。Lighter 协议与改单见 [LIGHTER.md](docs/LIGHTER.md)。
 
 ---
 
@@ -126,7 +126,7 @@ dex-grid/
 │   │   └── strategy/
 │   │       ├── strategy.go         # Strategy 接口、Action、Event
 │   │       ├── grid/               # 普通网格：价位生成 + 配对 + 状态机
-│   │       └── martingale/         # 马丁网格（第二阶段）
+│   │       └── martingale/         # 马丁网格：加仓计划 + 改止盈
 │   ├── app/
 │   │   ├── engine/                 # Runner：单 goroutine 事件循环 + 命令处理
 │   │   ├── executor/               # Action → Exchange，批量/限流/重试
@@ -154,6 +154,7 @@ dex-grid/
 ├── web/                            # 控制台静态页，由 go:embed 打进二进制
 ├── docs/
 │   ├── DESIGN.md                   # 开发设计文档
+│   ├── LIGHTER.md                  # Lighter 适配：协议、签名、nonce、改单
 │   ├── GRID_CONFIG.md              # 网格配置文档
 │   ├── DEPLOYMENT.md               # 安装部署文档
 │   └── images/ui-prototype.png
@@ -284,8 +285,8 @@ GOOS=windows GOARCH=amd64 go build -o dist/gridbot.exe ./cmd/gridbot
 | **M4 HTTP + 控制台** | REST + embed 静态控制台 | 页面可配置/启停/看状态与 1h 价格曲线 |
 | **M5 建仓与风控** | 三种建仓模式、止盈止损、区间外策略、trailing、熔断 | 主网小资金实盘 |
 | **M6 持久化与对账** | SQLite 落盘、启动恢复、周期漂移检查、指标 | 长时间无人值守 |
-| **M7 行情分析** | K 线已接入图表；EMA/斜率/ATR、趋势判定、参数推荐待做 | 「智能填充」可用 |
-| **M8 马丁网格** | 马丁策略实现 | 验证策略扩展性 |
+| **M7 行情分析** | K 线已接入图表；EMA/斜率/ATR、趋势判定、参数推荐待做 | 图表可用 |
+| **M8 马丁网格** | 马丁策略（做多/做空）、预挂加仓、加仓后 Modify 止盈、控制台表单 | 已实现 |
 | **M9 多交易所** | 接入第二个 DEX（具体交易所待定） | 验证端口抽象 |
 
 **扩展性验收标准**：新增交易所只允许改 `internal/exchange/<name>/` 与 `main.go` 一行注册；新增策略只允许改 `internal/domain/strategy/<name>/` 与配置结构体。若必须改 `app` 层，说明抽象有缺陷，先修抽象。

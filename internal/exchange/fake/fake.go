@@ -182,6 +182,45 @@ func (e *Exchange) PlaceOrders(_ context.Context, reqs []exchange.PlaceRequest) 
 	return out, nil
 }
 
+func (e *Exchange) ModifyOrders(_ context.Context, reqs []exchange.ModifyRequest) ([]exchange.ModifyResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	now := time.Now().UTC()
+	out := make([]exchange.ModifyResult, len(reqs))
+	for i, req := range reqs {
+		out[i] = exchange.ModifyResult{ClientOrderID: req.ClientOrderID}
+		o, ok := e.orders[req.ClientOrderID]
+		if !ok {
+			out[i].Err = exchange.Classify(exchange.ClassInvalidParam, "modify_order",
+				fmt.Errorf("fake: order %d not found", req.ClientOrderID))
+			continue
+		}
+		price := e.mkt.RoundPrice(req.Price, market.RoundNearest)
+		qty := e.mkt.RoundQty(req.Quantity)
+		if err := e.mkt.CheckOrder(price, qty); err != nil {
+			out[i].Err = exchange.Classify(exchange.ClassInvalidParam, "modify_order", err)
+			continue
+		}
+		if o.FilledQty.IsPositive() && qty.LessThan(o.FilledQty) {
+			out[i].Err = exchange.Classify(exchange.ClassInvalidParam, "modify_order",
+				fmt.Errorf("fake: new qty %s below filled %s", qty, o.FilledQty))
+			continue
+		}
+		if o.TIF == order.PostOnly && e.wouldCrossLocked(o.Side, price) {
+			out[i].Err = exchange.Classify(exchange.ClassInvalidParam, "modify_order",
+				fmt.Errorf("fake: post-only modify would cross"))
+			continue
+		}
+		o.Price = price
+		o.Quantity = qty
+		o.UpdatedAt = now
+		cp := *o
+		e.emitLocked(exchange.StreamEvent{Order: &cp, Time: now})
+		out[i].TxHash = "fake-mod-" + o.ExchangeID
+	}
+	return out, nil
+}
+
 func (e *Exchange) CancelOrders(_ context.Context, reqs []exchange.CancelRequest) ([]exchange.CancelResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()

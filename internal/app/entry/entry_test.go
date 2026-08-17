@@ -144,8 +144,8 @@ func TestMakerFollowReprices(t *testing.T) {
 	})
 
 	acts, _, _ = tr.OnEvent(strategy.BookEvent{
-		Book: book("149.7", "149.9"),
-		Mark: d("149.8"),
+		Book: book("150.2", "150.4"),
+		Mark: d("150.3"),
 		Now:  t0.Add(time.Second),
 	})
 	if len(acts) != 1 {
@@ -160,8 +160,76 @@ func TestMakerFollowReprices(t *testing.T) {
 		Now:   t0.Add(time.Second),
 	})
 	po2 := firstPlace(t, acts)
-	if !po2.Price.Equal(d("149.7")) {
-		t.Fatalf("repriced to %s, want 149.7", po2.Price)
+	if !po2.Price.Equal(d("150.2")) {
+		t.Fatalf("repriced to %s, want 150.2", po2.Price)
+	}
+}
+
+func TestMakerFollowDoesNotRepriceWhenBidDrops(t *testing.T) {
+	p := strategy.DefaultEntryParams()
+	p.Mode = strategy.EntryMakerFollow
+	p.RepriceTicks = 1
+	p.RepriceInterval = 0
+	tr := New(p, testMarket(), 0, 1)
+
+	acts := tr.Start(d("1"), d("0"), book("149.9", "150.1"), d("150"), t0)
+	po := firstPlace(t, acts)
+	tr.OnEvent(strategy.OrderEvent{
+		Order: order.Order{ClientOrderID: po.ClientOrderID, State: order.StateOpen, Quantity: d("1")},
+		Now:   t0,
+	})
+	acts, _, _ = tr.OnEvent(strategy.BookEvent{
+		Book: book("149.7", "149.9"),
+		Mark: d("149.8"),
+		Now:  t0.Add(time.Second),
+	})
+	if countPlace(acts) != 0 {
+		t.Fatalf("bid drop must not reprice, got %+v", acts)
+	}
+}
+
+func TestRejectedDoesNotPlaceImmediately(t *testing.T) {
+	p := strategy.DefaultEntryParams()
+	p.Mode = strategy.EntryMakerFollow
+	tr := New(p, testMarket(), 0, 1)
+	acts := tr.Start(d("1"), d("0"), book("149.9", "150.1"), d("150"), t0)
+	po := firstPlace(t, acts)
+	acts, done, failed := tr.OnEvent(strategy.OrderEvent{
+		Order: order.Order{ClientOrderID: po.ClientOrderID, State: order.StateRejected, Quantity: d("1")},
+		Now:   t0,
+	})
+	if done || failed {
+		t.Fatalf("done=%v failed=%v", done, failed)
+	}
+	if countPlace(acts) != 0 {
+		t.Fatalf("reject must not immediately replace, got %+v", acts)
+	}
+	acts, _, _ = tr.OnEvent(strategy.TickEvent{Now: t0.Add(time.Second)})
+	po2 := firstPlace(t, acts)
+	if po2.ClientOrderID == po.ClientOrderID {
+		t.Fatal("retry must use a new client id")
+	}
+}
+
+func TestNoSecondPlaceWhilePending(t *testing.T) {
+	p := strategy.DefaultEntryParams()
+	p.Mode = strategy.EntryMakerFollow
+	tr := New(p, testMarket(), 0, 1)
+	acts := tr.Start(d("1"), d("0"), book("149.9", "150.1"), d("150"), t0)
+	if countPlace(acts) != 1 {
+		t.Fatal("expected first place")
+	}
+	tr.OnEvent(strategy.OrderEvent{
+		Order: order.Order{ClientOrderID: firstPlace(t, acts).ClientOrderID, State: order.StatePending, Quantity: d("1")},
+		Now:   t0,
+	})
+	acts, _, _ = tr.OnEvent(strategy.TickEvent{Now: t0.Add(time.Second)})
+	if countPlace(acts) != 0 {
+		t.Fatalf("pending order must not be doubled, got %+v", acts)
+	}
+	acts, _, _ = tr.OnEvent(strategy.BookEvent{Book: book("150.0", "150.2"), Mark: d("150.1"), Now: t0.Add(time.Second)})
+	if countPlace(acts) != 0 {
+		t.Fatalf("book update while pending must not place another, got %+v", acts)
 	}
 }
 
@@ -276,8 +344,8 @@ func TestMakerFollowLateFillAfterRepriceDoesNotPlaceAgain(t *testing.T) {
 	}
 
 	acts, _, _ = tr.OnEvent(strategy.BookEvent{
-		Book: book("149.7", "149.9"),
-		Mark: d("149.8"),
+		Book: book("150.2", "150.4"),
+		Mark: d("150.3"),
 		Now:  t0.Add(2 * time.Second),
 	})
 	if len(acts) != 1 {
@@ -340,8 +408,8 @@ func TestMakerFollowRepriceThenOldOrderFillsFully(t *testing.T) {
 	})
 
 	acts, _, _ = tr.OnEvent(strategy.BookEvent{
-		Book: book("149.7", "149.9"),
-		Mark: d("149.8"),
+		Book: book("150.2", "150.4"),
+		Mark: d("150.3"),
 		Now:  t0.Add(time.Second),
 	})
 	if len(acts) != 1 {

@@ -238,8 +238,10 @@ func (t *Trigger) onOrder(e strategy.OrderEvent) []strategy.Action {
 	}
 
 	switch o.State {
-	case order.StateOpen, order.StatePartiallyFilled:
-		t.phase = PhaseResting
+	case order.StatePending, order.StateOpen, order.StatePartiallyFilled:
+		if o.State != order.StatePending {
+			t.phase = PhaseResting
+		}
 		return nil
 
 	case order.StateFilled:
@@ -250,15 +252,16 @@ func (t *Trigger) onOrder(e strategy.OrderEvent) []strategy.Action {
 		return t.placeNext(e.Now)
 
 	case order.StateRejected:
+		// 立即重挂会与链上尚未确认的上一笔重叠，改由 tick/盘口再试。
 		t.phase = PhasePlacing
-		return t.placeNext(e.Now)
+		return nil
 
 	case order.StateCanceled, order.StateExpired:
 		if t.phase == PhaseRepricing {
 			return t.placeNext(e.Now)
 		}
 		t.phase = PhasePlacing
-		return t.placeNext(e.Now)
+		return nil
 	}
 	return nil
 }
@@ -295,11 +298,14 @@ func (t *Trigger) applySignedFill(side order.Side, qty decimal.Decimal) {
 }
 
 func (t *Trigger) onBook(now time.Time) []strategy.Action {
+	if t.params.Mode == strategy.EntryMakerFollow && t.phase == PhasePlacing && t.coid == 0 {
+		return t.placeNext(now)
+	}
 	if t.params.Mode != strategy.EntryMakerFollow || t.phase != PhaseResting || t.coid == 0 {
 		return nil
 	}
 	want := t.followPrice()
-	if !want.IsPositive() {
+	if !want.IsPositive() || !t.shouldChase(want) {
 		return nil
 	}
 	ticks := t.params.RepriceTicks
@@ -328,8 +334,8 @@ func (t *Trigger) onTick(now time.Time) []strategy.Action {
 	if t.params.Timeout > 0 && !t.started.IsZero() && now.Sub(t.started) >= t.params.Timeout.Std() {
 		return t.onTimeout(now)
 	}
-	if t.marketMode() && t.phase == PhasePlacing && t.coid == 0 {
-		if t.params.SliceInterval > 0 && !t.lastSlice.IsZero() &&
+	if t.phase == PhasePlacing && t.coid == 0 {
+		if t.marketMode() && t.params.SliceInterval > 0 && !t.lastSlice.IsZero() &&
 			now.Sub(t.lastSlice) < t.params.SliceInterval.Std() {
 			return nil
 		}
@@ -360,12 +366,15 @@ func (t *Trigger) placeNext(now time.Time) []strategy.Action {
 	if t.done() {
 		return t.finish()
 	}
+	if t.coid != 0 {
+		return nil
+	}
 	rem := t.remaining()
 	side := order.Buy
 	if rem.IsNegative() {
 		side = order.Sell
 	}
-	qty := rem.Abs()
+	qty := t.mkt.RoundQty(rem.Abs())
 
 	if t.marketMode() {
 		n := t.params.SliceCount
@@ -460,6 +469,18 @@ func (t *Trigger) followPrice() decimal.Decimal {
 		return t.mkt.RoundPrice(t.book.Ask, market.RoundNearest)
 	}
 	return t.mkt.RoundPrice(t.book.Bid, market.RoundNearest)
+}
+
+// shouldChase 只在盘口朝远离我们的方向走时改价：买单追涨买一，卖单追跌卖一。
+// 反向跳动不撤单，避免建底仓时每跳一次就撤了重挂、链上出现多笔建仓单。
+func (t *Trigger) shouldChase(want decimal.Decimal) bool {
+	if !t.orderPrice.IsPositive() {
+		return true
+	}
+	if t.remaining().IsNegative() {
+		return want.LessThan(t.orderPrice)
+	}
+	return want.GreaterThan(t.orderPrice)
 }
 
 func (t *Trigger) protectionPrice(side order.Side) decimal.Decimal {
