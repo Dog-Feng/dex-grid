@@ -209,9 +209,13 @@ func (s *Strategy) OnEvent(ev strategy.Event) ([]strategy.Action, error) {
 			strategy.Stop{Reason: strategy.StopEntryFailed},
 		}, nil
 	case strategy.ResyncEvent:
-		s.position = e.Position.Size
-		if e.Position.EntryPrice.IsPositive() {
-			s.avgPrice = e.Position.EntryPrice
+		// 建仓阶段不采纳交易所仓位快照：止盈重开时本地已清零，
+		// 若 Resync 写入旧持仓会误判为首单已到位并跳过 EnsurePosition。
+		if s.phase != strategy.PhaseEntering {
+			s.position = e.Position.Size
+			if e.Position.EntryPrice.IsPositive() {
+				s.avgPrice = e.Position.EntryPrice
+			}
 		}
 		cancels := s.syncFromOrders(e.Orders)
 		if s.phase == strategy.PhaseRunning && s.tpMismatched() {

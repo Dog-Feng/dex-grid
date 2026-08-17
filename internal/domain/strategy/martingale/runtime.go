@@ -208,6 +208,7 @@ func (s *Strategy) handleTPFill(o order.Order, now time.Time) []strategy.Action 
 		s.stats.GridProfit = s.stats.GridProfit.Add(diff.Mul(o.FilledQty.Abs()))
 	}
 	s.cycles++
+	// 止盈成交：先撤掉本周期全部加仓挂单，再进入下一轮首单建仓。
 	s.clearLive()
 	s.position = decimal.Zero
 	s.addedTimes = 0
@@ -364,7 +365,19 @@ func (s *Strategy) wantAdd(level int) bool {
 }
 
 func (s *Strategy) resumeActions(now time.Time) []strategy.Action {
-	if s.phase == strategy.PhaseIdle || s.phase == strategy.PhaseEntering {
+	switch s.phase {
+	case strategy.PhaseEntering:
+		if s.needsEntry() && !s.hasWorkingInventory() {
+			return []strategy.Action{strategy.EnsurePosition{Target: s.target}}
+		}
+		if !s.needsEntry() {
+			// 恢复运行：建仓已在崩溃前完成，直接铺单。
+			s.phase = strategy.PhaseRunning
+			return s.placeActions(now)
+		}
+		// needsEntry 且已有同向仓：等 ClosePosition / EnsurePosition 完成，勿提前铺单。
+		return nil
+	case strategy.PhaseIdle:
 		if s.needsEntry() && !s.hasWorkingInventory() {
 			s.phase = strategy.PhaseEntering
 			return []strategy.Action{strategy.EnsurePosition{Target: s.target}}

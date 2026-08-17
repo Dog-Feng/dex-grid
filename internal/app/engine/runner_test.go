@@ -404,3 +404,72 @@ func TestMartingaleCycleRestartKeepsNewEpochOrders(t *testing.T) {
 		t.Fatalf("watchdog cancelled new-epoch adds: %d -> %d", before, n)
 	}
 }
+
+func TestMartingaleTakeProfitClearsOldEpochAdds(t *testing.T) {
+	ex := fake.New(testMarket())
+	ex.SetBook(d("149.9"), d("150.1"))
+	ex.SetMark(d("150"))
+
+	p := martingale.DefaultParams()
+	p.Symbol = "BTC"
+	p.Leverage = 5
+	p.Martingale.InitialMargin = d("50")
+	p.Martingale.AddMargin = d("50")
+	p.Martingale.MaxAddTimes = 2
+	p.ApplyDefaults()
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := martingale.New(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := New(ex, s, Config{Name: "fake", Slot: 0, TickInterval: time.Second, MaxRetries: 2})
+	res := r.Do(context.Background(), CmdStart, StartPayload{
+		Symbol: "BTC",
+		Entry: strategy.EntryParams{
+			Mode:          strategy.EntryMarket,
+			SliceCount:    1,
+			FillTolerance: d("0.01"),
+			MaxSlippage:   d("0.05"),
+		},
+		Risk: strategy.DefaultRiskParams(),
+	})
+	if !res.OK {
+		t.Fatalf("start: %s", res.Message)
+	}
+	r.Drain(context.Background())
+
+	epoch1 := r.View().Strategy.Epoch
+	oldAdds := 0
+	var tpPx decimal.Decimal
+	for _, o := range ex.Resting() {
+		ref := o.ClientOrderID.Decode()
+		if ref.Epoch == epoch1 && ref.Purpose == order.PurposeOpen {
+			oldAdds++
+		}
+		if o.ReduceOnly && o.Side == order.Sell {
+			tpPx = o.Price
+		}
+	}
+	if oldAdds == 0 {
+		t.Fatal("expected resting add orders before take-profit")
+	}
+	if !tpPx.IsPositive() {
+		t.Fatal("missing take-profit")
+	}
+
+	ex.SetBook(tpPx, tpPx.Add(d("0.1")))
+	ex.SetMark(tpPx)
+	ex.Trade(tpPx)
+	r.Drain(context.Background())
+	r.Drain(context.Background())
+
+	for _, o := range ex.Resting() {
+		ref := o.ClientOrderID.Decode()
+		if ref.Epoch == epoch1 && ref.Purpose == order.PurposeOpen {
+			t.Fatalf("old-epoch add order still resting after take-profit: %v", o.ClientOrderID)
+		}
+	}
+}

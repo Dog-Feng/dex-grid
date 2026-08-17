@@ -273,6 +273,91 @@ func TestAddFillDoesNotDoubleCountIfPositionAlreadyUpdated(t *testing.T) {
 	}
 }
 
+func TestTakeProfitCancelsRestingAdds(t *testing.T) {
+	s := newStrategy(t, testParams())
+	_, _ = s.Init(testState("100", "0"))
+	acts, _ := s.OnEvent(strategy.EntryDoneEvent{Filled: s.target, Now: epoch0})
+	var tp strategy.PlaceOrder
+	addCount := 0
+	for _, p := range placements(acts) {
+		ref := p.ClientOrderID.Decode()
+		if ref.Purpose == order.PurposeTakeProfit {
+			tp = p
+		} else if ref.Purpose == order.PurposeOpen {
+			addCount++
+			confirm(t, s, p)
+		}
+	}
+	if addCount == 0 || tp.Quantity.IsZero() {
+		t.Fatal("missing resting adds or tp")
+	}
+	confirm(t, s, tp)
+
+	next := fill(t, s, tp, epoch0.Add(time.Second))
+	cancelAll := false
+	for _, a := range next {
+		if _, ok := a.(strategy.CancelAll); ok {
+			cancelAll = true
+		}
+	}
+	if !cancelAll {
+		t.Fatal("take-profit must CancelAll resting add orders")
+	}
+	for k, lv := range s.adds {
+		if lv != nil && lv.COID != 0 {
+			t.Fatalf("add level %d still tracked locally after TP", k)
+		}
+	}
+	if s.tp != nil && s.tp.COID != 0 {
+		t.Fatal("take-profit slot must be cleared after TP fill")
+	}
+}
+
+func TestResyncDuringEnteringAfterTPKeepsEntry(t *testing.T) {
+	s := newStrategy(t, testParams())
+	_, _ = s.Init(testState("100", "0"))
+	acts, _ := s.OnEvent(strategy.EntryDoneEvent{Filled: s.target, Now: epoch0})
+	var tp strategy.PlaceOrder
+	for _, p := range placements(acts) {
+		if p.ClientOrderID.Decode().Purpose == order.PurposeTakeProfit {
+			tp = p
+		}
+	}
+	confirm(t, s, tp)
+	fill(t, s, tp, epoch0.Add(time.Second))
+	if s.phase != strategy.PhaseEntering {
+		t.Fatalf("phase = %s, want entering", s.phase)
+	}
+
+	// 模拟 Resync 仍带着止盈前的旧持仓（交易所推送滞后）。
+	resync, err := s.OnEvent(strategy.ResyncEvent{
+		Position: position.Position{Size: s.target, EntryPrice: d("100")},
+		Orders:   nil,
+		Now:      epoch0.Add(2 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.position.IsPositive() {
+		t.Fatalf("position = %s, must stay zero during entering after TP", s.position)
+	}
+	if s.phase != strategy.PhaseEntering {
+		t.Fatalf("phase = %s, must not jump to running on stale resync", s.phase)
+	}
+	ensure := 0
+	for _, a := range resync {
+		if _, ok := a.(strategy.EnsurePosition); ok {
+			ensure++
+		}
+		if _, ok := a.(strategy.PlaceOrder); ok {
+			t.Fatal("stale resync must not place add/tp orders before entry completes")
+		}
+	}
+	if ensure != 1 {
+		t.Fatalf("EnsurePosition count = %d, want 1 to restart first lot", ensure)
+	}
+}
+
 func TestTakeProfitRestartsCycle(t *testing.T) {
 	s := newStrategy(t, testParams())
 	_, _ = s.Init(testState("100", "0"))

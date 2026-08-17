@@ -357,6 +357,7 @@ function applyStatus(st) {
     $("st-apr").classList.remove("up", "down");
   } else {
     setSigned($("st-apr"), apr);
+    $("st-apr").textContent += "%";
   }
   $("st-grids").textContent = String(stats.completed_grids ?? 0);
   $("st-runtime").textContent = fmtRuntime(stats.reset_at, running);
@@ -835,6 +836,25 @@ function drawChart() {
     ctx.strokeStyle = "#60a5fa";
     ctx.lineWidth = 1.6;
     ctx.stroke();
+  }
+
+  if (pts.length >= 1) {
+    const last = pts[pts.length - 1];
+    const lx = xOf(last.t);
+    const ly = yOf(last.p);
+    const price = Number.isFinite(mark) && mark > 0 ? mark : last.p;
+    const label = num(price, price >= 100 ? 2 : 4);
+    ctx.beginPath();
+    ctx.arc(lx, ly, 3.5, 0, Math.PI * 2);
+    ctx.fillStyle = "#60a5fa";
+    ctx.fill();
+    ctx.strokeStyle = "#0f1420";
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    ctx.fillStyle = "#e2e8f0";
+    ctx.font = "11px sans-serif";
+    ctx.textAlign = "right";
+    ctx.fillText(label, Math.max(pad.l + 4, lx - 8), ly - 8);
   }
 
   if (Number.isFinite(mark) && mark > 0) {
