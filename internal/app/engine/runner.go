@@ -57,6 +57,7 @@ type Runner struct {
 	entryP       strategy.EntryParams
 	riskP        strategy.RiskParams
 	stopping     bool
+	pendingStop  strategy.StopReason // 风控止盈：先 maker 跟价平到 0，成交后再 finishStop
 	lastWatchdog time.Time
 }
 
@@ -289,6 +290,7 @@ func (r *Runner) handleStart(ctx context.Context, p StartPayload) CommandResult 
 
 	r.status = StatusStarting
 	r.stopReason = 0
+	r.pendingStop = 0
 	r.residual = false
 	r.stopping = false
 
@@ -370,6 +372,13 @@ func (r *Runner) onStream(ctx context.Context, se exchange.StreamEvent) {
 		r.recordFill(*se.Order)
 		r.dispatch(ctx, strategy.OrderEvent{Order: *se.Order, Now: now})
 	}
+	if se.Trade != nil {
+		tr := *se.Trade
+		if tr.Time.IsZero() {
+			tr.Time = now
+		}
+		r.dispatch(ctx, strategy.TradeEvent{Trade: tr, Now: now})
+	}
 	if se.Position != nil {
 		r.state.Position = *se.Position
 		r.dispatch(ctx, strategy.PositionEvent{
@@ -388,7 +397,7 @@ func (r *Runner) dispatch(ctx context.Context, ev strategy.Event) {
 		r.updateViewOnly(ev)
 		return
 	}
-	if r.guard != nil {
+	if r.guard != nil && r.pendingStop == 0 {
 		v := r.guard.Check(ev)
 		if v.Reconnect {
 			r.log.Warn("market data stale, reconnecting")
@@ -396,6 +405,11 @@ func (r *Runner) dispatch(ctx context.Context, ev strategy.Event) {
 			return
 		}
 		if v.Stop {
+			if v.Reason == strategy.StopTakeProfit && !r.state.Position.IsFlat() {
+				r.pendingStop = v.Reason
+				r.apply(ctx, v.Actions, ev.At())
+				return
+			}
 			r.apply(ctx, v.Actions, ev.At())
 			r.finishStop(ctx, v.Reason)
 			return
@@ -410,12 +424,23 @@ func (r *Runner) route(ctx context.Context, ev strategy.Event) {
 		return
 	}
 	if r.entering && r.trig != nil {
+		if _, isTrade := ev.(strategy.TradeEvent); isTrade {
+			acts, err := r.strat.OnEvent(ev)
+			if err != nil {
+				r.fail(ctx, err)
+				return
+			}
+			r.apply(ctx, acts, ev.At())
+		}
 		if _, isEntry := ev.(strategy.EntryDoneEvent); !isEntry {
 			if _, isFail := ev.(strategy.EntryFailedEvent); !isFail {
 				acts, done, failed := r.trig.OnEvent(ev)
 				r.apply(ctx, acts, ev.At())
 				if failed {
 					r.entering = false
+					if r.completePendingStop(ctx) {
+						return
+					}
 					filled, reason := r.trig.Result()
 					r.route(ctx, strategy.EntryFailedEvent{Filled: filled, Reason: reason, Now: ev.At()})
 					return
@@ -423,6 +448,9 @@ func (r *Runner) route(ctx context.Context, ev strategy.Event) {
 				if done {
 					r.entering = false
 					filled, _ := r.trig.Result()
+					if r.completePendingStop(ctx) {
+						return
+					}
 					r.route(ctx, strategy.EntryDoneEvent{Filled: filled, Now: ev.At()})
 				}
 				return
@@ -467,7 +495,7 @@ func (r *Runner) apply(ctx context.Context, acts []strategy.Action, now time.Tim
 	if res.Ensure != nil {
 		r.startEntry(ctx, *res.Ensure, now)
 	}
-	if res.Stop != nil {
+	if res.Stop != nil && r.pendingStop == 0 {
 		r.finishStop(ctx, res.Stop.Reason)
 	}
 }
@@ -479,11 +507,18 @@ func (r *Runner) startEntry(ctx context.Context, req strategy.EnsurePosition, no
 	}
 	r.syncEpoch()
 	r.refreshPosition(ctx)
-	r.trig = entry.New(r.entryP, r.state.Market, r.cfg.Slot, r.epoch)
+	params := r.entryP
+	if r.pendingStop != 0 {
+		params = strategy.DefaultEntryParams()
+	}
+	r.trig = entry.New(params, r.state.Market, r.cfg.Slot, r.epoch)
 	acts := r.trig.Start(req.Target, r.state.Position.Size, r.state.Book, r.state.Mark, now)
 	if !r.trig.Active() {
 		filled, _ := r.trig.Result()
 		r.entering = false
+		if r.completePendingStop(ctx) {
+			return
+		}
 		r.route(ctx, strategy.EntryDoneEvent{Filled: filled, Now: now})
 		return
 	}
@@ -492,17 +527,32 @@ func (r *Runner) startEntry(ctx context.Context, req strategy.EnsurePosition, no
 	r.apply(ctx, acts, now)
 }
 
+func (r *Runner) completePendingStop(ctx context.Context) bool {
+	if r.pendingStop == 0 {
+		return false
+	}
+	reason := r.pendingStop
+	r.pendingStop = 0
+	r.finishStop(ctx, reason)
+	return true
+}
+
 func (r *Runner) finishStop(ctx context.Context, reason strategy.StopReason) {
 	if r.status == StatusStopped && r.stopping {
 		return
 	}
 	r.stopping = true
 	r.entering = false
+	r.pendingStop = 0
 	acts, err := r.strat.OnStop(reason)
 	if err != nil {
 		r.log.Error("strategy OnStop failed", "err", err)
 	} else {
-		r.execApplyQuiet(ctx, stripControl(acts))
+		r.refreshPosition(ctx)
+		// 止盈若仓位还在，不能 CancelAll，否则刚挂上的 maker 平仓单会被撤掉。
+		if reason != strategy.StopTakeProfit || r.state.Position.IsFlat() {
+			r.execApplyQuiet(ctx, stripControl(acts))
+		}
 	}
 	r.refreshPosition(ctx)
 	r.status = StatusStopped

@@ -545,15 +545,5 @@ func (p persistAdapter) RecordFill(exchange string, o order.Order) error {
 	if !o.FilledQty.IsPositive() {
 		return nil
 	}
-	return p.store.InsertFill(store.Fill{
-		Exchange: exchange,
-		Symbol:   o.Symbol,
-		COID:     o.ClientOrderID,
-		Side:     o.Side.String(),
-		Price:    o.AvgFillPrice.String(),
-		Qty:      o.FilledQty.String(),
-		Fee:      o.Fee.String(),
-		IsMaker:  o.IsMaker,
-		Time:     o.UpdatedAt,
-	})
+	return p.store.RecordOrderFill(exchange, o)
 }

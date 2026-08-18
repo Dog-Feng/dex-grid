@@ -78,6 +78,30 @@ exchanges:
     # strategy_file: config/lighter-sol.yaml
     autostart: false
 
-  # 后续接入的交易所在这里追加一段，格式同上（当前只实现了 lighter）
+  # RH Lighter：另一条链上的独立 DEX，与上面的 lighter 账户/nonce/挂单完全隔离。
+  # 启用前填好 RH_LIGHTER_* 环境变量；api_key_index 建议 ≥ 2（0 和 1 留给官方前后端）。
+  - name: rh_lighter
+    enabled: false
+    network: mainnet
+
+    credentials:
+      account_index: ${RH_LIGHTER_ACCOUNT_INDEX}
+      api_key_index: ${RH_LIGHTER_API_KEY_INDEX}
+      api_key_private_key: ${RH_LIGHTER_API_KEY_PRIVATE_KEY}
+
+    options:
+      tx_send_channel: ws
+      batch_enabled: true
+      batch_size: 20
+      order_expiry: 28d
+      price_protection: true
+
+    rate_limit:
+      rps: 10
+      burst: 20
+
+    autostart: false
+
+  # 后续接入的交易所在这里追加一段，格式同上
   # - name: <exchange>
   #   enabled: false

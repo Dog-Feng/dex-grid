@@ -1,7 +1,8 @@
 // Package executor 把策略意图翻译成交易所调用。
 //
-// 它不决定「该下什么单」，只负责归类合并、先撤后挂、批量拆分、
-// 可重试错误的退避，以及把结果转成 OrderEvent 回灌给策略。
+// 默认强制 Limit + PostOnly。仅止损平仓与建仓超时允许市价 IOC 吃单。
+// 其余负责归类合并、先撤后挂、批量拆分、可重试错误的退避，
+// 以及把结果转成 OrderEvent 回灌给策略。
 package executor
 
 import (
@@ -188,14 +189,18 @@ func (e *Executor) place(ctx context.Context, places []strategy.PlaceOrder, now 
 	e.progress = Progress{Target: len(places)}
 	reqs := make([]exchange.PlaceRequest, len(places))
 	for i, p := range places {
+		typ, tif := order.Limit, order.PostOnly
+		if p.Type == order.Market || p.TIF == order.IOC {
+			typ, tif = order.Market, order.IOC
+		}
 		reqs[i] = exchange.PlaceRequest{
 			Symbol:        e.opts.Symbol,
 			ClientOrderID: p.ClientOrderID,
 			Side:          p.Side,
-			Type:          p.Type,
+			Type:          typ,
 			Price:         p.Price,
 			Quantity:      p.Quantity,
-			TIF:           p.TIF,
+			TIF:           tif,
 			ReduceOnly:    p.ReduceOnly,
 		}
 	}
@@ -440,20 +445,30 @@ func (e *Executor) closePosition(ctx context.Context, act strategy.ClosePosition
 		side = order.Buy
 	}
 	price := pos.MarkPrice
+	tif := order.PostOnly
+	typ := order.Limit
 	if tick, terr := e.ex.Ticker(ctx, e.opts.Symbol); terr == nil {
-		if side == order.Buy && tick.Book.Ask.IsPositive() {
-			price = tick.Book.Ask.Mul(decimal.RequireFromString("1.005"))
-		} else if side == order.Sell && tick.Book.Bid.IsPositive() {
-			price = tick.Book.Bid.Mul(decimal.RequireFromString("0.995"))
+		if act.Urgency == strategy.UrgencyMarket {
+			// 止损吃单：Price 是可接受的最差价。
+			if side == order.Buy && tick.Book.Ask.IsPositive() {
+				price = tick.Book.Ask.Mul(decimal.RequireFromString("1.005"))
+			} else if side == order.Sell && tick.Book.Bid.IsPositive() {
+				price = tick.Book.Bid.Mul(decimal.RequireFromString("0.995"))
+			} else if tick.Mark.IsPositive() {
+				price = tick.Mark
+			}
+			tif = order.IOC
+			typ = order.Market
+		} else if side == order.Sell && tick.Book.Ask.IsPositive() {
+			price = tick.Book.Ask
+		} else if side == order.Buy && tick.Book.Bid.IsPositive() {
+			price = tick.Book.Bid
 		} else if tick.Mark.IsPositive() {
 			price = tick.Mark
 		}
-	}
-	tif := order.IOC
-	typ := order.Market
-	if act.Urgency == strategy.UrgencyMaker {
-		tif = order.PostOnly
-		typ = order.Limit
+	} else if act.Urgency == strategy.UrgencyMarket {
+		tif = order.IOC
+		typ = order.Market
 	}
 	e.exitSeq = order.NextSeq(e.exitSeq)
 	coid, err := order.Encode(order.Ref{

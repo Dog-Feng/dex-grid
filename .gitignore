@@ -12,6 +12,7 @@ config/config.yaml
 *.lock
 
 # 构建产物（仅仓库根目录，不要忽略 cmd/gridbot）
+/bin/
 /dist/
 /gridbot
 /gridbot.exe

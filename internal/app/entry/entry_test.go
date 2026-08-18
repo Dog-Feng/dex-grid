@@ -62,8 +62,11 @@ func TestMarketEntryFillsInOneShot(t *testing.T) {
 
 	acts := tr.Start(d("2"), d("0"), book("149.9", "150.1"), d("150"), t0)
 	po := firstPlace(t, acts)
-	if po.Type != order.Market || po.Side != order.Buy {
-		t.Fatalf("got %+v", po)
+	if po.Type != order.Limit || po.TIF != order.PostOnly || po.Side != order.Buy {
+		t.Fatalf("got %+v, want post-only buy", po)
+	}
+	if !po.Price.Equal(d("149.9")) {
+		t.Fatalf("maker entry price = %s, want bid 149.9", po.Price)
 	}
 	if !po.Quantity.Equal(d("2")) {
 		t.Fatalf("qty = %s", po.Quantity)
@@ -277,8 +280,11 @@ func TestShortEntrySells(t *testing.T) {
 	tr := New(p, testMarket(), 0, 1)
 	acts := tr.Start(d("-2"), d("0"), book("149.9", "150.1"), d("150"), t0)
 	po := firstPlace(t, acts)
-	if po.Side != order.Sell {
-		t.Fatalf("side = %s, want sell", po.Side)
+	if po.Side != order.Sell || po.TIF != order.PostOnly {
+		t.Fatalf("side = %s tif = %s, want post-only sell", po.Side, po.TIF)
+	}
+	if !po.Price.Equal(d("150.1")) {
+		t.Fatalf("short maker price = %s, want ask 150.1", po.Price)
 	}
 }
 
@@ -314,6 +320,45 @@ func TestPartialFillAccumulates(t *testing.T) {
 	filled, _ := tr.Result()
 	if !filled.Equal(d("1")) {
 		t.Fatalf("filled = %s (double-counted?)", filled)
+	}
+}
+
+func TestEntryTimeoutSwitchesToMarket(t *testing.T) {
+	p := strategy.DefaultEntryParams()
+	p.Mode = strategy.EntryMakerFollow
+	p.Timeout = strategy.MustParseDuration("5s")
+	p.OnTimeout = strategy.TimeoutMarket
+	p.MaxSlippage = d("0.005")
+	tr := New(p, testMarket(), 0, 1)
+
+	acts := tr.Start(d("1"), d("0"), book("149.9", "150.1"), d("150"), t0)
+	po := firstPlace(t, acts)
+	if po.TIF != order.PostOnly {
+		t.Fatalf("before timeout want post-only, got %+v", po)
+	}
+	tr.OnEvent(strategy.OrderEvent{
+		Order: order.Order{ClientOrderID: po.ClientOrderID, State: order.StateOpen, Quantity: d("1")},
+		Now:   t0,
+	})
+
+	acts, done, failed := tr.OnEvent(strategy.TickEvent{Now: t0.Add(5 * time.Second)})
+	if done || failed {
+		t.Fatalf("timeout should cancel then market, done=%v failed=%v", done, failed)
+	}
+	if len(acts) != 1 {
+		t.Fatalf("expected cancel on timeout, got %d", len(acts))
+	}
+
+	acts, _, _ = tr.OnEvent(strategy.OrderEvent{
+		Order: order.Order{ClientOrderID: po.ClientOrderID, State: order.StateCanceled, Quantity: d("1")},
+		Now:   t0.Add(5 * time.Second),
+	})
+	mkt := firstPlace(t, acts)
+	if mkt.Type != order.Market || mkt.TIF != order.IOC || mkt.Side != order.Buy {
+		t.Fatalf("timeout order = %+v, want market IOC buy", mkt)
+	}
+	if !mkt.Price.Equal(d("150.9")) { // ask 150.1 * 1.005 → 150.8505, RoundUp tick 0.1 → 150.9
+		t.Fatalf("protection price = %s, want 150.9", mkt.Price)
 	}
 }
 

@@ -19,8 +19,10 @@ const PHASE_LABEL = {
 };
 
 const state = {
+  tab: "overview",
   exchange: "",
   exchanges: [],
+  statuses: {},
   config: {},
   status: null,
   symbols: [],
@@ -30,6 +32,8 @@ const state = {
   klines: [],
   klinesAt: 0,
 };
+
+let liveSeq = 0;
 
 function $(id) {
   return document.getElementById(id);
@@ -75,11 +79,21 @@ async function api(method, path, body) {
 }
 
 function switchTab(name) {
+  state.tab = name;
   document.querySelectorAll(".tab-panel").forEach((el) => el.classList.remove("active"));
-  document.querySelectorAll(".tab-btn").forEach((el) => el.classList.toggle("active", el.dataset.tab === name));
-  const panel = $("tab-" + name);
+  document.querySelectorAll(".tab-btn").forEach((el) => {
+    const on = name === "exchange" ? el.dataset.ex === state.exchange : el.dataset.tab === name && !el.dataset.ex;
+    el.classList.toggle("active", !!on);
+  });
+  const panel = $(name === "exchange" ? "tab-exchange" : "tab-" + name);
   if (panel) panel.classList.add("active");
-  if (name === "lighter") drawChart();
+  if (name === "exchange") drawChart();
+}
+
+function exchangeLabel(name) {
+  if (name === "rh_lighter") return "RH Lighter";
+  if (name === "lighter") return "Lighter";
+  return titleCase(name);
 }
 
 function toast(msg) {
@@ -185,6 +199,16 @@ function isRunning(status) {
   return status === "running" || status === "starting" || status === "paused" || status === "reconnecting";
 }
 
+function isActiveInstance(st) {
+  const s = (st && st.status) || "";
+  return isRunning(s) || s === "error";
+}
+
+function toNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
 function showBanner(msg, kind) {
   const el = $("banner");
   if (!msg) {
@@ -283,8 +307,44 @@ function collectParams() {
   return out;
 }
 
+function resetForm() {
+  state.config = {};
+  selectMode("kind", "grid");
+  selectMode("direction", "long");
+  setSymbol("", false);
+  $("leverage").value = "10";
+  $("margin-mode").value = "cross";
+  $("lower").value = "72";
+  $("upper").value = "77";
+  $("count").value = "25";
+  $("sizing").value = "margin";
+  $("margin-wrap").style.display = "";
+  $("qty-wrap").style.display = "none";
+  $("margin").value = "1000";
+  $("qty").value = "0.53";
+  $("out-of-range").value = "pause";
+  $("entry-mode").value = "maker_follow";
+  $("entry-price").value = "";
+  $("mg-drop").value = "2.0";
+  $("mg-tp").value = "1.5";
+  $("mg-initial").value = "50";
+  $("mg-add").value = "50";
+  $("mg-times").value = "5";
+  $("mg-mult").value = "1.0";
+  $("mg-mode").value = "from_last";
+  $("mg-restart").value = "true";
+  $("mg-preplace").value = "true";
+  $("mg-sl").value = "";
+  updateKind();
+  updateEntryHint();
+  updateDerived();
+}
+
 function fillForm(cfg) {
-  if (!cfg || !cfg.symbol) return;
+  if (!cfg || !cfg.symbol) {
+    resetForm();
+    return;
+  }
   state.config = cfg;
   const kind = cfg.strategy === "martingale" || cfg.martingale ? "martingale" : "grid";
   selectMode("kind", kind);
@@ -302,7 +362,9 @@ function fillForm(cfg) {
   if (g.margin != null) $("margin").value = dec(g.margin);
   if (g.per_grid_qty != null) $("qty").value = dec(g.per_grid_qty);
   if (cfg.risk && cfg.risk.out_of_range) $("out-of-range").value = cfg.risk.out_of_range;
-  if (cfg.entry && cfg.entry.mode) $("entry-mode").value = cfg.entry.mode;
+  if (cfg.entry && cfg.entry.mode) {
+    $("entry-mode").value = cfg.entry.mode === "market" ? "maker_follow" : cfg.entry.mode;
+  }
   if (cfg.entry && cfg.entry.price != null) $("entry-price").value = dec(cfg.entry.price);
   const mg = cfg.martingale || {};
   if (mg.add_drop_pct != null) $("mg-drop").value = dec(mg.add_drop_pct);
@@ -320,7 +382,7 @@ function fillForm(cfg) {
   updateDerived();
 }
 
-function applyStatus(st) {
+function applyExchangePanel(st) {
   state.status = st || null;
   const empty = !st;
   const mark = empty ? "" : st.mark;
@@ -332,17 +394,13 @@ function applyStatus(st) {
   const symbol = (st && st.symbol) || cfg.symbol || "";
   const status = (st && st.status) || "stopped";
   const dir = strat.direction || cfg.direction || "";
-  const lev = pos.leverage || cfg.leverage || "";
-  const mm = pos.margin_mode || cfg.margin_mode || "";
-  const lower = strat.lower_price || (cfg.grid && cfg.grid.lower_price);
-  const upper = strat.upper_price || (cfg.grid && cfg.grid.upper_price);
-  const count = strat.grid_count || (cfg.grid && cfg.grid.grid_count);
   const target = strat.order_target || 0;
   const resting = strat.order_resting || 0;
   const realized = stats.realized_pnl ?? stats.grid_profit;
   const unreal = stats.unrealized_pnl ?? pos.unrealized_pnl ?? acct.unrealized_pnl;
   const now = new Date();
   const running = isRunning(status);
+  const ex = exchangeLabel(state.exchange);
 
   $("st-mark").textContent = mark ? dec(mark) : "—";
   $("st-pos").textContent = symbol ? `${dec(pos.size || 0)} / ${dec(pos.entry_price || mark || "—")}` : "—";
@@ -372,36 +430,126 @@ function applyStatus(st) {
   $("st-progress-txt").textContent = `挂单 ${resting} / 目标 ${target || "—"}`;
   $("st-progress-bar").style.width = target ? Math.min(100, (resting / target) * 100) + "%" : "0%";
 
-  $("ov-equity").textContent = num(acct.equity, 2);
-  $("ov-avail").textContent = num(acct.available, 2);
-  setSigned($("ov-pnl"), Number(realized || 0) + Number(unreal || 0));
-  setSigned($("ov-real"), realized);
-  setSigned($("ov-unreal"), unreal);
-  $("ov-orders").textContent = `${resting} / ${stats.completed_grids ?? 0}`;
-  $("ov-target").textContent = String(target || "—");
-  $("ov-status").textContent = STATUS_LABEL[status] || status || "—";
-  $("ov-symbol").textContent = symbol || "—";
-  $("ov-dir-short").textContent = DIR_LABEL[dir] ? DIR_LABEL[dir] + "网格" : "网格";
-  $("ov-pair").textContent = symbol || "—";
-  $("ov-mark").textContent = mark ? dec(mark) : "—";
-  $("ov-pos").textContent = symbol ? `${dec(pos.size || 0)} ${symbol}` : "—";
-  $("ov-health").textContent = `目标 ${target || "—"} / 已确认 ${resting}`;
-  $("ov-direction").textContent = [DIR_LABEL[dir] || "—", lev ? lev + "x" : "", mm === "isolated" ? "逐仓" : mm === "cross" ? "全仓" : ""]
-    .filter(Boolean)
-    .join(" · ");
-  $("ov-range").textContent = lower && upper ? `${dec(lower)} – ${dec(upper)} · ${count || "—"} 格` : "—";
-  $("ov-dot").classList.toggle("on", running);
-  const ex = titleCase(state.exchange);
-  const net = (state.exchanges.find((e) => e.name === state.exchange) || {}).network;
-  $("ov-ex").textContent = ex;
-  $("ov-exname").textContent = net ? `${ex} ${String(net).toUpperCase()}` : ex;
-
   $("btn-start").textContent = isMartingale() ? `启动 ${ex} 马丁` : `启动 ${ex} 网格`;
   const gridsLbl = $("st-grids") && $("st-grids").previousElementSibling;
   if (gridsLbl) gridsLbl.textContent = isMartingale() ? "完成周期" : "完成格";
-  $("btn-goto-ex").textContent = `进入 ${ex} 控制台 →`;
   lockForm(running);
   drawChart();
+}
+
+function pnlOf(st) {
+  if (!st) return { realized: 0, unreal: 0, total: 0 };
+  const pos = st.position || {};
+  const acct = st.account || {};
+  const stats = (st.strategy && st.strategy.stats) || {};
+  const realized = toNum(stats.realized_pnl ?? stats.grid_profit);
+  const unreal = toNum(stats.unrealized_pnl ?? pos.unrealized_pnl ?? acct.unrealized_pnl);
+  return { realized, unreal, total: realized + unreal };
+}
+
+function instanceCardHTML(name, st) {
+  const meta = state.exchanges.find((e) => e.name === name) || {};
+  const label = exchangeLabel(name);
+  const net = meta.network ? String(meta.network).toUpperCase() : "";
+  const pos = (st && st.position) || {};
+  const acct = (st && st.account) || {};
+  const strat = (st && st.strategy) || {};
+  const symbol = (st && st.symbol) || "";
+  const status = (st && st.status) || "stopped";
+  const dir = strat.direction || "";
+  const lev = pos.leverage || "";
+  const mm = pos.margin_mode || "";
+  const lower = strat.lower_price;
+  const upper = strat.upper_price;
+  const count = strat.grid_count;
+  const target = strat.order_target || 0;
+  const resting = strat.order_resting || 0;
+  const mark = st && st.mark;
+  const running = isRunning(status);
+  const dirLine = [DIR_LABEL[dir] || "—", lev ? lev + "x" : "", mm === "isolated" ? "逐仓" : mm === "cross" ? "全仓" : ""]
+    .filter(Boolean)
+    .join(" · ");
+  const range = lower && upper ? `${dec(lower)} – ${dec(upper)} · ${count || "—"} 格` : "—";
+  return `<article class="ov-card" data-ex="${name}">
+    <div class="ov-exname"><span class="run-dot${running ? " on" : ""}"></span><span>${label}${net ? " " + net : ""}</span></div>
+    <div class="kv"><span class="lbl">交易对</span><span class="val">${symbol || "—"}</span></div>
+    <div class="kv"><span class="lbl">方向</span><span class="val">${dirLine}</span></div>
+    <div class="kv"><span class="lbl">区间</span><span class="val">${range}</span></div>
+    <div class="kv"><span class="lbl">最新价</span><span class="val">${mark ? dec(mark) : "—"}</span></div>
+    <div class="kv"><span class="lbl">持仓</span><span class="val">${symbol ? `${dec(pos.size || 0)} ${symbol}` : "—"}</span></div>
+    <div class="kv"><span class="lbl">挂单健康</span><span class="val">目标 ${target || "—"} / 已确认 ${resting}</span></div>
+    <div class="kv"><span class="lbl">权益</span><span class="val">${num(acct.equity, 2)}</span></div>
+    <div class="kv"><span class="lbl">状态</span><span class="val">${STATUS_LABEL[status] || status}</span></div>
+    <button type="button" class="btn btn-ghost" data-goto-ex="${name}">进入 ${label} 控制台 →</button>
+  </article>`;
+}
+
+function renderOverview() {
+  const list = state.exchanges || [];
+  const active = list.filter((ex) => isActiveInstance(state.statuses[ex.name]));
+  const box = $("ov-instances");
+  if (box) {
+    box.hidden = active.length === 0;
+    box.innerHTML = active.map((ex) => instanceCardHTML(ex.name, state.statuses[ex.name])).join("");
+  }
+
+  let equity = 0;
+  let avail = 0;
+  let realized = 0;
+  let unreal = 0;
+  let resting = 0;
+  let completed = 0;
+  let target = 0;
+  let hasAcct = false;
+  for (const ex of list) {
+    const st = state.statuses[ex.name];
+    if (!st) continue;
+    const acct = st.account || {};
+    if (acct.equity != null || acct.available != null) hasAcct = true;
+    equity += toNum(acct.equity);
+    avail += toNum(acct.available);
+    const pnl = pnlOf(st);
+    realized += pnl.realized;
+    unreal += pnl.unreal;
+    const strat = st.strategy || {};
+    const stats = strat.stats || {};
+    resting += toNum(strat.order_resting);
+    completed += toNum(stats.completed_grids);
+    target += toNum(strat.order_target);
+  }
+
+  $("ov-equity").textContent = hasAcct ? equity.toFixed(2) : "—";
+  $("ov-avail").textContent = hasAcct ? avail.toFixed(2) : "—";
+  if (hasAcct || active.length) {
+    setSigned($("ov-pnl"), realized + unreal);
+    setSigned($("ov-real"), realized);
+    setSigned($("ov-unreal"), unreal);
+  } else {
+    ["ov-pnl", "ov-real", "ov-unreal"].forEach((id) => {
+      const el = $(id);
+      el.textContent = "—";
+      el.classList.remove("up", "down");
+    });
+  }
+  $("ov-orders").textContent = list.length ? `${resting} / ${completed}` : "—";
+  $("ov-target").textContent = target ? String(target) : "—";
+
+  if (!active.length) {
+    $("ov-status").textContent = "未启动";
+    $("ov-status-detail").textContent = "无运行中的策略";
+    return;
+  }
+  if (active.length === 1) {
+    const st = state.statuses[active[0].name] || {};
+    const dir = (st.strategy && st.strategy.direction) || "";
+    $("ov-status").textContent = STATUS_LABEL[st.status] || st.status || "运行中";
+    $("ov-status-detail").textContent = [exchangeLabel(active[0].name), st.symbol, DIR_LABEL[dir] ? DIR_LABEL[dir] + "网格" : ""]
+      .filter(Boolean)
+      .join(" · ");
+    return;
+  }
+  $("ov-status").textContent = `${active.length} 个运行中`;
+  $("ov-status-detail").textContent = active.map((ex) => exchangeLabel(ex.name)).join(" · ");
 }
 
 function lockForm(running) {
@@ -471,9 +619,9 @@ function renderChips(system, exchanges) {
     .map((e) => {
       const st = sys[e.name] || "idle";
       const cls = st === "running" || st === "starting" ? "ok" : st === "error" ? "error" : st === "reconnecting" ? "warn" : "idle";
-      const short = String(e.name || "").slice(0, 2).toUpperCase();
-      const net = e.network ? String(e.network).toUpperCase() : "—";
-      return `<span class="ex-chip"><i class="hdot ${cls}"></i>${short}: ${net}</span>`;
+      const label = exchangeLabel(e.name);
+      const net = e.network ? String(e.network).toUpperCase() : "";
+      return `<span class="ex-chip"><i class="hdot ${cls}"></i>${label}${net ? `<span class="ex-chip-net">${net}</span>` : ""}</span>`;
     })
     .join("");
 }
@@ -622,9 +770,9 @@ function updateEntryHint() {
     return;
   }
   const map = {
-    maker_follow: "做多挂买一、做空挂卖一，盘口移动则撤单重挂。",
-    market: "立即市价建仓（唯一 taker 路径）。",
-    limit_price: "在指定价挂 post-only，等成交。",
+    maker_follow: "做多挂买一、做空挂卖一，盘口移动则撤单重挂。默认 post-only；建仓超时改市价吃剩余量。",
+    market: "按 Maker 跟价限价挂，不主动吃单；建仓超时改市价吃剩余量。",
+    limit_price: "在指定价挂 post-only。建仓超时改市价吃剩余量。",
   };
   hint.textContent = (isMartingale() ? "做多先建首单仓位。" : "做多先建底仓（上方卖格数量之和）。") + " " + map[mode];
 }
@@ -931,6 +1079,51 @@ function bindForms() {
   });
 }
 
+function renderExTabs() {
+  const nav = $("main-tabs");
+  if (!nav) return;
+  nav.querySelectorAll(".tab-btn[data-ex]").forEach((el) => el.remove());
+  for (const ex of state.exchanges) {
+    const btn = document.createElement("button");
+    btn.className = "tab-btn";
+    btn.dataset.tab = "exchange";
+    btn.dataset.ex = ex.name;
+    btn.textContent = exchangeLabel(ex.name);
+    btn.addEventListener("click", () => selectExchange(ex.name));
+    nav.appendChild(btn);
+  }
+  switchTab(state.tab || "overview");
+}
+
+async function loadExchangeData(name) {
+  state.exchange = name;
+  state.klines = [];
+  state.klinesAt = 0;
+  state.levels = [];
+  resetForm();
+  applyExchangePanel(state.statuses[name] || null);
+  renderTrades([]);
+  renderLogs([]);
+  const [cfg, symbols] = await Promise.all([
+    api("GET", `/api/exchanges/${name}/config`).catch(() => ({})),
+    api("GET", `/api/exchanges/${name}/symbols`).catch(() => []),
+  ]);
+  if (state.exchange !== name) return;
+  state.symbols = Array.isArray(symbols) ? symbols : [];
+  if (cfg && cfg.symbol && !state.symbols.some((s) => s.symbol === cfg.symbol)) {
+    state.symbols.unshift({ symbol: cfg.symbol, type: "perp" });
+  }
+  fillForm(cfg && cfg.symbol ? cfg : {});
+}
+
+async function selectExchange(name) {
+  if (state.exchange !== name) {
+    await loadExchangeData(name);
+  }
+  switchTab("exchange");
+  await refreshKlines(true);
+}
+
 async function loadBootstrap() {
   const [exchanges, system] = await Promise.all([
     api("GET", "/api/exchanges"),
@@ -938,41 +1131,51 @@ async function loadBootstrap() {
   ]);
   state.exchanges = Array.isArray(exchanges) ? exchanges : [];
   if (!state.exchanges.length) throw new Error("没有已启用的交易所");
-  state.exchange = state.exchanges[0].name;
   renderChips(system, state.exchanges);
-  const tab = document.querySelector('.tab-btn[data-tab="lighter"]');
-  if (tab) tab.textContent = titleCase(state.exchange);
-
-  const [cfg, symbols] = await Promise.all([
-    api("GET", `/api/exchanges/${state.exchange}/config`).catch(() => ({})),
-    api("GET", `/api/exchanges/${state.exchange}/symbols`).catch(() => []),
-  ]);
-  state.symbols = Array.isArray(symbols) ? symbols : [];
-  if (cfg && cfg.symbol && !state.symbols.some((s) => s.symbol === cfg.symbol)) {
-    state.symbols.unshift({ symbol: cfg.symbol, type: "perp" });
-  }
-  fillForm(cfg && cfg.symbol ? cfg : {});
-  await refreshKlines(true);
+  renderExTabs();
+  renderOverview();
+  await loadExchangeData(state.exchanges[0].name);
 }
 
 async function refreshLive() {
-  if (!state.exchange) return;
-  const ex = state.exchange;
-  const [status, trades, logs, levels, system] = await Promise.all([
-    api("GET", `/api/exchanges/${ex}/status`),
-    api("GET", `/api/exchanges/${ex}/trades?limit=30`).catch(() => []),
-    api("GET", `/api/exchanges/${ex}/logs?limit=40`).catch(() => []),
-    api("GET", `/api/exchanges/${ex}/levels`).catch(() => []),
+  const names = (state.exchanges || []).map((e) => e.name);
+  if (!names.length) return;
+  const seq = ++liveSeq;
+  const current = state.exchange;
+  const statusReqs = names.map((n) => api("GET", `/api/exchanges/${n}/status`).catch(() => null));
+  const extra = current
+    ? [
+        api("GET", `/api/exchanges/${current}/trades?limit=30`).catch(() => []),
+        api("GET", `/api/exchanges/${current}/logs?limit=40`).catch(() => []),
+        api("GET", `/api/exchanges/${current}/levels`).catch(() => []),
+      ]
+    : [Promise.resolve([]), Promise.resolve([]), Promise.resolve([])];
+  const all = await Promise.all([
     api("GET", "/api/system/status").catch(() => ({})),
+    ...statusReqs,
+    ...extra,
   ]);
-  state.levels = Array.isArray(levels) ? levels : [];
-  applyStatus(status);
-  renderTrades(trades);
-  renderLogs(logs);
+  if (seq !== liveSeq) return;
+  const system = all[0];
+  const map = {};
+  names.forEach((n, i) => {
+    map[n] = all[1 + i];
+  });
+  state.statuses = map;
+  renderOverview();
   renderChips(system, state.exchanges);
-  await refreshKlines(false);
+  if (state.exchange) applyExchangePanel(map[state.exchange] || null);
+  if (current && state.exchange === current) {
+    renderTrades(all[1 + names.length]);
+    renderLogs(all[2 + names.length]);
+    state.levels = Array.isArray(all[3 + names.length]) ? all[3 + names.length] : [];
+  }
+  if (state.tab === "exchange") await refreshKlines(false);
+  if (seq !== liveSeq) return;
   state.live = true;
-  setConn(true, STATUS_LABEL[(status && status.status) || "stopped"] || "已连接");
+  const cur = map[state.exchange];
+  const curStatus = (cur && cur.status) || "stopped";
+  setConn(true, STATUS_LABEL[curStatus] || "已连接");
   showBanner("");
 }
 
@@ -991,15 +1194,17 @@ async function tick() {
 }
 
 function bindActions() {
-  document.querySelectorAll(".tab-btn[data-tab]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      if (!btn.disabled) {
-        switchTab(btn.dataset.tab);
-        if (btn.dataset.tab === "lighter") refreshKlines(false);
-      }
+  const overview = document.querySelector('.tab-btn[data-tab="overview"]');
+  if (overview) {
+    overview.addEventListener("click", () => switchTab("overview"));
+  }
+  const instances = $("ov-instances");
+  if (instances) {
+    instances.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-goto-ex]");
+      if (btn) selectExchange(btn.dataset.gotoEx);
     });
-  });
-  $("btn-goto-ex").onclick = () => switchTab("lighter");
+  }
   $("btn-start").onclick = () =>
     openModal("启动网格", "将保存当前配置并启动。校验通过后建仓、再铺网格。停止时只撤本交易对挂单、保留仓位。", async () => {
       try {

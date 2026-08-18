@@ -77,8 +77,9 @@ type Strategy struct {
 	// lastRetryMark 是上次刷新 retrying 时的 mark，用于在价格变动后恢复被拒格子。
 	lastRetryMark decimal.Decimal
 
-	stats    strategy.Stats
-	restored bool
+	stats      strategy.Stats
+	seenTrades map[int64]struct{}
+	restored   bool
 }
 
 // New 从 JSON 参数构造策略。
@@ -135,6 +136,7 @@ func (s *Strategy) Init(st strategy.State) ([]strategy.Action, error) {
 	s.target = g.TargetPosition(s.params.Direction, s.params.Grid.NeutralBaseRatio)
 	s.stats = strategy.Stats{ResetAt: st.Now}
 	s.retrying = map[int]int{}
+	s.seenTrades = map[int64]struct{}{}
 	s.lastRetryMark = s.mark
 
 	acts := []strategy.Action{
@@ -167,6 +169,10 @@ func (s *Strategy) OnEvent(ev strategy.Event) ([]strategy.Action, error) {
 
 	case strategy.OrderEvent:
 		return s.onOrder(e)
+
+	case strategy.TradeEvent:
+		s.onTrade(e.Trade)
+		return nil, nil
 
 	case strategy.EntryDoneEvent:
 		if s.phase != strategy.PhaseEntering {
@@ -218,6 +224,7 @@ func (s *Strategy) OnCommand(cmd strategy.Command) ([]strategy.Action, error) {
 
 	case strategy.CmdResetStats:
 		s.stats = strategy.Stats{ResetAt: cmd.Now}
+		s.seenTrades = map[int64]struct{}{}
 		return nil, nil
 
 	case strategy.CmdAdjustRange:
@@ -342,6 +349,12 @@ func (s *Strategy) realignGrid() []strategy.Action {
 		if c.Side == want && c.OrderPrice().Equal(wantPrice) {
 			continue
 		}
+		// 存活挂单已被现价穿过时等成交回报，不要先撤再反向挂。
+		// 否则 ticker 早于 fill 到达会清掉 COID，成交被当成陈旧回报丢掉，
+		// 开腿均价也记不上。
+		if c.State == CellResting && crossedByMark(c.Side, c.OrderPrice(), s.mark) {
+			continue
+		}
 		if c.State != CellEmpty && c.COID != 0 {
 			acts = append(acts, strategy.CancelOrder{ClientOrderID: c.COID})
 		}
@@ -439,6 +452,13 @@ func (s *Strategy) checkRange(now time.Time) (acts []strategy.Action, handled bo
 	return s.placeActions(now), true
 }
 
+func (s *Strategy) onTrade(t order.Trade) {
+	if s.seenTrades == nil {
+		s.seenTrades = map[int64]struct{}{}
+	}
+	strategy.NoteVenueTrade(&s.stats, s.seenTrades, s.slot, s.epoch, t)
+}
+
 // onOrder 处理订单状态变化。
 func (s *Strategy) onOrder(e strategy.OrderEvent) ([]strategy.Action, error) {
 	o := e.Order
@@ -510,14 +530,21 @@ func (s *Strategy) handleFill(idx int, o order.Order, now time.Time) []strategy.
 	if partial {
 		s.stats.PartialFills++
 	}
-	s.stats.FeePaid = s.stats.FeePaid.Add(o.Fee)
+	s.stats.FeePaid = s.stats.FeePaid.Add(s.fillFee(o))
 	if res.Completed {
 		s.stats.CompletedGrids++
-		profit := res.GrossProfit
-		if partial && c.Qty.IsPositive() {
-			profit = profit.Mul(o.FilledQty).Div(c.Qty)
+		profit := realizedRoundTrip(c, o.Side, o.FillPrice(), o.FilledQty)
+		if profit.IsZero() {
+			profit = res.GrossProfit
+			if partial && c.Qty.IsPositive() {
+				profit = profit.Mul(o.FilledQty).Div(c.Qty)
+			}
 		}
 		s.stats.GridProfit = s.stats.GridProfit.Add(profit)
+		c.OpenQty = decimal.Zero
+		c.OpenPrice = decimal.Zero
+	} else {
+		c.OpenPrice, c.OpenQty = mergeVWAP(c.OpenPrice, c.OpenQty, o.FillPrice(), o.FilledQty)
 	}
 
 	if s.phase != strategy.PhaseRunning {
@@ -707,6 +734,55 @@ func (s *Strategy) purposeFor(side order.Side) order.Purpose {
 	return order.PurposeOpen
 }
 
+// crossedByMark 判断现价是否已经穿过挂单价（买单 mark≤价，卖单 mark≥价）。
+func crossedByMark(side order.Side, price, mark decimal.Decimal) bool {
+	if !mark.IsPositive() || !price.IsPositive() {
+		return false
+	}
+	if side == order.Buy {
+		return mark.LessThanOrEqual(price)
+	}
+	return mark.GreaterThanOrEqual(price)
+}
+
+func (s *Strategy) fillFee(o order.Order) decimal.Decimal {
+	if o.Fee.IsPositive() {
+		return o.Fee
+	}
+	if !o.FilledQty.IsPositive() {
+		return decimal.Zero
+	}
+	return s.mkt.FeeFor(o.FillPrice(), o.FilledQty, o.IsMaker || o.TIF == order.PostOnly)
+}
+
+// mergeVWAP 把新成交并进已有均价。
+func mergeVWAP(oldPx, oldQty, px, qty decimal.Decimal) (decimal.Decimal, decimal.Decimal) {
+	n := oldQty.Add(qty)
+	if !n.IsPositive() {
+		return decimal.Zero, decimal.Zero
+	}
+	if !oldQty.IsPositive() {
+		return px, qty
+	}
+	return oldPx.Mul(oldQty).Add(px.Mul(qty)).Div(n), n
+}
+
+// realizedRoundTrip 用开腿均价与平腿成交价算已实现毛利。
+// 买开卖平：(卖价 − 买价) × 配对量；卖开买平反过来。
+func realizedRoundTrip(c *Cell, closeSide order.Side, closePx, closeQty decimal.Decimal) decimal.Decimal {
+	if !c.OpenQty.IsPositive() || !c.OpenPrice.IsPositive() || !closePx.IsPositive() || !closeQty.IsPositive() {
+		return decimal.Zero
+	}
+	matched := closeQty
+	if c.OpenQty.LessThan(matched) {
+		matched = c.OpenQty
+	}
+	if closeSide == order.Sell {
+		return closePx.Sub(c.OpenPrice).Mul(matched)
+	}
+	return c.OpenPrice.Sub(closePx).Mul(matched)
+}
+
 func effectiveMark(mark decimal.Decimal, book market.BookTicker) decimal.Decimal {
 	if mark.IsPositive() {
 		return mark
@@ -721,7 +797,7 @@ func (s *Strategy) View() strategy.View {
 		Epoch:     s.epoch,
 		Direction: s.params.Direction.String(),
 		GridCount: s.params.Grid.GridCount,
-		Stats:     s.stats,
+		Stats:     s.stats.ForView(),
 	}
 	if s.grid == nil {
 		v.LowerPrice = s.params.Grid.LowerPrice
@@ -769,9 +845,14 @@ type snapshotData struct {
 	BackInRangeSince time.Time       `json:"back_in_range_since"`
 	Retrying         map[int]int     `json:"retrying"`
 	Stats            strategy.Stats  `json:"stats"`
+	SeenTrades       []int64         `json:"seen_trades,omitempty"`
 }
 
 func (s *Strategy) Snapshot() ([]byte, error) {
+	ids := make([]int64, 0, len(s.seenTrades))
+	for id := range s.seenTrades {
+		ids = append(ids, id)
+	}
 	return json.Marshal(snapshotData{
 		Params:           s.params,
 		Epoch:            s.epoch,
@@ -784,6 +865,7 @@ func (s *Strategy) Snapshot() ([]byte, error) {
 		BackInRangeSince: s.backInRangeSince,
 		Retrying:         s.retrying,
 		Stats:            s.stats,
+		SeenTrades:       ids,
 	})
 }
 
@@ -806,6 +888,10 @@ func (s *Strategy) Restore(data []byte) error {
 	s.retrying = d.Retrying
 	if s.retrying == nil {
 		s.retrying = map[int]int{}
+	}
+	s.seenTrades = map[int64]struct{}{}
+	for _, id := range d.SeenTrades {
+		s.seenTrades[id] = struct{}{}
 	}
 	s.restored = s.grid != nil
 	return nil

@@ -14,6 +14,7 @@ import (
 
 	"dex-grid/internal/domain/order"
 
+	"github.com/shopspring/decimal"
 	_ "modernc.org/sqlite"
 )
 
@@ -250,6 +251,67 @@ INSERT INTO fills(exchange, symbol, coid, side, price, qty, fee, is_maker, ts)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		f.Exchange, f.Symbol, int64(f.COID), f.Side, f.Price, f.Qty, f.Fee, maker, f.Time.Unix())
 	return err
+}
+
+// RecordOrderFill 把订单回报里的累计成交拆成增量再落库。
+// 一张单吃多档会多次推送 filled_base_amount，直接存累计值会把同一笔量记多遍。
+func (s *Store) RecordOrderFill(exchange string, o order.Order) error {
+	if !o.FilledQty.IsPositive() || !o.ClientOrderID.Valid() {
+		return nil
+	}
+	prevQty, prevNotional, prevFee, err := s.fillProgress(exchange, o.ClientOrderID)
+	if err != nil {
+		return err
+	}
+	deltaQty := o.FilledQty.Sub(prevQty)
+	if deltaQty.LessThanOrEqual(decimal.Zero) {
+		return nil
+	}
+	cumNotional := o.FillPrice().Mul(o.FilledQty)
+	deltaNotional := cumNotional.Sub(prevNotional)
+	if !deltaNotional.IsPositive() {
+		deltaNotional = o.FillPrice().Mul(deltaQty)
+	}
+	deltaPx := deltaNotional.Div(deltaQty)
+	deltaFee := o.Fee.Sub(prevFee)
+	if deltaFee.IsNegative() {
+		deltaFee = decimal.Zero
+	}
+	return s.InsertFill(Fill{
+		Exchange: exchange,
+		Symbol:   o.Symbol,
+		COID:     o.ClientOrderID,
+		Side:     o.Side.String(),
+		Price:    deltaPx.String(),
+		Qty:      deltaQty.String(),
+		Fee:      deltaFee.String(),
+		IsMaker:  o.IsMaker,
+		Time:     o.UpdatedAt,
+	})
+}
+
+func (s *Store) fillProgress(exchange string, coid order.ClientOrderID) (qty, notional, fee decimal.Decimal, err error) {
+	rows, err := s.db.Query(`SELECT qty, price, fee FROM fills WHERE exchange=? AND coid=?`, exchange, int64(coid))
+	if err != nil {
+		return decimal.Zero, decimal.Zero, decimal.Zero, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var qStr, pStr, fStr string
+		if err := rows.Scan(&qStr, &pStr, &fStr); err != nil {
+			return decimal.Zero, decimal.Zero, decimal.Zero, err
+		}
+		q, err := decimal.NewFromString(qStr)
+		if err != nil {
+			continue
+		}
+		p, _ := decimal.NewFromString(pStr)
+		f, _ := decimal.NewFromString(fStr)
+		qty = qty.Add(q)
+		notional = notional.Add(q.Mul(p))
+		fee = fee.Add(f)
+	}
+	return qty, notional, fee, rows.Err()
 }
 
 // ListFills 返回重置统计时间点之后的成交，最新在前。

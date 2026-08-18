@@ -1,6 +1,6 @@
 # Lighter 适配设计
 
-本文只写 **Lighter（zkLighter）** 这一侧：协议怎么映射、订单怎么签、事件怎么收、主网踩过哪些坑。系统分层、网格算法、HTTP API 见 [DESIGN.md](DESIGN.md)；凭证字段见 [GRID_CONFIG.md](GRID_CONFIG.md)；部署见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+本文只写 **Lighter（zkLighter）** 这一侧。Robinhood 链上的独立实例见 [RH_LIGHTER.md](RH_LIGHTER.md)，两套代码与账户不要混用。
 
 代码在 `internal/exchange/lighter/`。适配器实现 `exchange.Exchange` + `exchange.Streamer`，**不含策略语义**：不知道网格还是马丁，只翻译端口上的下单 / 改单 / 撤单 / 行情。
 
@@ -73,7 +73,7 @@ Capabilities{
 }
 ```
 
-`PostOnly` 为 false 时本系统无法运行——除建仓市价外，全部挂单都是 post-only。适配器必须如实申报，不能静默降级。
+`PostOnly` 为 false 时本系统无法运行——除止损平仓与建仓超时外，全部挂单都是 post-only。适配器必须如实申报，不能静默降级。
 
 `ModifyOrder` 为 true 时，Executor 把策略的 `ModifyOrder` 译成 `ModifyOrders`；为 false 时才撤旧单再按同一 `ClientOrderID` 重挂。马丁加仓后改止盈依赖这条能力。
 
@@ -162,8 +162,8 @@ sizeInt  = int64(qty.Shift(int32(m.SizeDecimals)).IntPart())
 
 逐笔 `GetCreateOrderTransaction`。单笔失败不中断后续，结果按入参顺序带 `Err`，上层决定重试哪几笔。
 
-- 限价 + post-only：网格腿、加仓、止盈
-- 市价：仅建仓 / 紧急平仓。`Price` 是滑点保护上限，**不是成交价**
+- 限价 + post-only：网格腿、加仓、止盈、建仓跟价
+- 市价 IOC：仅止损平仓、建仓超时补齐。`Price` 是滑点保护上限，**不是成交价**
 - 只减仓单允许打到已下架合约上
 
 Post-only 若会立即成交，Lighter 表现为提交成功、随后订单 `rejected`（常见原因 `canceled-post-only`）。这**不算**连续失败：策略等下一 tick 换价重挂，`seq` 递增。

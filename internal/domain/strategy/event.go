@@ -35,6 +35,12 @@ type OrderEvent struct {
 	Now   time.Time
 }
 
+// TradeEvent 是交易所逐笔成交。已实现盈亏已扣手续费，本事件只记账、不驱动挂单。
+type TradeEvent struct {
+	Trade order.Trade
+	Now   time.Time
+}
+
 // PositionEvent 仓位与账户资金变化。
 type PositionEvent struct {
 	Position position.Position
@@ -71,6 +77,7 @@ type ResyncEvent struct {
 
 func (BookEvent) eventMarker()        {}
 func (OrderEvent) eventMarker()       {}
+func (TradeEvent) eventMarker()       {}
 func (PositionEvent) eventMarker()    {}
 func (TickEvent) eventMarker()        {}
 func (EntryDoneEvent) eventMarker()   {}
@@ -79,6 +86,7 @@ func (ResyncEvent) eventMarker()      {}
 
 func (e BookEvent) At() time.Time        { return e.Now }
 func (e OrderEvent) At() time.Time       { return e.Now }
+func (e TradeEvent) At() time.Time       { return e.Now }
 func (e PositionEvent) At() time.Time    { return e.Now }
 func (e TickEvent) At() time.Time        { return e.Now }
 func (e EntryDoneEvent) At() time.Time   { return e.Now }

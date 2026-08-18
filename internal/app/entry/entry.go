@@ -1,4 +1,5 @@
-// Package entry 实现三种建仓触发器：市价、maker 跟价、指定价格。
+// Package entry 实现建仓触发器：maker 跟价、指定价格。
+// 旧配置名 market 仍按买一/卖一 post-only 挂；仅建仓超时（OnTimeout=market）转市价吃单。
 //
 // 触发器是纯状态机：时间来自事件，输出是 Action。Runner 负责把
 // Action 交给 Executor，再把成交回报喂回来。建仓完成或失败后
@@ -72,7 +73,7 @@ type Trigger struct {
 	lastSlice   time.Time
 	book        market.BookTicker
 	mark        decimal.Decimal
-	forceMarket bool // 超时后转市价补齐，不改原始配置
+	forceMarket bool // 超时后转市价 IOC 吃剩余量，不改原始配置
 }
 
 // New 构造一个尚未启动的触发器。
@@ -298,10 +299,13 @@ func (t *Trigger) applySignedFill(side order.Side, qty decimal.Decimal) {
 }
 
 func (t *Trigger) onBook(now time.Time) []strategy.Action {
-	if t.params.Mode == strategy.EntryMakerFollow && t.phase == PhasePlacing && t.coid == 0 {
+	if t.forceMarket || t.params.Mode == strategy.EntryLimitPrice {
+		return nil
+	}
+	if t.phase == PhasePlacing && t.coid == 0 {
 		return t.placeNext(now)
 	}
-	if t.params.Mode != strategy.EntryMakerFollow || t.phase != PhaseResting || t.coid == 0 {
+	if t.phase != PhaseResting || t.coid == 0 {
 		return nil
 	}
 	want := t.followPrice()
@@ -351,7 +355,7 @@ func (t *Trigger) onTimeout(now time.Time) []strategy.Action {
 	case strategy.TimeoutAbort:
 		return t.fail("entry timeout")
 	default:
-		// 转市价补齐剩余。
+		// 超时转市价吃单，补齐剩余量。
 		t.forceMarket = true
 		if t.coid != 0 {
 			t.phase = PhaseRepricing
@@ -439,7 +443,7 @@ func (t *Trigger) marketMode() bool {
 }
 
 func (t *Trigger) quote(side order.Side) (decimal.Decimal, order.Type, order.TIF, error) {
-	if t.marketMode() {
+	if t.forceMarket {
 		px := t.protectionPrice(side)
 		if !px.IsPositive() {
 			return decimal.Zero, 0, 0, fmt.Errorf("no price for market entry")

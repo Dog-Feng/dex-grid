@@ -79,10 +79,18 @@ func startOK(t *testing.T, r *Runner, risk strategy.RiskParams) {
 	if !res.OK {
 		t.Fatalf("start: %s", res.Message)
 	}
-	// 覆盖成市价建仓，避免跟价单在测试里等盘口。
+	// 覆盖成跟价建仓（旧 market 名），测试里再配合 Trade 成交。
 	r.entryP.Mode = strategy.EntryMarket
 	r.entryP.SliceCount = 1
 	r.Drain(ctx)
+}
+
+func drainEntry(t *testing.T, r *Runner, ex *fake.Exchange) {
+	t.Helper()
+	r.Drain(context.Background())
+	ex.Trade(d("149.9"))
+	ex.Trade(d("150.1"))
+	r.Drain(context.Background())
 }
 
 func TestNeutralStartPlacesGrid(t *testing.T) {
@@ -117,7 +125,7 @@ func TestLongStartEntersThenPlaces(t *testing.T) {
 	if !res.OK {
 		t.Fatalf("start: %s", res.Message)
 	}
-	r.Drain(context.Background())
+	drainEntry(t, r, ex)
 
 	pos, _ := ex.Position(context.Background(), "BTC")
 	if !pos.Size.Equal(d("2")) {
@@ -146,7 +154,7 @@ func TestFillPairsOppositeOrder(t *testing.T) {
 	if !res.OK {
 		t.Fatalf("start: %s", res.Message)
 	}
-	r.Drain(context.Background())
+	drainEntry(t, r, ex)
 	before := len(ex.Resting())
 
 	// 击中 125 的买单，该格应翻转为在 150 挂卖。
@@ -160,7 +168,7 @@ func TestFillPairsOppositeOrder(t *testing.T) {
 		t.Fatalf("resting before=%d after=%d, pairing should replace the filled order", before, after)
 	}
 	if r.View().Strategy.Stats.Fills < 1 {
-		t.Fatal("expected at least one fill")
+		t.Fatalf("expected at least one fill, stats=%+v", r.View().Strategy.Stats)
 	}
 }
 
@@ -181,7 +189,7 @@ func TestStopLossClosesAndStops(t *testing.T) {
 	if !res.OK {
 		t.Fatalf("start: %s", res.Message)
 	}
-	r.Drain(context.Background())
+	drainEntry(t, r, ex)
 
 	ex.SetBook(d("138.9"), d("139.1"))
 	ex.SetMark(d("139"))
@@ -246,7 +254,7 @@ func TestManualStopKeepsPositionAndCancelsOrders(t *testing.T) {
 	if !res.OK {
 		t.Fatalf("start: %s", res.Message)
 	}
-	r.Drain(context.Background())
+	drainEntry(t, r, ex)
 	before, _ := ex.Position(context.Background(), "BTC")
 	if before.IsFlat() {
 		t.Fatal("expected a long position before stop")
@@ -348,7 +356,7 @@ func TestMartingaleCycleRestartKeepsNewEpochOrders(t *testing.T) {
 	if !res.OK {
 		t.Fatalf("start: %s", res.Message)
 	}
-	r.Drain(context.Background())
+	drainEntry(t, r, ex)
 
 	pos, _ := ex.Position(context.Background(), "BTC")
 	if !pos.Size.IsPositive() {
@@ -374,6 +382,8 @@ func TestMartingaleCycleRestartKeepsNewEpochOrders(t *testing.T) {
 	ex.SetMark(tpPx)
 	ex.Trade(tpPx)
 	r.Drain(context.Background())
+	ex.Trade(d("149.9"))
+	ex.Trade(d("150.1"))
 	r.Drain(context.Background())
 
 	pos, _ = ex.Position(context.Background(), "BTC")
@@ -439,7 +449,7 @@ func TestMartingaleTakeProfitClearsOldEpochAdds(t *testing.T) {
 	if !res.OK {
 		t.Fatalf("start: %s", res.Message)
 	}
-	r.Drain(context.Background())
+	drainEntry(t, r, ex)
 
 	epoch1 := r.View().Strategy.Epoch
 	oldAdds := 0
@@ -464,6 +474,8 @@ func TestMartingaleTakeProfitClearsOldEpochAdds(t *testing.T) {
 	ex.SetMark(tpPx)
 	ex.Trade(tpPx)
 	r.Drain(context.Background())
+	ex.Trade(d("149.9"))
+	ex.Trade(d("150.1"))
 	r.Drain(context.Background())
 
 	for _, o := range ex.Resting() {

@@ -19,11 +19,8 @@
     </div>
   </header>
 
-  <nav class="main-tabs">
+  <nav class="main-tabs" id="main-tabs">
     <button class="tab-btn active" data-tab="overview">总览</button>
-    <button class="tab-btn" data-tab="lighter">Lighter</button>
-    <button class="tab-btn" disabled title="后续交易所按 /api/exchanges 动态追加">Decibel</button>
-    <button class="tab-btn" disabled>Extended</button>
   </nav>
 
   <main class="wrap">
@@ -48,23 +45,14 @@
         </div>
         <div class="total-card">
           <div class="lbl">运行状态</div>
-          <div class="val" id="ov-status">—</div>
-          <div class="sub"><span id="ov-ex">—</span> · <span id="ov-symbol">—</span> <span id="ov-dir-short">—</span></div>
+          <div class="val" id="ov-status">未启动</div>
+          <div class="sub" id="ov-status-detail">无运行中的策略</div>
         </div>
       </div>
-      <div class="ov-card">
-        <div class="ov-exname"><span class="run-dot" id="ov-dot"></span><span id="ov-exname">—</span></div>
-        <div class="kv"><span class="lbl">交易对</span><span class="val" id="ov-pair">—</span></div>
-        <div class="kv"><span class="lbl">方向</span><span class="val" id="ov-direction">—</span></div>
-        <div class="kv"><span class="lbl">区间</span><span class="val" id="ov-range">—</span></div>
-        <div class="kv"><span class="lbl">最新价</span><span class="val" id="ov-mark">—</span></div>
-        <div class="kv"><span class="lbl">持仓</span><span class="val" id="ov-pos">—</span></div>
-        <div class="kv"><span class="lbl">挂单健康</span><span class="val" id="ov-health">—</span></div>
-        <button class="btn btn-ghost" id="btn-goto-ex">进入控制台 →</button>
-      </div>
+      <div class="ov-instances" id="ov-instances" hidden></div>
     </section>
 
-    <section id="tab-lighter" class="tab-panel">
+    <section id="tab-exchange" class="tab-panel">
       <div class="grid-left-right">
         <div class="stack">
           <div class="panel">
@@ -184,7 +172,6 @@
                 <label>建仓方式</label>
                 <select id="entry-mode">
                   <option value="maker_follow" selected>Maker 自动跟价</option>
-                  <option value="market">市价建仓</option>
                   <option value="limit_price">指定价格</option>
                 </select>
                 <div id="entry-hint" class="note"></div>

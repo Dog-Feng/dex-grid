@@ -170,9 +170,30 @@ func (o Order) Remaining() decimal.Decimal {
 
 // FilledNotional 返回已成交的名义价值。
 func (o Order) FilledNotional() decimal.Decimal {
-	price := o.AvgFillPrice
-	if price.IsZero() {
-		price = o.Price
+	return o.FillPrice().Mul(o.FilledQty)
+}
+
+// FillPrice 是这张单的成交均价。没有均价时退回挂单价。
+func (o Order) FillPrice() decimal.Decimal {
+	if o.AvgFillPrice.IsPositive() {
+		return o.AvgFillPrice
 	}
-	return price.Mul(o.FilledQty)
+	return o.Price
+}
+
+// Trade 是交易所推送的一笔逐笔成交。
+//
+// RealizedPnL 用交易历史里的 ask/bid_account_pnl，已经扣除手续费。
+// Fee 只作展示，不要再从 RealizedPnL 里减一次。
+type Trade struct {
+	ID            int64
+	ClientOrderID ClientOrderID
+	Symbol        string
+	Side          Side
+	Price         decimal.Decimal
+	Quantity      decimal.Decimal
+	Fee           decimal.Decimal
+	RealizedPnL   decimal.Decimal
+	IsMaker       bool
+	Time          time.Time
 }

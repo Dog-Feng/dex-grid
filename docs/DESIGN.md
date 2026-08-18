@@ -1,8 +1,8 @@
 # dex-grid 开发设计文档
 
-版本：v0.3（Lighter + 普通合约网格 + 马丁网格。Web 控制台已 embed，默认不自动开网格）
+版本：v0.4（Lighter + RH Lighter + 普通/马丁网格。Web 控制台已 embed，默认不自动开网格）
 
-本文描述分层职责、核心抽象、网格算法、事件与命令流、HTTP API 契约与工程约定。Lighter 协议、签名、nonce、改单与主网踩坑见 [LIGHTER.md](LIGHTER.md)。配置字段规范见 [GRID_CONFIG.md](GRID_CONFIG.md)，部署见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+本文描述分层职责、核心抽象、网格算法、事件与命令流、HTTP API 契约与工程约定。Lighter 协议、签名、nonce、改单与主网踩坑见 [LIGHTER.md](LIGHTER.md)。RH Lighter（独立实例）见 [RH_LIGHTER.md](RH_LIGHTER.md)。配置字段规范见 [GRID_CONFIG.md](GRID_CONFIG.md)，部署见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
 ---
 
@@ -185,7 +185,7 @@ type Capabilities struct {
 
 - `PlaceOrders` / `ModifyOrders` / `CancelOrders` 天然收批量，避免上层出现单笔/批量两套路径。铺 80 格网格时批量是刚需；Lighter 目前 `BatchPlace=0`，Executor 拆成串行。
 - 事件合流成单 channel 而非多个，让 Runner 的 select 只有三个分支（事件、命令、定时器），也避免多 channel 之间乱序导致「先收到成交、后收到挂单确认」这类难处理的时序问题。
-- `PostOnly` 为 false 时直接拒绝启动，不做静默降级 —— 全 maker 是本系统的核心前提。
+- `PostOnly` 为 false 时直接拒绝启动，不做静默降级。策略挂单默认全是 maker；仅止损平仓与建仓超时允许市价 IOC。
 - `ModifyOrder` 为 true 时改价改量（马丁止盈主路径）；为 false 时 Executor 降级成撤旧单再挂同一 `ClientOrderID`。改单失败不得把旧单当成 `Rejected` 清掉，否则会双挂。
 - `Markets` 与 `Klines` 是为页面加的只读查询。事件流在 `Streamer` 上，不塞进交易端口。
 
@@ -254,7 +254,8 @@ type Stop          struct{ Reason StopReason }
 `main.go` 显式注册，不用 `init()` 副作用，保持依赖可见：
 
 ```go
-exchange.Register("lighter", lighter.New)     // slot 0
+exchange.Register("lighter", lighter.New)          // slot 0（lighter 包 init）
+exchange.Register("rh_lighter", rhlighter.New)    // slot 1，只能追加
 strategy.Register("grid", grid.New)
 strategy.Register("martingale", martingale.New)
 ```
@@ -342,7 +343,7 @@ type Cell struct {
 
 **中性网格默认不需要建仓**（初始目标仓位为 0），`entry` 配置在 `neutral_base_ratio = 0` 时不生效，页面上该区域置灰并提示。配置 `neutral_base_ratio ∈ (0,1]` 时按挂卖格子总量的该比例建立多头底仓，行为介于中性与做多之间。
 
-每闭合一个循环，毛利 `= (High − Low) × Qty`，净利再扣两笔 maker 手续费。
+每闭合一个循环，毛利按**真实成交均价**配对（不是格子 High−Low）。页面「已实现」：有交易所成交历史时用其净盈亏（已扣费，不再二次扣）；否则用毛利 − 自估手续费（maker 成交按 maker 费率，止损/超时吃单按 taker 费率）。
 
 **挂单数 = 格子数**。80 格网格铺满是 80 笔单，现价所在的那条价格线上没有单——那条线是相邻两格的交界，两边都不需要在它上面挂单。（控制台原型上写的 81 是按价格线数量算的，实际以格子数为准。）
 
@@ -380,14 +381,14 @@ Lighter 的挂单额度足以支撑 80 格全挂，但换到挂单上限低的�
 
 | 模式 | 行为 | 关键参数 |
 | --- | --- | --- |
-| `market` | 直接发市价单（Lighter：`MarketOrder` + `IOC` + 滑点保护）。唯一使用 taker 的场景。可拆片降低冲击成本 | `slice_count`、`slice_interval`、`max_slippage` |
-| `maker_follow` | 做多挂买一价、做空挂卖一价，最优价偏离超过 `reprice_ticks` 个 tick 时改价跟随。支持 `ModifyOrder` 用改单，否则撤单重挂 | `depth_level`、`reprice_ticks`、`reprice_interval`、`max_reprice`、`timeout`、`on_timeout` |
+| `maker_follow`（默认；旧名 `market` 同样走这条） | 做多挂买一价、做空挂卖一价，全程 post-only。最优价偏离超过 `reprice_ticks` 个 tick 时撤单重挂 | `depth_level`、`reprice_ticks`、`reprice_interval`、`max_reprice`、`timeout`、`on_timeout` |
 | `limit_price` | 在指定价挂 post-only 单等待，不跟价 | `price`、`timeout`、`on_timeout` |
 
 **共同约束**
 
 - 部分成交是常态：持续跟踪 `filled_qty`，只对剩余量重挂，直到 `filled_qty >= target × (1 − fill_tolerance)`。
-- `on_timeout` 可选 `market`（转市价补齐剩余）、`keep`（继续等）、`abort`（放弃并停止）。
+- `on_timeout` 可选 `market`（**市价 IOC 吃掉剩余量**，滑点保护价）、`keep`（继续等）、`abort`（放弃并停止）。这是建仓路径里唯一的 taker。
+- Executor 默认把限价单强制成 `Limit + PostOnly`；仅 `Type=Market` / `TIF=IOC`（止损、建仓超时）放行吃单。
 - `max_reprice` 防止剧烈行情中无限跟价烧手续费与请求配额。
 - **建仓期间不铺网格**。建仓完成后策略才生成铺网格意图，避免仓位未到位就挂 reduce-only 平仓单被拒。页面此阶段显示「建仓中」。
 - `EnsurePosition` 的目标是带符号的绝对仓位。Runner 在启动建仓前必须 `syncEpoch` 并重新查询交易所仓位，禁止用过期快照算差额。
@@ -522,7 +523,7 @@ API handler 投递命令后阻塞等待 `Reply`，默认超时 10s（`CmdStop` �
 | 命令 | 前置条件 | 行为 | 失败处理 |
 | --- | --- | --- | --- |
 | `Start` | 状态为 Stopped，配置校验通过，余额充足 | 设杠杆 → 对账 → 建仓 → 铺网格 → 转 Running | 任一步失败则回滚到 Stopped 并撤销已挂出的单 |
-| `Stop` | Running / Paused | 撤销全部挂单 → 按配置市价平仓 → 落盘终态 → 转 `Stopped(Manual)` | 平仓失败保留仓位并告警，状态仍转 Stopped 并标记有残留仓位 |
+| `Stop` | Running / Paused | 撤销全部挂单 → **保留仓位** → 落盘终态 → 转 `Stopped(Manual)` | — |
 | `AdjustRange` | Running | 见 7.3 | 失败则保持旧区间不变，返回错误 |
 | `CancelOrders` | Running / Paused(OutOfRange) | 撤销本实例全部挂单，**仓位不动**，层级全部置 Empty，转 `Paused(Manual)` | 部分失败则返回未撤成功的层级列表 |
 | `Refill` | Running / Paused(Manual) | 对账 → 计算缺失层级 → 补挂；从 Paused(Manual) 调用时同时转回 Running | 部分失败计入待重试计数，下个 tick 继续补 |
@@ -654,8 +655,8 @@ func (c ClientOrderID) Decode() (slot uint8, epoch, level uint16, purpose Purpos
 
 | 优先级 | 检查项 | 触发动作 |
 | --- | --- | --- |
-| 1 | 止损价 | `CancelAll` + `ClosePosition{Market}` + `Stop{StopLoss}` |
-| 2 | 止盈价 | `CancelAll` + `ClosePosition{Market}` + `Stop{TakeProfit}` |
+| 1 | 止损价 | `CancelAll` + `ClosePosition{Market}` + `Stop{StopLoss}`（市价 IOC，避免对手盘不够） |
+| 2 | 止盈价 | `CancelAll` + `EnsurePosition{0}`（maker 跟价收到 0 后再停止） |
 | 3 | 区间外策略（`pause` / `stop_and_cancel`） | 见 10.2 |
 | 4 | 最大持仓名义 | 暂停开仓腿，只留平仓腿，告警 |
 | 5 | 保证金率低于阈值 | 同上 + 告警 |
@@ -731,7 +732,7 @@ func (c ClientOrderID) Decode() (slot uint8, epoch, level uint16, purpose Purpos
 
 因此 `Paused` 必须携带 reason，页面上分别展示不同的提示与操作入口。
 
-`Stopped` 同样携带 reason，且**默认不保证已平仓**：只有 `TakeProfit` / `StopLoss` 会市价平仓。`Manual`、`Shutdown`、`OutOfRange`、`Circuit`、`Error`、`EntryFailed` 都只撤销**当前策略交易对**的挂单并保留仓位。页面在有残留仓位时必须醒目提示，不能让用户以为停止了就等于空仓。
+`Stopped` 同样携带 reason，且**默认不保证已平仓**：`StopLoss` 市价吃单平仓；`TakeProfit` maker 跟价平仓。`Manual`、`Shutdown`、`OutOfRange`、`Circuit`、`Error`、`EntryFailed` 都只撤销**当前策略交易对**的挂单并保留仓位。页面在有残留仓位时必须醒目提示，不能让用户以为停止了就等于空仓。
 
 ---
 
@@ -1040,7 +1041,7 @@ const (
 - 加仓单按计划价 post-only 预挂，成交即加仓，避免轮询滞后。
 - **加仓后改止盈，不撤旧单重挂。** 有 `ModifyOrder` 时 `ModifyOrders`；没有则 Executor 降级撤+挂。改单失败保留旧止盈，禁止当成拒单清掉（否则双挂）。
 - 启动时若已有同向仓且数量 ≥ 首单，不反向平，直接挂加仓与止盈；反向仓拒绝启动，要求先平。
-- **止盈后重开**：`epoch++` → 全撤 → 市价平掉残留 → 按新均价重建计划 → `EnsurePosition(首单量)`。Runner 必须立刻同步 epoch，并按交易所最新仓位建仓；不得用止盈前的仓位快照去「减仓」，否则做多下一轮会先挂一笔空单，随后加仓单被看门狗当旧轮次循环撤销。
+- **止盈后重开**：`epoch++` → 全撤 → maker 限价平掉残留 → 按新均价重建计划 → `EnsurePosition(首单量)`。Runner 必须立刻同步 epoch，并按交易所最新仓位建仓；不得用止盈前的仓位快照去「减仓」，否则做多下一轮会先挂一笔空单，随后加仓单被看门狗当旧轮次循环撤销。
 - 看门狗只在 `Idle` / `Entering` 才 `EnsurePosition`。Running 后仓位随加仓变化，不得把仓位拉回初始首单量。
 - Maker 建仓跟价：已有在途单则改价，不发第二笔；盘口未到则等 tick，不连打。
 - `add_multiplier > 1` 时资金指数增长；保存时预计算总保证金与加满仓强平价，超过可用余额拒绝。预览按**首单**保证金拦截即可启动，加满仓需求在计划表里展示。

@@ -190,10 +190,16 @@ func (g *Guard) price() decimal.Decimal {
 }
 
 func closeActions(reason strategy.StopReason) []strategy.Action {
+	if reason == strategy.StopStopLoss {
+		return []strategy.Action{
+			strategy.CancelAll{},
+			strategy.ClosePosition{Urgency: strategy.UrgencyMarket},
+			strategy.Stop{Reason: reason},
+		}
+	}
 	return []strategy.Action{
 		strategy.CancelAll{},
-		strategy.ClosePosition{Urgency: strategy.UrgencyMarket},
-		strategy.Stop{Reason: reason},
+		strategy.EnsurePosition{Target: decimal.Zero},
 	}
 }
 

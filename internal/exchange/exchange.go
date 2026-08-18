@@ -83,7 +83,7 @@ type Capabilities struct {
 	BatchCancel int
 	// ModifyOrder 支持改价改量，可省掉一次撤单。
 	ModifyOrder bool
-	// PostOnly 为 false 时本系统无法运行——除建仓外全部挂单都是 post-only。
+	// PostOnly 为 false 时本系统无法运行——除止损/建仓超时外，策略挂单一律 post-only。
 	PostOnly   bool
 	ReduceOnly bool
 	// NativeTPSL 支持交易所原生条件单。
@@ -171,6 +171,7 @@ type StreamEvent struct {
 	Order    *order.Order
 	Position *position.Position
 	Account  *account.Snapshot
+	Trade    *order.Trade
 	// Resync 为真表示流刚重连，本地状态可能已过期，上层应触发全量对账。
 	Resync bool
 	Err    error

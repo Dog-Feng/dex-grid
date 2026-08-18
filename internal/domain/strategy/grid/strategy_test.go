@@ -268,6 +268,87 @@ func TestCompletedGridCountsProfit(t *testing.T) {
 	if !st.GridProfit.Equal(d("25")) {
 		t.Fatalf("grid profit = %s, want 25", st.GridProfit)
 	}
+	if !st.FeePaid.IsPositive() {
+		t.Fatal("self-calculated realized path should accrue maker fees")
+	}
+	if !st.RealizedPnL.Equal(st.GridProfit.Sub(st.FeePaid)) {
+		t.Fatalf("realized pnl = %s, want grid_profit - fee_paid", st.RealizedPnL)
+	}
+}
+
+// 已实现按真实成交均价，不按格子 High−Low。买在 99、卖在 125，毛利 26 而不是 25。
+func TestCompletedGridUsesFillVWAP(t *testing.T) {
+	s := newStrategy(t, smallParams(Neutral))
+	acts, _ := s.Init(testState("150", "0"))
+
+	buy100 := findPlacement(t, acts, "100")
+	confirm(t, s, buy100, order.StateOpen, decimal.Zero)
+	moveMarket(t, s, "100.05", time.Second)
+
+	buyFill := orderEvent(buy100, order.StateFilled, buy100.Quantity)
+	buyFill.Order.AvgFillPrice = d("99")
+	next, err := s.OnEvent(buyFill)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sell125 := findPlacement(t, next, "125")
+	confirm(t, s, sell125, order.StateOpen, decimal.Zero)
+	moveMarket(t, s, "125", 2*time.Second)
+	if _, err := s.OnEvent(orderEvent(sell125, order.StateFilled, sell125.Quantity)); err != nil {
+		t.Fatal(err)
+	}
+
+	st := s.View().Stats
+	if st.CompletedGrids != 1 {
+		t.Fatalf("completed grids = %d, want 1", st.CompletedGrids)
+	}
+	if !st.GridProfit.Equal(d("26")) {
+		t.Fatalf("grid profit = %s, want 26 (125-99)", st.GridProfit)
+	}
+	if !st.RealizedPnL.Equal(st.GridProfit.Sub(st.FeePaid)) {
+		t.Fatalf("self-calculated realized = %s, want %s - %s", st.RealizedPnL, st.GridProfit, st.FeePaid)
+	}
+}
+
+// 交易所成交里的已实现已经扣过手续费，页面用它，不再 GridProfit − 估算手续费。
+func TestVenueTradePnLOverridesGridProfit(t *testing.T) {
+	s := newStrategy(t, smallParams(Neutral))
+	if _, err := s.Init(testState("150", "0")); err != nil {
+		t.Fatal(err)
+	}
+	coid := order.MustEncode(order.Ref{Slot: 0, Epoch: s.epoch, Cell: 0, Purpose: order.PurposeClose, Seq: 1})
+	tr := order.Trade{
+		ID:            77,
+		ClientOrderID: coid,
+		Side:          order.Sell,
+		Price:         d("125"),
+		Quantity:      d("1"),
+		Fee:           d("0.01"),
+		RealizedPnL:   d("24.5"),
+	}
+	if _, err := s.OnEvent(strategy.TradeEvent{Trade: tr, Now: epoch0}); err != nil {
+		t.Fatal(err)
+	}
+	st := s.View().Stats
+	if !st.RealizedPnL.Equal(d("24.5")) {
+		t.Fatalf("realized = %s, want venue net 24.5", st.RealizedPnL)
+	}
+	if _, err := s.OnEvent(strategy.TradeEvent{Trade: tr, Now: epoch0}); err != nil {
+		t.Fatal(err)
+	}
+	if !s.View().Stats.RealizedPnL.Equal(d("24.5")) {
+		t.Fatal("duplicate trade_id must not double-count realized pnl")
+	}
+	foreign := tr
+	foreign.ID = 78
+	foreign.ClientOrderID = order.MustEncode(order.Ref{Slot: 9, Epoch: 99, Cell: 0, Purpose: order.PurposeClose})
+	if _, err := s.OnEvent(strategy.TradeEvent{Trade: foreign, Now: epoch0}); err != nil {
+		t.Fatal(err)
+	}
+	if !s.View().Stats.RealizedPnL.Equal(d("24.5")) {
+		t.Fatal("foreign slot/epoch trade must not affect realized pnl")
+	}
 }
 
 // 会立即成交的价格不下单：post-only 必被拒，等价格移开再挂。
@@ -618,7 +699,8 @@ func TestIgnoresForeignOrderEvents(t *testing.T) {
 	if len(acts) != 0 {
 		t.Fatal("foreign order events must not produce actions")
 	}
-	if s.View().Stats != before {
+	after := s.View().Stats
+	if after.Fills != before.Fills || after.CompletedGrids != before.CompletedGrids || !after.GridProfit.Equal(before.GridProfit) {
 		t.Fatal("foreign order events must not affect stats")
 	}
 }
@@ -843,6 +925,46 @@ func TestRealignAfterMarkDropEnablesSellAt76(t *testing.T) {
 		}
 	}
 	t.Fatalf("expected sell @ 76 after mark drop, got %d placements", len(placements(acts)))
+}
+
+// 已确认的买单被现价穿过时，realign 不得先撤单；等成交回报再翻转到对手价。
+func TestRealignSkipsRestingOrderCrossedByMark(t *testing.T) {
+	s := newStrategy(t, smallParams(Long))
+	acts, err := s.Init(testState("150", "2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	buy125 := findPlacement(t, acts, "125")
+	confirm(t, s, buy125, order.StateOpen, decimal.Zero)
+
+	moved, err := s.OnEvent(strategy.BookEvent{
+		Book: market.BookTicker{Bid: d("124.9"), Ask: d("125.1")},
+		Mark: d("125"),
+		Now:  epoch0.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range moved {
+		if c, ok := a.(strategy.CancelOrder); ok && c.ClientOrderID == buy125.ClientOrderID {
+			t.Fatal("must not cancel a resting buy that mark has already crossed")
+		}
+		if p, ok := a.(strategy.PlaceOrder); ok && p.Side == order.Sell && p.Price.Equal(d("150")) {
+			t.Fatal("must not place the opposite sell before the crossed buy fills")
+		}
+	}
+
+	next, err := s.OnEvent(orderEvent(buy125, order.StateFilled, buy125.Quantity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sell := findPlacement(t, next, "150")
+	if sell.Side != order.Sell {
+		t.Fatalf("after fill want sell @ 150, got %s @ %s", sell.Side, sell.Price)
+	}
+	if s.View().Stats.Fills != 1 {
+		t.Fatalf("fills = %d, want 1", s.View().Stats.Fills)
+	}
 }
 
 // 建仓完成时应按运行时 mark 重新 Arm，而不是沿用 Init 时偏高的 mark。

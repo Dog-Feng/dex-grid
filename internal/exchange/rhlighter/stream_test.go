@@ -1,4 +1,4 @@
-package lighter
+package rhlighter
 
 import (
 	"context"

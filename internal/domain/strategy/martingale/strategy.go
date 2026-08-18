@@ -95,8 +95,9 @@ type Strategy struct {
 	retry   map[int]int
 	retryTP int
 
-	stats    strategy.Stats
-	restored bool
+	stats      strategy.Stats
+	seenTrades map[int64]struct{}
+	restored   bool
 }
 
 // New 从 JSON 参数构造策略。
@@ -141,6 +142,7 @@ func (s *Strategy) Init(st strategy.State) ([]strategy.Action, error) {
 	}
 	s.target = s.entryTarget()
 	s.stats = strategy.Stats{ResetAt: st.Now}
+	s.seenTrades = map[int64]struct{}{}
 	s.clearLive()
 	s.addedTimes = 0
 
@@ -187,6 +189,9 @@ func (s *Strategy) OnEvent(ev strategy.Event) ([]strategy.Action, error) {
 		return nil, nil
 	case strategy.OrderEvent:
 		return s.onOrder(e)
+	case strategy.TradeEvent:
+		s.onTrade(e.Trade)
+		return nil, nil
 	case strategy.EntryDoneEvent:
 		if s.phase != strategy.PhaseEntering {
 			return nil, nil
@@ -241,6 +246,7 @@ func (s *Strategy) OnCommand(cmd strategy.Command) ([]strategy.Action, error) {
 		return s.placeActions(cmd.Now), nil
 	case strategy.CmdResetStats:
 		s.stats = strategy.Stats{ResetAt: cmd.Now}
+		s.seenTrades = map[int64]struct{}{}
 		return nil, nil
 	default:
 		return nil, strategy.ErrUnsupportedCommand

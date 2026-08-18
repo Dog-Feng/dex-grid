@@ -32,7 +32,10 @@ func (r *Runner) recordFill(o order.Order) {
 	if r.cfg.Persist == nil || !o.FilledQty.IsPositive() {
 		return
 	}
-	if o.State != order.StateFilled && o.State != order.StatePartiallyFilled {
+	if !o.ClientOrderID.Valid() {
+		return
+	}
+	if o.ClientOrderID.Decode().Slot != r.cfg.Slot {
 		return
 	}
 	if err := r.cfg.Persist.RecordFill(r.cfg.Name, o); err != nil {

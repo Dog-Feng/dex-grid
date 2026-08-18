@@ -80,7 +80,7 @@ exchanges: # 各 DEX 凭证与连接参数
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `name` | string | — | 交易所标识，当前仅 `lighter` |
+| `name` | string | — | 交易所标识：`lighter` 或 `rh_lighter`。同一个 name 只能出现一次 |
 | `enabled` | bool | `true` | 关闭后该交易所不启动、不加载策略文件 |
 | `network` | string | `mainnet` | `mainnet` / `testnet` |
 | `base_url` / `ws_url` | string | 按 network 推导 | 覆盖默认端点 |
@@ -106,6 +106,23 @@ exchanges: # 各 DEX 凭证与连接参数
 | `options.batch_size` | int | `20` | 单批最大交易数 |
 | `options.order_expiry` | duration | `28d` | GTT 有效期，上限 `30d` |
 | `options.price_protection` | bool | `true` | 市价单滑点保护 |
+
+### 4.3 RH Lighter 专有字段
+
+RH Lighter 是**另一条链上的独立 DEX**，配置段必须单独写、密钥必须用 `RH_LIGHTER_*`，不能复用上面的 `LIGHTER_*`。协议字段与 4.2 相同，默认端点不同。详见 [RH_LIGHTER.md](RH_LIGHTER.md)。
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `name` | string | — | 必须是 `rh_lighter` |
+| `credentials.account_index` | int | — | RH 账户索引（必填） |
+| `credentials.api_key_index` | int | `1` | **建议 ≥ 2**。0 和 1 留给官方 Web/移动端 |
+| `credentials.api_key_private_key` | string | — | RH API Key 私钥（必填，**环境变量**） |
+| `options.chain_id` | int | `466324` | 主网签名 chain_id；测试网默认 `300` |
+
+未覆盖时 REST/WS：
+
+- 主网 `https://api.rh.lighter.xyz` / `wss://api.rh.lighter.xyz/stream`
+- 测试网 `https://api.rh-testnet.lighter.xyz` / `wss://api.rh-testnet.lighter.xyz/stream`
 
 ## 5. 完整示例
 
@@ -151,6 +168,23 @@ exchanges:
       rps: 10
       burst: 20
     # strategy_file: config/lighter-sol.yaml
+    autostart: false
+
+  - name: rh_lighter
+    enabled: false
+    network: mainnet
+    credentials:
+      account_index: ${RH_LIGHTER_ACCOUNT_INDEX}
+      api_key_index: ${RH_LIGHTER_API_KEY_INDEX}
+      api_key_private_key: ${RH_LIGHTER_API_KEY_PRIVATE_KEY}
+    options:
+      tx_send_channel: ws
+      batch_enabled: true
+      batch_size: 20
+      order_expiry: 28d
+    rate_limit:
+      rps: 10
+      burst: 20
     autostart: false
 ```
 
@@ -211,21 +245,14 @@ exchanges:
 
 | 表单项 | JSON 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- | --- |
-| 建仓方式 | `entry.mode` | string | `maker_follow` | `market` / `maker_follow` / `limit_price` |
+| 建仓方式 | `entry.mode` | string | `maker_follow` | `maker_follow` / `limit_price`（旧值 `market` 按跟价处理） |
 | 指定价格 | `entry.price` | string | — | 仅 `limit_price` 必填 |
-| 建仓超时 | `entry.timeout` | duration | `5m` | `market` 模式忽略 |
-| 超时处理 | `entry.on_timeout` | string | `market` | `market`（转市价补齐）/ `keep`（继续等）/ `abort`（放弃并停止） |
+| 建仓超时 | `entry.timeout` | duration | `5m` | 超时后按 `on_timeout` 处理 |
+| 超时处理 | `entry.on_timeout` | string | `market` | `market`（市价 IOC 吃剩余量）/ `keep`（继续等）/ `abort`（放弃并停止） |
 | 成交容忍 | `entry.fill_tolerance` | string | `"0.01"` | 成交 99% 即视为完成 |
+| 最大滑点 | `entry.max_slippage` | string | `"0.005"` | 仅超时转市价时使用，0.5% |
 
-`mode = market`（唯一使用 taker 的场景）：
-
-| 表单项 | JSON 字段 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| 分片数 | `entry.slice_count` | `1` | 拆成几笔市价单降低冲击成本 |
-| 分片间隔 | `entry.slice_interval` | `1s` | |
-| 最大滑点 | `entry.max_slippage` | `"0.005"` | 0.5%，超出则中止剩余分片 |
-
-`mode = maker_follow`（做多挂买一档，做空挂卖一档）：
+`mode = maker_follow`（默认；做多挂买一档，做空挂卖一档，**post-only**）：
 
 | 表单项 | JSON 字段 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -242,11 +269,11 @@ exchanges:
 
 | 表单项 | JSON 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- | --- |
-| 止盈价 | `risk.take_profit_price` | string | — | 触及则撤单 + 市价平仓 + 停止 |
-| 止损价 | `risk.stop_loss_price` | string | — | 同上。**强烈建议配置** |
+| 止盈价 | `risk.take_profit_price` | string | — | 触及则撤单 + maker 跟价平到 0 + 停止 |
+| 止损价 | `risk.stop_loss_price` | string | — | 触及则撤单 + **市价 IOC 吃单**平仓 + 停止。**强烈建议配置** |
 | 区间外策略 | `risk.out_of_range` | string | `pause` | 见 9.1 |
 | 触发价格源 | `risk.price_source` | string | `mark` | `mark`（标记价，抗插针）/ `mid` / `last` |
-| 停止时平仓 | `risk.close_on_stop` | bool | `false` | **已废弃**。停策略与关进程一律只撤本交易对挂单、保留仓位；仅止盈/止损仍平仓 |
+| 停止时平仓 | `risk.close_on_stop` | bool | `false` | **已废弃**。停策略与关进程一律只撤本交易对挂单、保留仓位；止损市价平仓，风控止盈 maker 平仓 |
 | 最大持仓名义 | `risk.max_position_notional` | string | `"0"` | 超出后暂停开仓腿，`0` = 不限 |
 | 最低保证金率 | `risk.min_margin_ratio` | string | `"0"` | 低于则暂停开仓腿并告警，`0` = 不检查 |
 | 连续失败熔断 | `risk.max_consecutive_errors` | int | `10` | 达到则撤单熔断，**不平仓** |
@@ -477,7 +504,7 @@ Content-Type: application/json
 
 加仓成交后**修改**已有止盈单（Lighter `ModifyOrder`），不撤了再挂：新止盈价按新持仓均价计算，数量必须等于当前仓位。详见 [LIGHTER.md](LIGHTER.md) 第 8.2 节。
 
-止盈成交后下一周期：轮次号加一，先平残留再按首单量建仓。不会用过期仓位去挂反向单，新加仓单也不会被看门狗当成上一轮孤儿单撤掉。
+止盈成交后下一周期：轮次号加一，先 **maker 限价**平残留再按首单量建仓。不会用过期仓位去挂反向单，新加仓单也不会被看门狗当成上一轮孤儿单撤掉。
 
 ## 15. 字段总表
 
@@ -615,7 +642,7 @@ lighterctl market -m 2       # 查看 market_index=2 的元数据与最小下单
 | `POST /suggest` | 「智能填充参数」与「采用推荐策略 + 自动区间」按钮 |
 | `grid.*` | 数值输入组，每次 change 防抖 300ms 后调 `POST /preview` |
 | `POST /preview` 响应 | 表单下方派生量文字 + 警告条 |
-| `entry.mode` | 建仓方式三选一，选中后展开对应子表单；中性网格时整块置灰 |
+| `entry.mode` | 建仓方式两选一（跟价 / 指定价）；中性网格时整块置灰 |
 | `risk.out_of_range` | 区间外策略二选一，选 `pause` 时展开回归确认参数 |
 | 五个操作按钮 | 对应五个 POST 端点，`stop` 与 `adjust-range` 需二次确认弹窗 |
 

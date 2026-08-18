@@ -51,7 +51,7 @@ type SetLeverage struct {
 
 // EnsurePosition 要求把仓位调整到 Target（带符号的绝对目标，不是增量）。
 //
-// 具体怎么调整由应用层的建仓触发器决定（市价 / maker 跟价 / 指定价格），
+// 具体怎么调整由应用层的建仓触发器决定（maker 跟价 / 指定价格；旧 market 配置同样走 maker），
 // 完成后回发 EntryDoneEvent。策略不关心过程。
 type EnsurePosition struct {
 	Target decimal.Decimal
@@ -61,9 +61,9 @@ type EnsurePosition struct {
 type Urgency uint8
 
 const (
-	// UrgencyMarket 立即市价平仓，用于止损止盈这类不能等的场景。
+	// UrgencyMarket 市价 IOC 吃单平仓，用于止损。
 	UrgencyMarket Urgency = iota
-	// UrgencyMaker 挂单平仓，省手续费但不保证成交。
+	// UrgencyMaker 挂买一/卖一 post-only 平仓。
 	UrgencyMaker
 )
 
@@ -121,8 +121,8 @@ func (r StopReason) String() string {
 	}
 }
 
-// ClosesPosition 表示该停止原因下会主动市价平仓。
-// 手动停止、关进程、熔断、错误一律只撤单留仓；仅止盈/止损仍平仓。
+// ClosesPosition 表示该停止原因下会主动平仓。
+// 止损市价吃单；止盈 maker 跟价。手动停止、关进程、熔断、错误一律只撤单留仓。
 func (r StopReason) ClosesPosition() bool {
 	switch r {
 	case StopTakeProfit, StopStopLoss:

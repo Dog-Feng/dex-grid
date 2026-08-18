@@ -229,9 +229,9 @@ func (s *Strategy) handleTPFill(o order.Order, now time.Time) []strategy.Action 
 	}
 	s.target = s.entryTarget()
 	s.phase = strategy.PhaseEntering
-	// 先市价减仓清掉止盈没平干净的残留，再建首单。
+	// 先 maker 限价减仓清掉止盈没平干净的残留，再建首单。
 	// 否则 Runner 若还拿着止盈前的仓位快照，会把「建仓」做成反向空单。
-	return append(acts, strategy.ClosePosition{Urgency: strategy.UrgencyMarket}, strategy.EnsurePosition{Target: s.target})
+	return append(acts, strategy.ClosePosition{Urgency: strategy.UrgencyMaker}, strategy.EnsurePosition{Target: s.target})
 }
 
 func (s *Strategy) noteFill(o order.Order) {
@@ -241,7 +241,14 @@ func (s *Strategy) noteFill(o order.Order) {
 	} else {
 		s.stats.SellFills++
 	}
-	s.stats.FeePaid = s.stats.FeePaid.Add(o.Fee)
+	s.stats.FeePaid = s.stats.FeePaid.Add(fillFee(o, s.mkt))
+}
+
+func (s *Strategy) onTrade(t order.Trade) {
+	if s.seenTrades == nil {
+		s.seenTrades = map[int64]struct{}{}
+	}
+	strategy.NoteVenueTrade(&s.stats, s.seenTrades, s.slot, s.epoch, t)
 }
 
 func (s *Strategy) placeActions(now time.Time) []strategy.Action {
@@ -627,10 +634,17 @@ func effectiveMark(mark decimal.Decimal, book market.BookTicker) decimal.Decimal
 }
 
 func fillPrice(o order.Order) decimal.Decimal {
-	if o.AvgFillPrice.IsPositive() {
-		return o.AvgFillPrice
+	return o.FillPrice()
+}
+
+func fillFee(o order.Order, mkt market.Market) decimal.Decimal {
+	if o.Fee.IsPositive() {
+		return o.Fee
 	}
-	return o.Price
+	if !o.FilledQty.IsPositive() {
+		return decimal.Zero
+	}
+	return mkt.FeeFor(o.FillPrice(), o.FilledQty, o.IsMaker || o.TIF == order.PostOnly)
 }
 
 func firstNonZero(a, b decimal.Decimal) decimal.Decimal {

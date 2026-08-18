@@ -46,8 +46,9 @@ Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运
 | 交易所 | 阶段 | 状态 |
 | --- | --- | --- |
 | Lighter (zkLighter) | 第一阶段 | 已接入，可主网实盘 |
+| RH Lighter | 第二家 DEX | 已接入（独立实例，`rh_lighter`） |
 
-后续接入哪些 DEX 待定。架构上新增一个交易所只需实现 `exchange.Exchange` 接口并在 `main.go` 追加一行注册。
+架构上新增一个交易所只需实现 `exchange.Exchange` 接口并在 `main.go` **追加**一行注册（不可插入中间，会改 ClientOrderID slot）。
 
 | 策略 | 标的 | 方向 | 阶段 | 状态 |
 | --- | --- | --- | --- | --- |
@@ -56,15 +57,17 @@ Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运
 
 **不支持现货网格**，这是明确的设计边界而不是待办项。
 
-### 建仓触发模式（三选一）
+### 建仓与挂单角色
+
+控制台建仓方式两选一（旧配置名 `market` 仍可读，按跟价处理）：
 
 | 模式 | 说明 | 订单角色 |
 | --- | --- | --- |
-| 市价建仓 `market` | 立即以市价单完成建仓 | **taker** |
-| Maker 自动跟价 `maker_follow` | 挂在订单簿买一档（做空时卖一档），价格移动则跟随改价 | maker |
-| 指定价格 `limit_price` | 在指定价挂单等待成交 | maker |
+| Maker 自动跟价 `maker_follow` | 做多挂买一、做空挂卖一，盘口移动则撤单重挂 | maker |
+| 指定价格 `limit_price` | 在指定价挂 post-only 等待成交 | maker |
 
-> 除市价建仓外，系统中**所有**网格挂单一律 post-only。post-only 被拒（会立即成交）时重试或等下一 tick 重挂，绝不降级成 taker。
+> 网格、加仓、止盈、建仓挂单一律 post-only。post-only 被拒时重试或等下一 tick 重挂，不降级成 taker。  
+> **仅两处走市价 IOC 吃单**：风控**止损平仓**（避免对手盘不够挂不出），以及建仓 **`on_timeout=market` 超时补齐剩余量**。风控止盈仍 maker 跟价收到 0。
 
 ---
 
@@ -117,6 +120,8 @@ Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运
 ```
 dex-grid/
 ├── cmd/gridbot/main.go             # 入口：加载配置 → 注册适配器 → 恢复实例 → 启动 HTTP
+├── cmd/lighterctl/main.go          # Core Lighter 核对 CLI
+├── cmd/rhlighterctl/main.go        # RH Lighter 核对 CLI
 ├── internal/
 │   ├── config/                     # config.yaml 结构体、环境变量展开、校验
 │   ├── domain/                     # 领域层（纯逻辑，无 IO）
@@ -142,7 +147,8 @@ dex-grid/
 │   ├── exchange/
 │   │   ├── exchange.go             # Exchange 端口 + Capabilities
 │   │   ├── registry.go             # 名称 → 构造函数
-│   │   └── lighter/                # Lighter 适配器（REST + WS + 签名）
+│   │   ├── lighter/                # Lighter 适配器（slot 0）
+│   │   └── rhlighter/              # RH Lighter 适配器（slot 1，独立链）
 │   └── infra/
 │       ├── store/                  # SQLite：策略配置、订单、成交、统计
 │       ├── logx/                   # slog + 内存环形缓冲
@@ -155,6 +161,7 @@ dex-grid/
 ├── docs/
 │   ├── DESIGN.md                   # 开发设计文档
 │   ├── LIGHTER.md                  # Lighter 适配：协议、签名、nonce、改单
+│   ├── RH_LIGHTER.md               # RH Lighter 适配：独立实例、端点、chain_id 466324
 │   ├── GRID_CONFIG.md              # 网格配置文档
 │   ├── DEPLOYMENT.md               # 安装部署文档
 │   └── images/ui-prototype.png
@@ -222,6 +229,14 @@ go build -o lighterctl ./cmd/lighterctl
 
 > `cancel-all` 必须带 `-m`，只撤销该交易对挂单，不影响其他市场。
 
+RH Lighter 用独立工具 `rhlighterctl`（连 `api.rh.lighter.xyz`，读 `name: rh_lighter` 那段配置）：
+
+```bash
+go build -o rhlighterctl ./cmd/rhlighterctl
+./rhlighterctl markets -q sol
+./rhlighterctl check
+```
+
 ---
 
 ## 6. 运行时操作
@@ -252,7 +267,7 @@ go build -o lighterctl ./cmd/lighterctl
 3. **意图幂等**：每笔订单携带确定性 `ClientOrderID`（编码交易所槽位 + 轮次 + 层级 + 用途 + 重挂序号），重放安全。
 4. **启动先对账**：恢复运行前先拉交易所真实挂单与仓位比对，撤孤儿单、补缺失单。
 5. **失败不静默**：错误按类型分流（可重试 / 参数错 / 保证金不足 / post-only 被拒），连续失败达阈值则熔断并写日志。
-6. **停止只撤单**：停策略或关进程一律「撤销本交易对挂单 → 保留仓位 → 落盘终态」。仅止盈/止损会市价平仓。
+6. **停止只撤单**：停策略或关进程一律「撤销本交易对挂单 → 保留仓位 → 落盘终态」。止损市价吃单平仓；风控止盈 maker 跟价平仓。
 7. **精度先规整后发送**：价格按 `tick_size`、数量按 `lot_size` 规整，规整后为 0 直接丢弃并告警。
 
 ---
@@ -287,7 +302,7 @@ GOOS=windows GOARCH=amd64 go build -o dist/gridbot.exe ./cmd/gridbot
 | **M6 持久化与对账** | SQLite 落盘、启动恢复、周期漂移检查、指标 | 长时间无人值守 |
 | **M7 行情分析** | K 线已接入图表；EMA/斜率/ATR、趋势判定、参数推荐待做 | 图表可用 |
 | **M8 马丁网格** | 马丁策略（做多/做空）、预挂加仓、加仓后 Modify 止盈、止盈后同步 epoch 再开下一轮 | 已实现 |
-| **M9 多交易所** | 接入第二个 DEX（具体交易所待定） | 验证端口抽象 |
+| **M9 多交易所** | 接入 RH Lighter（独立实例，验证端口抽象） | 已接入 `rh_lighter` |
 
 **扩展性验收标准**：新增交易所只允许改 `internal/exchange/<name>/` 与 `main.go` 一行注册；新增策略只允许改 `internal/domain/strategy/<name>/` 与配置结构体。若必须改 `app` 层，说明抽象有缺陷，先修抽象。
 
@@ -307,6 +322,8 @@ GOOS=windows GOARCH=amd64 go build -o dist/gridbot.exe ./cmd/gridbot
 
 ## 11. 相关文档
 
-- [开发设计文档 docs/DESIGN.md](docs/DESIGN.md) —— 分层职责、核心接口、网格算法、事件与命令流、API 契约、Lighter 适配、测试策略
+- [开发设计文档 docs/DESIGN.md](docs/DESIGN.md) —— 分层职责、核心接口、网格算法、事件与命令流、HTTP API
+- [Lighter 适配 docs/LIGHTER.md](docs/LIGHTER.md) —— Core Lighter 协议、签名、nonce、改单
+- [RH Lighter 适配 docs/RH_LIGHTER.md](docs/RH_LIGHTER.md) —— Robinhood 链实例，与 Core 隔离
 - [网格配置文档 docs/GRID_CONFIG.md](docs/GRID_CONFIG.md) —— `config.yaml`、策略 YAML、REST 字段、派生量公式、校验规则
 - [安装部署文档 docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) —— Windows / Linux 安装、服务化、代理、升级、备份、排错

@@ -15,7 +15,7 @@ func (s *Strategy) View() strategy.View {
 		Direction:      s.params.Direction.String(),
 		GridCount:      s.params.Martingale.MaxAddTimes,
 		TargetPosition: s.target,
-		Stats:          s.stats,
+		Stats:          s.stats.ForView(),
 	}
 	if n := len(s.plan.Levels); n > 0 {
 		last := s.plan.Levels[n-1].TriggerPrice
@@ -107,9 +107,14 @@ type snapshotData struct {
 	AddedTimes int             `json:"added_times"`
 	Cycles     int             `json:"cycles"`
 	Stats      strategy.Stats  `json:"stats"`
+	SeenTrades []int64         `json:"seen_trades,omitempty"`
 }
 
 func (s *Strategy) Snapshot() ([]byte, error) {
+	ids := make([]int64, 0, len(s.seenTrades))
+	for id := range s.seenTrades {
+		ids = append(ids, id)
+	}
 	return json.Marshal(snapshotData{
 		Params:     s.params,
 		Epoch:      s.epoch,
@@ -123,6 +128,7 @@ func (s *Strategy) Snapshot() ([]byte, error) {
 		AddedTimes: s.addedTimes,
 		Cycles:     s.cycles,
 		Stats:      s.stats,
+		SeenTrades: ids,
 	})
 }
 
@@ -146,6 +152,10 @@ func (s *Strategy) Restore(data []byte) error {
 	s.stats = d.Stats
 	s.adds = map[int]*liveOrder{}
 	s.retry = map[int]int{}
+	s.seenTrades = map[int64]struct{}{}
+	for _, id := range d.SeenTrades {
+		s.seenTrades[id] = struct{}{}
+	}
 	s.restored = true
 	return nil
 }

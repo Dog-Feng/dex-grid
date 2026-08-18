@@ -140,14 +140,48 @@ type Stats struct {
 	// 偶发是正常的，持续增长说明回报链路有问题。
 	PendingTimeouts int             `json:"pending_timeouts"`
 	CompletedGrids  int             `json:"completed_grids"`
-	GridProfit      decimal.Decimal `json:"grid_profit"` // 完成格的毛利合计
+	GridProfit      decimal.Decimal `json:"grid_profit"` // 本轮已闭合循环的成交价差毛利（不含费）
 	FeePaid         decimal.Decimal `json:"fee_paid"`
+	// RealizedPnL 是页面「已实现」：有交易所成交时用交易历史净盈亏（已扣费），否则用 GridProfit − FeePaid。
+	RealizedPnL decimal.Decimal `json:"realized_pnl"`
+	// VenueRealized 表示已收到本轮交易所成交，RealizedPnL 按交易历史累加，不再用费率二次扣减。
+	VenueRealized bool `json:"venue_realized,omitempty"`
 	// ResetAt 是统计的起算时间，「重置统计」会更新它。
 	ResetAt time.Time `json:"reset_at"`
 }
 
-// NetProfit 返回扣除手续费后的网格净利。
-func (s Stats) NetProfit() decimal.Decimal { return s.GridProfit.Sub(s.FeePaid) }
+// ForView 填好 realized_pnl。交易所成交已扣费；自算路径用 GridProfit − FeePaid。
+func (s Stats) ForView() Stats {
+	if s.VenueRealized {
+		return s
+	}
+	s.RealizedPnL = s.GridProfit.Sub(s.FeePaid)
+	return s
+}
+
+// NoteVenueTrade 把一笔交易所成交的已实现（已扣费）计入本轮。重复 trade_id 或外人格子单忽略。
+func NoteVenueTrade(stats *Stats, seen map[int64]struct{}, slot uint8, epoch uint16, t order.Trade) {
+	if stats == nil {
+		return
+	}
+	if t.ID != 0 && seen != nil {
+		if _, ok := seen[t.ID]; ok {
+			return
+		}
+	}
+	if !t.ClientOrderID.Valid() {
+		return
+	}
+	ref := t.ClientOrderID.Decode()
+	if ref.Slot != slot || (epoch > 0 && ref.Epoch != epoch) {
+		return
+	}
+	if seen != nil && t.ID != 0 {
+		seen[t.ID] = struct{}{}
+	}
+	stats.VenueRealized = true
+	stats.RealizedPnL = stats.RealizedPnL.Add(t.RealizedPnL)
+}
 
 // View 是策略暴露给页面的只读视图。
 type View struct {

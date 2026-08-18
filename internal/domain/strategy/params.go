@@ -18,7 +18,7 @@ type EntryMode uint8
 const (
 	// EntryMakerFollow 挂在盘口最优价并跟随，默认。
 	EntryMakerFollow EntryMode = iota
-	// EntryMarket 市价建仓，全系统唯一使用 taker 的场景。
+	// EntryMarket 已不再吃单：仍接受旧配置名，实际按 maker 跟价限价挂。
 	EntryMarket
 	// EntryLimitPrice 在指定价挂 post-only 单等待。
 	EntryLimitPrice
@@ -63,7 +63,7 @@ func (m *EntryMode) UnmarshalText(b []byte) error {
 type TimeoutPolicy uint8
 
 const (
-	TimeoutMarket TimeoutPolicy = iota // 转市价补齐剩余量
+	TimeoutMarket TimeoutPolicy = iota // 超时后市价 IOC 吃掉剩余量
 	TimeoutKeep                        // 继续等待
 	TimeoutAbort                       // 放弃建仓并停止实例
 )
@@ -209,7 +209,7 @@ func DefaultRiskParams() RiskParams {
 }
 
 // ShouldCloseOnStop 已废弃：停止策略/关进程一律保留仓位。
-// 仅止盈/止损仍由风控 Guard 市价平仓。
+// 仅止损由风控 Guard 市价吃单平仓；风控止盈仍 maker 跟价收到 0。
 func (r RiskParams) ShouldCloseOnStop() bool {
 	return r.CloseOnStop != nil && *r.CloseOnStop
 }

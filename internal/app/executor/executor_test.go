@@ -161,6 +161,40 @@ func TestClosePositionMarket(t *testing.T) {
 	if res.Fatal != nil {
 		t.Fatal(res.Fatal)
 	}
+	if n := len(ex.Resting()); n != 0 {
+		t.Fatalf("market close should not rest, got %d orders", n)
+	}
+	pos, _ := ex.Position(context.Background(), "BTC")
+	if !pos.IsFlat() {
+		t.Fatalf("position still %s", pos.Size)
+	}
+}
+
+func TestClosePositionMakerLimit(t *testing.T) {
+	ex := fake.New(testMarket())
+	ex.SetBook(d("149.9"), d("150.1"))
+	ex.SetMark(d("150"))
+	ex.SetPosition(position.Position{Symbol: "BTC", Size: d("2"), MarkPrice: d("150")})
+	e := newExec(ex)
+
+	res := e.Apply(context.Background(), []strategy.Action{
+		strategy.ClosePosition{Urgency: strategy.UrgencyMaker},
+	})
+	if res.Fatal != nil {
+		t.Fatal(res.Fatal)
+	}
+	resting := ex.Resting()
+	if len(resting) != 1 {
+		t.Fatalf("maker close should rest, got %d orders", len(resting))
+	}
+	o := resting[0]
+	if o.TIF != order.PostOnly || o.Type != order.Limit || o.Side != order.Sell {
+		t.Fatalf("close order = %+v, want post-only sell", o)
+	}
+	if !o.Price.Equal(d("150.1")) {
+		t.Fatalf("close price = %s, want ask 150.1", o.Price)
+	}
+	ex.Trade(d("150.1"))
 	pos, _ := ex.Position(context.Background(), "BTC")
 	if !pos.IsFlat() {
 		t.Fatalf("position still %s", pos.Size)

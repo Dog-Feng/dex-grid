@@ -39,7 +39,11 @@ func TestStopLossLong(t *testing.T) {
 		t.Fatalf("verdict = %+v", v)
 	}
 	if len(v.Actions) != 3 {
-		t.Fatalf("actions = %d, want cancel+close+stop", len(v.Actions))
+		t.Fatalf("actions = %d, want cancel+market close+stop", len(v.Actions))
+	}
+	cp, ok := v.Actions[1].(strategy.ClosePosition)
+	if !ok || cp.Urgency != strategy.UrgencyMarket {
+		t.Fatalf("second action = %#v, want market close", v.Actions[1])
 	}
 }
 
@@ -52,6 +56,12 @@ func TestTakeProfitLong(t *testing.T) {
 	})
 	if !v.Stop || v.Reason != strategy.StopTakeProfit {
 		t.Fatalf("verdict = %+v", v)
+	}
+	if len(v.Actions) != 2 {
+		t.Fatalf("tp actions = %d, want cancel + maker flatten", len(v.Actions))
+	}
+	if _, ok := v.Actions[1].(strategy.EnsurePosition); !ok {
+		t.Fatalf("tp second action = %T, want EnsurePosition", v.Actions[1])
 	}
 }
 

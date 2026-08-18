@@ -55,6 +55,11 @@ type Cell struct {
 	// Armed 表示该格已完成循环的前半程（持有一条已成交的开腿），
 	// 下一笔成交就构成一个完整的网格循环。
 	Armed bool `json:"armed"`
+
+	// OpenQty / OpenPrice 是开腿的成交量与成交均价，闭合时用真实均价算已实现，
+	// 而不是格子 High−Low。一单多笔成交时均价已经含在订单的 AvgFillPrice 里。
+	OpenQty   decimal.Decimal `json:"open_qty,omitempty"`
+	OpenPrice decimal.Decimal `json:"open_price,omitempty"`
 }
 
 // OrderPrice 返回该格当前应挂的价格。

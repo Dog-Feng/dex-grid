@@ -16,6 +16,7 @@ import (
 	"dex-grid/internal/app/supervisor"
 	"dex-grid/internal/config"
 	"dex-grid/internal/exchange"
+	"dex-grid/internal/exchange/rhlighter"
 	"dex-grid/internal/infra/httpx"
 	"dex-grid/internal/infra/lockfile"
 	"dex-grid/internal/infra/logx"
@@ -25,6 +26,11 @@ import (
 	_ "dex-grid/internal/domain/strategy/martingale"
 	_ "dex-grid/internal/exchange/lighter"
 )
+
+func init() {
+	// lighter 包 init 已占用 slot 0。RH Lighter 必须追加，不能插到中间。
+	exchange.Register(rhlighter.Name, rhlighter.New)
+}
 
 func main() {
 	if err := run(); err != nil {

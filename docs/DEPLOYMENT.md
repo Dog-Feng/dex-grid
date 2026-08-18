@@ -249,7 +249,7 @@ chmod 600 .env && chown gridbot:gridbot .env
 | `api_key_index` | 创建 API Key 时指定的槽位，0-254。首个通常用 `1`（`0` 一般留给官方前端） |
 | `api_key_private_key` | 创建 API Key 时生成的私钥，**只显示一次** |
 
-创建流程参考 Lighter 官方文档的 System Setup 章节，或使用官方 Python SDK 的 `system_setup.py` 示例生成。适配器协议、签名、nonce 与改单见 [LIGHTER.md](LIGHTER.md)。
+创建流程参考 Lighter 官方文档的 System Setup 章节，或使用官方 Python SDK 的 `system_setup.py` 示例生成。DEX 适配：协议、签名、nonce 与改单见 [LIGHTER.md](LIGHTER.md)（Core）或 [RH_LIGHTER.md](RH_LIGHTER.md)（Robinhood 链实例）。
 
 ### 重要安全提示
 
