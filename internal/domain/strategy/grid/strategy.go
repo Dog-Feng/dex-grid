@@ -74,6 +74,8 @@ type Strategy struct {
 
 	// retrying 记录各格子的连续下单失败次数，供页面展示「待重试」。
 	retrying map[int]int
+	// lastRetryMark 是上次刷新 retrying 时的 mark，用于在价格变动后恢复被拒格子。
+	lastRetryMark decimal.Decimal
 
 	stats    strategy.Stats
 	restored bool
@@ -133,6 +135,7 @@ func (s *Strategy) Init(st strategy.State) ([]strategy.Action, error) {
 	s.target = g.TargetPosition(s.params.Direction, s.params.Grid.NeutralBaseRatio)
 	s.stats = strategy.Stats{ResetAt: st.Now}
 	s.retrying = map[int]int{}
+	s.lastRetryMark = s.mark
 
 	acts := []strategy.Action{
 		strategy.SetLeverage{Leverage: s.params.Leverage, Mode: s.params.MarginMode},
@@ -175,6 +178,8 @@ func (s *Strategy) OnEvent(ev strategy.Event) ([]strategy.Action, error) {
 			s.position = next
 		}
 		s.phase = strategy.PhaseRunning
+		s.realignGrid()
+		s.refreshRetrying()
 		return s.placeActions(e.Now), nil
 
 	case strategy.EntryFailedEvent:
@@ -207,6 +212,8 @@ func (s *Strategy) OnCommand(cmd strategy.Command) ([]strategy.Action, error) {
 			return nil, fmt.Errorf("grid: 当前状态 %s 不能补格", s.phase)
 		}
 		s.phase = strategy.PhaseRunning
+		s.realignGrid()
+		s.refreshRetrying()
 		return s.placeActions(cmd.Now), nil
 
 	case strategy.CmdResetStats:
@@ -312,7 +319,56 @@ func (s *Strategy) tick(now time.Time) []strategy.Action {
 		return nil
 	}
 	s.expirePending(now)
-	return s.placeActions(now)
+	acts := s.realignGrid()
+	s.refreshRetrying()
+	acts = append(acts, s.placeActions(now)...)
+	return acts
+}
+
+// realignGrid 把尚未成交（Seq=0）的格子对齐到当前 mark 下的 Arm 方向。
+// 已跑完至少一腿的格子不在此列，避免覆盖 OnFill 翻转后的对手单。
+func (s *Strategy) realignGrid() []strategy.Action {
+	if s.grid == nil || !s.mark.IsPositive() {
+		return nil
+	}
+	var acts []strategy.Action
+	for i := range s.grid.Cells {
+		c := &s.grid.Cells[i]
+		if c.Seq != 0 {
+			continue
+		}
+		want := SideForMark(s.mark, *c)
+		wantPrice := c.priceForSide(want)
+		if c.Side == want && c.OrderPrice().Equal(wantPrice) {
+			continue
+		}
+		if c.State != CellEmpty && c.COID != 0 {
+			acts = append(acts, strategy.CancelOrder{ClientOrderID: c.COID})
+		}
+		c.Side = want
+		applyArmed(s.params.Direction, c)
+		c.State = CellEmpty
+		c.COID = 0
+		c.PendingSince = time.Time{}
+		delete(s.retrying, i)
+	}
+	return acts
+}
+
+func (s *Strategy) refreshRetrying() {
+	if s.grid == nil || !s.mark.IsPositive() || s.mark.Equal(s.lastRetryMark) {
+		return
+	}
+	s.lastRetryMark = s.mark
+	for i := range s.grid.Cells {
+		c := &s.grid.Cells[i]
+		if c.State != CellEmpty {
+			continue
+		}
+		if s.isMakerPrice(c.Side, c.OrderPrice()) {
+			delete(s.retrying, i)
+		}
+	}
 }
 
 // expirePending 把长时间收不到回报的格子放回 Empty。
@@ -495,11 +551,10 @@ func (s *Strategy) placeActions(now time.Time) []strategy.Action {
 		if c.State != CellEmpty {
 			continue
 		}
-		if s.retrying[i] > s.params.Order.PostOnlyRetry {
-			continue // 反复被拒，等价格移动后再试
-		}
-
 		price := c.OrderPrice()
+		if s.retrying[i] > s.params.Order.PostOnlyRetry {
+			continue // 反复被拒，等价格移开后再试
+		}
 		if !s.isMakerPrice(c.Side, price) {
 			continue // 会立即成交，post-only 必被拒，等下一个 tick
 		}
@@ -549,7 +604,10 @@ func (s *Strategy) resumeActions(now time.Time) []strategy.Action {
 	if s.phase != strategy.PhaseRunning {
 		return nil
 	}
-	return s.placeActions(now)
+	acts := s.realignGrid()
+	s.refreshRetrying()
+	acts = append(acts, s.placeActions(now)...)
+	return acts
 }
 
 // syncFromOrders 用对账结果同步格子状态，并撤掉本策略不认的多余单。

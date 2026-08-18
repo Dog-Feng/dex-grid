@@ -287,8 +287,8 @@ func TestSkipsOrdersThatWouldCrossTheBook(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := placements(acts)
-	if len(got) != 3 {
-		t.Fatalf("placed %d orders, want 3 (the buy at 125 must be skipped)", len(got))
+	if len(got) != 4 {
+		t.Fatalf("placed %d orders, want 4 after realign at lower mark", len(got))
 	}
 	for _, p := range got {
 		if p.Side == order.Buy && p.Price.GreaterThanOrEqual(d("110")) {
@@ -797,6 +797,112 @@ func TestRunningGridDoesNotReenterOnPositionDrift(t *testing.T) {
 	}
 	if n := countAction[strategy.EnsurePosition](acts); n != 0 {
 		t.Fatalf("看门狗对账时仓位小于初始目标，不应再补建仓，got %d", n)
+	}
+}
+
+func solNeutralParams() Params {
+	p := DefaultParams()
+	p.Direction = Neutral
+	p.Leverage = 10
+	p.Grid.LowerPrice = d("72")
+	p.Grid.UpperPrice = d("77")
+	p.Grid.GridCount = 50
+	p.Grid.SizingMode = MarginBased
+	p.Grid.Margin = d("1500")
+	return p
+}
+
+// 启动 mark 高于 76 时，75.9–76.0 格会被 Arm 成买单；价格回落后应 realign 成卖 @76。
+func TestRealignAfterMarkDropEnablesSellAt76(t *testing.T) {
+	s := newStrategy(t, solNeutralParams())
+	st := testState("76.2", "0")
+	st.Book = market.BookTicker{Bid: d("76.1"), Ask: d("76.2")}
+	st.Mark = d("76.2")
+	if _, err := s.Init(st); err != nil {
+		t.Fatal(err)
+	}
+	c := s.grid.Cells[39]
+	if !c.Low.Equal(d("75.9")) || !c.High.Equal(d("76")) {
+		t.Fatalf("cell39 bounds = %s-%s, want 75.9-76", c.Low, c.High)
+	}
+	if c.Side != order.Buy || !c.OrderPrice().Equal(d("75.9")) {
+		t.Fatalf("before drop cell39 = %s @ %s, want buy @ 75.9", c.Side, c.OrderPrice())
+	}
+
+	acts, err := s.OnEvent(strategy.BookEvent{
+		Book: market.BookTicker{Bid: d("75.5"), Ask: d("75.7")},
+		Mark: d("75.6"),
+		Now:  epoch0.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range placements(acts) {
+		if p.Side == order.Sell && p.Price.Equal(d("76")) {
+			return
+		}
+	}
+	t.Fatalf("expected sell @ 76 after mark drop, got %d placements", len(placements(acts)))
+}
+
+// 建仓完成时应按运行时 mark 重新 Arm，而不是沿用 Init 时偏高的 mark。
+func TestRealignAfterEntryDoneUsesRuntimeMark(t *testing.T) {
+	p := solNeutralParams()
+	p.Grid.NeutralBaseRatio = d("0.05")
+	s := newStrategy(t, p)
+	st := testState("76.2", "0")
+	st.Book = market.BookTicker{Bid: d("76.1"), Ask: d("76.2")}
+	st.Mark = d("76.2")
+	if _, err := s.Init(st); err != nil {
+		t.Fatal(err)
+	}
+	if s.phase != strategy.PhaseEntering {
+		t.Fatalf("phase = %s, want entering", s.phase)
+	}
+	moveMarket(t, s, "75.6", time.Second)
+	acts, err := s.OnEvent(strategy.EntryDoneEvent{Filled: d("1"), Now: epoch0.Add(time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range placements(acts) {
+		if p.Side == order.Sell && p.Price.Equal(d("76")) {
+			return
+		}
+	}
+	t.Fatalf("expected sell @ 76 after entry done, got %d placements", len(placements(acts)))
+}
+
+// post-only 拒单达上限后，价格移开且可 maker 时应恢复重试。
+func TestPostOnlyRetryResetsWhenMakerPriceReturns(t *testing.T) {
+	p := smallParams(Neutral)
+	p.Order.PostOnlyRetry = 1
+	s := newStrategy(t, p)
+	acts, _ := s.Init(testState("150", "0"))
+	buy := findPlacement(t, acts, "100")
+
+	confirm(t, s, buy, order.StateRejected, decimal.Zero)
+	if len(placements(s.tick(epoch0.Add(time.Second)))) != 1 {
+		t.Fatal("expected one retry placement")
+	}
+	confirm(t, s, buy, order.StateRejected, decimal.Zero)
+	if len(placements(s.tick(epoch0.Add(2*time.Second)))) != 0 {
+		t.Fatal("expected backoff after retry limit")
+	}
+
+	m := d("110")
+	acts, err := s.OnEvent(strategy.BookEvent{
+		Book: market.BookTicker{Bid: m.Sub(d("0.1")), Ask: m.Add(d("0.1"))},
+		Mark: m,
+		Now:  epoch0.Add(3 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.retrying[0] > 0 {
+		t.Fatalf("retry count = %d, want cleared after mark move", s.retrying[0])
+	}
+	if len(placements(acts)) == 0 {
+		t.Fatal("expected placement after price moved away and retry reset")
 	}
 }
 

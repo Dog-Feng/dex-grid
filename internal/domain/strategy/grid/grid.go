@@ -207,22 +207,37 @@ func Build(p Params, m market.Market) (*Grid, error) {
 func (g *Grid) Arm(dir Direction, mark decimal.Decimal) {
 	for i := range g.Cells {
 		c := &g.Cells[i]
-		if c.Low.GreaterThanOrEqual(mark) {
-			c.Side = order.Sell
-		} else {
-			c.Side = order.Buy
-		}
+		c.Side = SideForMark(mark, *c)
 		c.State = CellEmpty
 		c.COID = 0
 		c.Seq = 0
-		switch dir {
-		case Long:
-			c.Armed = c.Side == order.Sell
-		case Short:
-			c.Armed = c.Side == order.Buy
-		default:
-			c.Armed = false
-		}
+		applyArmed(dir, c)
+	}
+}
+
+// SideForMark 返回该格在当前价下应挂的方向（与 Arm 规则一致）。
+func SideForMark(mark decimal.Decimal, c Cell) order.Side {
+	if c.Low.GreaterThanOrEqual(mark) {
+		return order.Sell
+	}
+	return order.Buy
+}
+
+func (c Cell) priceForSide(side order.Side) decimal.Decimal {
+	if side == order.Buy {
+		return c.Low
+	}
+	return c.High
+}
+
+func applyArmed(dir Direction, c *Cell) {
+	switch dir {
+	case Long:
+		c.Armed = c.Side == order.Sell
+	case Short:
+		c.Armed = c.Side == order.Buy
+	default:
+		c.Armed = false
 	}
 }
 
