@@ -351,6 +351,53 @@ func TestVenueTradePnLOverridesGridProfit(t *testing.T) {
 	}
 }
 
+// RH 成交里 ask/bid_account_pnl 常为 0：不能因此改走交易历史口径，否则页面已实现一直是 0。
+func TestZeroVenuePnLKeepsSelfCalculatedRealized(t *testing.T) {
+	s := newStrategy(t, smallParams(Neutral))
+	acts, _ := s.Init(testState("150", "0"))
+
+	buy100 := findPlacement(t, acts, "100")
+	confirm(t, s, buy100, order.StateOpen, decimal.Zero)
+	moveMarket(t, s, "100.05", time.Second)
+	next, _ := s.OnEvent(orderEvent(buy100, order.StateFilled, buy100.Quantity))
+
+	sell125 := findPlacement(t, next, "125")
+	confirm(t, s, sell125, order.StateOpen, decimal.Zero)
+	moveMarket(t, s, "125", 2*time.Second)
+	if _, err := s.OnEvent(orderEvent(sell125, order.StateFilled, sell125.Quantity)); err != nil {
+		t.Fatal(err)
+	}
+
+	before := s.View().Stats
+	if before.VenueRealized {
+		t.Fatal("self-calculated path must not set venue_realized")
+	}
+	if !before.RealizedPnL.Equal(before.GridProfit.Sub(before.FeePaid)) {
+		t.Fatalf("realized = %s, want %s - %s", before.RealizedPnL, before.GridProfit, before.FeePaid)
+	}
+
+	coid := order.MustEncode(order.Ref{Slot: 0, Epoch: s.epoch, Cell: 0, Purpose: order.PurposeClose, Seq: 1})
+	tr := order.Trade{
+		ID:            88,
+		ClientOrderID: coid,
+		Side:          order.Sell,
+		Price:         d("125"),
+		Quantity:      d("1"),
+		Fee:           d("0.01"),
+		RealizedPnL:   decimal.Zero,
+	}
+	if _, err := s.OnEvent(strategy.TradeEvent{Trade: tr, Now: epoch0}); err != nil {
+		t.Fatal(err)
+	}
+	after := s.View().Stats
+	if after.VenueRealized {
+		t.Fatal("zero venue pnl must not switch to venue path")
+	}
+	if !after.RealizedPnL.Equal(before.RealizedPnL) {
+		t.Fatalf("realized = %s after zero venue trade, want %s", after.RealizedPnL, before.RealizedPnL)
+	}
+}
+
 // 会立即成交的价格不下单：post-only 必被拒，等价格移开再挂。
 func TestSkipsOrdersThatWouldCrossTheBook(t *testing.T) {
 	s := newStrategy(t, smallParams(Neutral))

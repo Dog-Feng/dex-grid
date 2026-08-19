@@ -142,15 +142,16 @@ type Stats struct {
 	CompletedGrids  int             `json:"completed_grids"`
 	GridProfit      decimal.Decimal `json:"grid_profit"` // 本轮已闭合循环的成交价差毛利（不含费）
 	FeePaid         decimal.Decimal `json:"fee_paid"`
-	// RealizedPnL 是页面「已实现」：有交易所成交时用交易历史净盈亏（已扣费），否则用 GridProfit − FeePaid。
+	// RealizedPnL 是页面「已实现」：交易所成交给出非 0 净盈亏时用该值（已扣费），
+	// 否则用 GridProfit − FeePaid。RH 的 ask/bid_account_pnl 常为 0，必须走自算。
 	RealizedPnL decimal.Decimal `json:"realized_pnl"`
-	// VenueRealized 表示已收到本轮交易所成交，RealizedPnL 按交易历史累加，不再用费率二次扣减。
+	// VenueRealized 表示本轮已收到带非 0 已实现的成交，RealizedPnL 按交易历史累加，不再用费率二次扣减。
 	VenueRealized bool `json:"venue_realized,omitempty"`
 	// ResetAt 是统计的起算时间，「重置统计」会更新它。
 	ResetAt time.Time `json:"reset_at"`
 }
 
-// ForView 填好 realized_pnl。交易所成交已扣费；自算路径用 GridProfit − FeePaid。
+// ForView 填好 realized_pnl。交易所给出非 0 净盈亏则直接用；否则用 GridProfit − FeePaid。
 func (s Stats) ForView() Stats {
 	if s.VenueRealized {
 		return s
@@ -160,6 +161,7 @@ func (s Stats) ForView() Stats {
 }
 
 // NoteVenueTrade 把一笔交易所成交的已实现（已扣费）计入本轮。重复 trade_id 或外人格子单忽略。
+// 盈亏字段为 0 视为交易所未提供（RH 常见），不切换到交易历史口径，页面仍用格子毛利 − 手续费。
 func NoteVenueTrade(stats *Stats, seen map[int64]struct{}, slot uint8, epoch uint16, t order.Trade) {
 	if stats == nil {
 		return
@@ -178,6 +180,9 @@ func NoteVenueTrade(stats *Stats, seen map[int64]struct{}, slot uint8, epoch uin
 	}
 	if seen != nil && t.ID != 0 {
 		seen[t.ID] = struct{}{}
+	}
+	if t.RealizedPnL.IsZero() {
+		return
 	}
 	stats.VenueRealized = true
 	stats.RealizedPnL = stats.RealizedPnL.Add(t.RealizedPnL)

@@ -1,7 +1,8 @@
 // Package lighttrade 解析 Lighter 协议（Core 与 RH 共用）成交里的本账户一侧。
 //
-// 已实现盈亏用交易所给出的 ask_account_pnl / bid_account_pnl，该值已经扣除手续费，
-// 策略层直接累加，不要再按费率估算后二次扣减。
+// 已实现盈亏用交易所给出的 ask_account_pnl / bid_account_pnl，该值已经扣除手续费。
+// 字段非 0 时策略层直接累加、不再按费率二次扣减；为 0 时视为未提供（RH 常见），
+// 页面改用格子毛利 − 估算手续费。
 package lighttrade
 
 import (
