@@ -89,7 +89,7 @@ Capabilities{
 - 价格 `uint32`、数量 `int64`，按市场 `price_decimals` / `size_decimals` 缩放
 - **费率是百分数字符串**（`"0.0120"` 表示 0.012%），适配器 **÷100** 才是比率
 - API 若返回 0，自算已实现盈亏用 RH 公布费率兜底：**maker 0.012%**、**taker 0.035%**
-- 页面已实现：成交里的 `ask/bid_account_pnl` 非 0 时用该净盈亏（已扣费，不再二次扣）；为 0（RH 常见）或无成交历史时用 **闭合循环毛利 − 该循环两腿手续费**。未配对开仓腿的手续费不扣已实现
+- 页面已实现：成交里的 `ask/bid_account_pnl` 非 0 时用该净盈亏（DEX 已扣费，不再二次扣）；为 0（RH 常见）时用闭合循环价差，不再估算扣费
 - `min_base_amount` 与 `min_quote_amount` **两者取严**
 - 保证金率：`/orderBookDetails` 为万分之一整数；`/account` 持仓里是百分数字符串
 

@@ -140,31 +140,30 @@ type Stats struct {
 	// 偶发是正常的，持续增长说明回报链路有问题。
 	PendingTimeouts int             `json:"pending_timeouts"`
 	CompletedGrids  int             `json:"completed_grids"`
-	GridProfit      decimal.Decimal `json:"grid_profit"` // 本轮已闭合循环的成交价差毛利（不含费）
-	FeePaid         decimal.Decimal `json:"fee_paid"`    // 本轮所有成交的手续费（含未闭合开腿）
-	// CycleFee 是已闭合循环两腿的手续费。页面已实现 = GridProfit − CycleFee，
-	// 不能减 FeePaid，否则会把当前底仓/未配对开腿的手续费算进已实现。
+	GridProfit      decimal.Decimal `json:"grid_profit"` // 本轮已闭合循环的成交价差毛利
+	FeePaid         decimal.Decimal `json:"fee_paid"`    // 本轮所有成交的手续费（含未闭合开腿，仅作统计）
+	// CycleFee 是已闭合循环两腿的估算手续费，只作核对，不从页面已实现里再扣。
 	CycleFee decimal.Decimal `json:"cycle_fee"`
-	// RealizedPnL 是页面「已实现」：交易所成交给出非 0 净盈亏时用该值（已扣费），
-	// 否则用 GridProfit − CycleFee。RH 的 ask/bid_account_pnl 常为 0，必须走自算。
+	// RealizedPnL 是页面「已实现」：交易所成交给出非 0 净盈亏时用该值（DEX 已扣费）；
+	// 否则用 GridProfit。RH 的 ask/bid_account_pnl 常为 0，不能再用估算费率二次扣减。
 	RealizedPnL decimal.Decimal `json:"realized_pnl"`
-	// VenueRealized 表示本轮已收到带非 0 已实现的成交，RealizedPnL 按交易历史累加，不再用费率二次扣减。
+	// VenueRealized 表示本轮已收到带非 0 已实现的成交，RealizedPnL 按交易历史累加。
 	VenueRealized bool `json:"venue_realized,omitempty"`
 	// ResetAt 是统计的起算时间，「重置统计」会更新它。
 	ResetAt time.Time `json:"reset_at"`
 }
 
-// ForView 填好 realized_pnl。交易所给出非 0 净盈亏则直接用；否则用 GridProfit − CycleFee。
+// ForView 填好 realized_pnl。交易所给出非 0 净盈亏则直接用；否则用闭合循环价差，不再扣估算手续费。
 func (s Stats) ForView() Stats {
 	if s.VenueRealized {
 		return s
 	}
-	s.RealizedPnL = s.GridProfit.Sub(s.CycleFee)
+	s.RealizedPnL = s.GridProfit
 	return s
 }
 
 // NoteVenueTrade 把一笔交易所成交的已实现（已扣费）计入本轮。重复 trade_id 或外人格子单忽略。
-// 盈亏字段为 0 视为交易所未提供（RH 常见），不切换到交易历史口径，页面仍用闭合循环毛利 − 两腿手续费。
+// 盈亏字段为 0 视为交易所未提供（RH 常见），页面改用闭合循环价差，不再用估算费率二次扣减。
 func NoteVenueTrade(stats *Stats, seen map[int64]struct{}, slot uint8, epoch uint16, t order.Trade) {
 	if stats == nil {
 		return

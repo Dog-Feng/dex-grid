@@ -274,8 +274,8 @@ func TestCompletedGridCountsProfit(t *testing.T) {
 	if !st.CycleFee.Equal(st.FeePaid) {
 		t.Fatalf("cycle fee = %s, want all fees on a fully closed round trip (%s)", st.CycleFee, st.FeePaid)
 	}
-	if !st.RealizedPnL.Equal(st.GridProfit.Sub(st.CycleFee)) {
-		t.Fatalf("realized pnl = %s, want %s - %s", st.RealizedPnL, st.GridProfit, st.CycleFee)
+	if !st.RealizedPnL.Equal(st.GridProfit) {
+		t.Fatalf("realized pnl = %s, want grid_profit %s (no estimated fee subtract)", st.RealizedPnL, st.GridProfit)
 	}
 }
 
@@ -309,8 +309,8 @@ func TestCompletedGridUsesFillVWAP(t *testing.T) {
 	if !st.GridProfit.Equal(d("26")) {
 		t.Fatalf("grid profit = %s, want 26 (125-99)", st.GridProfit)
 	}
-	if !st.RealizedPnL.Equal(st.GridProfit.Sub(st.CycleFee)) {
-		t.Fatalf("self-calculated realized = %s, want %s - %s", st.RealizedPnL, st.GridProfit, st.CycleFee)
+	if !st.RealizedPnL.Equal(st.GridProfit) {
+		t.Fatalf("self-calculated realized = %s, want grid_profit %s", st.RealizedPnL, st.GridProfit)
 	}
 }
 
@@ -356,8 +356,8 @@ func TestRealizedPnLExcludesOpenInventoryFee(t *testing.T) {
 	if !st.RealizedPnL.Equal(closed.RealizedPnL) {
 		t.Fatalf("realized changed after unpaired open fill: %s vs %s", st.RealizedPnL, closed.RealizedPnL)
 	}
-	if !st.RealizedPnL.Equal(st.GridProfit.Sub(st.CycleFee)) {
-		t.Fatalf("realized = %s, want %s - %s", st.RealizedPnL, st.GridProfit, st.CycleFee)
+	if !st.RealizedPnL.Equal(st.GridProfit) {
+		t.Fatalf("realized = %s, want grid_profit %s", st.RealizedPnL, st.GridProfit)
 	}
 }
 
@@ -422,8 +422,8 @@ func TestZeroVenuePnLKeepsSelfCalculatedRealized(t *testing.T) {
 	if before.VenueRealized {
 		t.Fatal("self-calculated path must not set venue_realized")
 	}
-	if !before.RealizedPnL.Equal(before.GridProfit.Sub(before.CycleFee)) {
-		t.Fatalf("realized = %s, want %s - %s", before.RealizedPnL, before.GridProfit, before.CycleFee)
+	if !before.RealizedPnL.Equal(before.GridProfit) {
+		t.Fatalf("realized = %s, want grid_profit %s", before.RealizedPnL, before.GridProfit)
 	}
 
 	coid := order.MustEncode(order.Ref{Slot: 0, Epoch: s.epoch, Cell: 0, Purpose: order.PurposeClose, Seq: 1})

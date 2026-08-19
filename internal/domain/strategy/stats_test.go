@@ -17,8 +17,8 @@ func testCOID() order.ClientOrderID {
 func TestForViewUsesGridProfitWhenVenueMissing(t *testing.T) {
 	s := Stats{GridProfit: d("0.7448"), CycleFee: d("0.144"), FeePaid: d("0.216")}
 	got := s.ForView().RealizedPnL
-	if !got.Equal(d("0.6008")) {
-		t.Fatalf("realized = %s, want 0.6008 (must not subtract unpaired open-leg fees)", got)
+	if !got.Equal(d("0.7448")) {
+		t.Fatalf("realized = %s, want 0.7448 (must not subtract estimated fees again)", got)
 	}
 }
 
@@ -29,8 +29,8 @@ func TestNoteVenueTradeZeroPnLDoesNotSwitchPath(t *testing.T) {
 	if stats.VenueRealized {
 		t.Fatal("zero venue pnl must not set venue_realized")
 	}
-	if !stats.ForView().RealizedPnL.Equal(d("9")) {
-		t.Fatalf("realized = %s, want 9", stats.ForView().RealizedPnL)
+	if !stats.ForView().RealizedPnL.Equal(d("10")) {
+		t.Fatalf("realized = %s, want 10", stats.ForView().RealizedPnL)
 	}
 }
 

@@ -253,7 +253,7 @@ go build -o rhlighterctl ./cmd/rhlighterctl
 | 调整区间 | `POST /api/exchanges/{ex}/adjust-range` | 全撤重铺到新区间，不停止实例 |
 | 撤销挂单 | `POST /api/exchanges/{ex}/cancel-orders` | 只撤单，仓位不动 |
 | 补齐挂单 | `POST /api/exchanges/{ex}/refill` | 看门狗同款：缺补、多撤 |
-| 查看状态 | `GET /api/exchanges/{ex}/status` | 持仓、挂单、盈亏（已实现 = 闭合循环毛利 − 该循环两腿手续费） |
+| 查看状态 | `GET /api/exchanges/{ex}/status` | 持仓、挂单、盈亏（已实现与 DEX 交易历史同口径，不二次扣估算手续费） |
 | 运行日志 | `GET /api/exchanges/{ex}/logs` | 启动、挂了 N 笔、某价成交；页面「运行日志」面板 |
 | K 线 | `GET /api/exchanges/{ex}/klines` | 默认 `interval=1h` |
 
