@@ -254,9 +254,10 @@ go build -o rhlighterctl ./cmd/rhlighterctl
 | 撤销挂单 | `POST /api/exchanges/{ex}/cancel-orders` | 只撤单，仓位不动 |
 | 补齐挂单 | `POST /api/exchanges/{ex}/refill` | 看门狗同款：缺补、多撤 |
 | 查看状态 | `GET /api/exchanges/{ex}/status` | 持仓、挂单、盈亏 |
+| 运行日志 | `GET /api/exchanges/{ex}/logs` | 启动、挂了 N 笔、某价成交；页面「运行日志」面板 |
 | K 线 | `GET /api/exchanges/{ex}/klines` | 默认 `interval=1h` |
 
-完整字段见 [网格配置文档](docs/GRID_CONFIG.md)。成交由交易所 WebSocket 推送后立刻翻转格子并挂对手单；`reconcile_interval`（默认 15s）只做挂单缺补/多撤兜底。
+完整字段见 [网格配置文档](docs/GRID_CONFIG.md)。成交由交易所 WebSocket 推送后立刻翻转格子并挂对手单；`reconcile_interval`（默认 15s）只做挂单缺补/多撤兜底。控制台运行日志会打「已启动 / 挂了 N 笔 / 买成交价×量」，成交明细仍看成交记录表。
 
 ---
 

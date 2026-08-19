@@ -1,8 +1,11 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,6 +94,40 @@ func drainEntry(t *testing.T, r *Runner, ex *fake.Exchange) {
 	ex.Trade(d("149.9"))
 	ex.Trade(d("150.1"))
 	r.Drain(context.Background())
+}
+
+func TestRuntimeLogsStartPlaceAndFill(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	ex := fake.New(testMarket())
+	ex.SetBook(d("149.9"), d("150.1"))
+	ex.SetMark(d("150"))
+	raw, err := json.Marshal(smallParams(grid.Neutral))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := grid.New(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := New(ex, s, Config{Name: "fake", Slot: 0, TickInterval: time.Second, MaxRetries: 2, Log: log})
+	startOK(t, r, strategy.DefaultRiskParams())
+	out := buf.String()
+	if !strings.Contains(out, "已启动 BTC 中性网格") {
+		t.Fatalf("missing start log: %s", out)
+	}
+	if !strings.Contains(out, "挂了 4 笔") {
+		t.Fatalf("missing place log: %s", out)
+	}
+
+	ex.SetBook(d("124.9"), d("125.1"))
+	ex.SetMark(d("125"))
+	ex.Trade(d("125"))
+	r.Drain(context.Background())
+	out = buf.String()
+	if !strings.Contains(out, "买成交") || !strings.Contains(out, "125") {
+		t.Fatalf("missing fill log: %s", out)
+	}
 }
 
 func TestNeutralStartPlacesGrid(t *testing.T) {

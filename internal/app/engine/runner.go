@@ -16,6 +16,8 @@ import (
 	"dex-grid/internal/domain/order"
 	"dex-grid/internal/domain/strategy"
 	"dex-grid/internal/exchange"
+
+	"github.com/shopspring/decimal"
 )
 
 // Config 是 Runner 的构造参数。
@@ -41,11 +43,12 @@ type Runner struct {
 
 	commands chan Command
 
-	status     Status
-	stopReason strategy.StopReason
-	residual   bool
-	symbol     string
-	epoch      uint16
+	status      Status
+	stopReason  strategy.StopReason
+	residual    bool
+	symbol      string
+	epoch       uint16
+	lastFillQty map[order.ClientOrderID]decimal.Decimal
 
 	// 热快照，供 View 与建仓使用。
 	state strategy.State
@@ -307,6 +310,9 @@ func (r *Runner) handleStart(ctx context.Context, p StartPayload) CommandResult 
 		return r.failResult(err.Error())
 	}
 
+	dir := r.strat.View().Direction
+	r.log.Info(fmt.Sprintf("已启动 %s %s网格，现价 %s", r.symbol, gridDirCN(dir), r.state.Mark),
+		"symbol", r.symbol, "direction", dir, "mark", r.state.Mark.String())
 	r.apply(ctx, acts, now)
 	r.syncStatus()
 	r.persist()
@@ -807,4 +813,48 @@ func stripControl(acts []strategy.Action) []strategy.Action {
 		}
 	}
 	return out
+}
+
+func (r *Runner) logOrderFill(o order.Order) {
+	if !o.FilledQty.IsPositive() {
+		return
+	}
+	if o.ClientOrderID.Valid() && o.ClientOrderID.Decode().Slot != r.cfg.Slot {
+		return
+	}
+	if r.lastFillQty == nil {
+		r.lastFillQty = map[order.ClientOrderID]decimal.Decimal{}
+	}
+	prev := r.lastFillQty[o.ClientOrderID]
+	if !o.FilledQty.GreaterThan(prev) {
+		return
+	}
+	delta := o.FilledQty.Sub(prev)
+	r.lastFillQty[o.ClientOrderID] = o.FilledQty
+	px := o.AvgFillPrice
+	if !px.IsPositive() {
+		px = o.Price
+	}
+	if !px.IsPositive() || !delta.IsPositive() {
+		return
+	}
+	side := "买"
+	if o.Side == order.Sell {
+		side = "卖"
+	}
+	r.log.Info(fmt.Sprintf("%s成交 %s × %s", side, px, delta),
+		"symbol", r.symbol, "side", o.Side.String(), "price", px.String(), "qty", delta.String())
+}
+
+func gridDirCN(dir string) string {
+	switch dir {
+	case "long":
+		return "做多"
+	case "short":
+		return "做空"
+	case "neutral":
+		return "中性"
+	default:
+		return dir
+	}
 }

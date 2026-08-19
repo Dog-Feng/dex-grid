@@ -582,7 +582,7 @@ API handler 投递命令后阻塞等待 `Reply`，默认超时 10s（`CmdStop` �
 | GET | `/api/exchanges/{ex}/status` | 运行状态、持仓、盈亏、挂单进度 | 账户状态卡片 |
 | GET | `/api/exchanges/{ex}/levels` | 网格层级表（价格/数量/角色/状态） | 图表网格线 |
 | GET | `/api/exchanges/{ex}/trades?limit=` | 成交记录 | 成交记录表 |
-| GET | `/api/exchanges/{ex}/logs?limit=&level=` | 运行日志 | 日志面板 |
+| GET | `/api/exchanges/{ex}/logs?limit=&level=` | 运行日志（启动 / 挂了 N 笔 / 某价成交等） | 日志面板 |
 | POST | `/api/exchanges/{ex}/start` | 启动网格 | 「启动网格」 |
 | POST | `/api/exchanges/{ex}/stop` | 停止 + 撤本交易对挂单，保留仓位 | 「停止策略」 |
 | POST | `/api/exchanges/{ex}/adjust-range` | 调整区间 | 「调整区间（不停止网格）」 |
@@ -978,9 +978,20 @@ const (
 
 ## 16. 可观测性与日志面板
 
-**日志**：`log/slog`，JSON 输出到文件/stdout。同时写入一个**内存环形缓冲**（默认 2000 条），供页面日志面板读取与 WS 推送。每条日志强制带 `exchange` 字段（Runner 构造时通过 `logger.With` 注入）。
+**日志**：`log/slog`，JSON 输出到文件/stdout。同时写入一个**内存环形缓冲**（默认 2000 条），供页面日志面板读取与 WS 推送。每条日志强制带 `exchange` 字段（Runner 构造时通过 `logger.With` 注入）。页面只展示 `msg` 正文（不展开 attrs）。
 
 环形缓冲的存在是为了让页面不依赖读文件，跨平台行为一致（Windows 上读正在写入的日志文件容易踩锁）。
+
+运行日志 Info 会包含这些网格动作（成交按订单累计成交量增量去重，避免 WS 重复推送刷屏）：
+
+| 时机 | 示例 `msg` |
+| --- | --- |
+| 实例启动（事件流订上之后、铺单之前） | `已启动 BTC 中性网格，现价 64313.2` |
+| 一批挂单被交易所确认 | `挂了 40 笔`；部分失败为 `挂了 38 笔（目标 40）` |
+| 有成交 | `买成交 64300 × 0.01166` / `卖成交 64500 × 0.01164` |
+| 生命周期 | `事件流已连接`、`instance stopped`、`exchange attached` |
+
+挂单进度与成交明细仍以账户状态卡片、成交记录表为准；日志只做操作员可读的摘要。
 
 **指标**（Prometheus，`/metrics`）：
 

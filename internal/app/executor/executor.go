@@ -7,6 +7,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -279,6 +280,13 @@ func (e *Executor) place(ctx context.Context, places []strategy.PlaceOrder, now 
 
 	if e.progress.Confirmed > 0 && res.Failures == 0 {
 		e.fails = 0
+	}
+	if e.progress.Confirmed > 0 {
+		msg := fmt.Sprintf("挂了 %d 笔", e.progress.Confirmed)
+		if e.progress.Target > e.progress.Confirmed {
+			msg = fmt.Sprintf("挂了 %d 笔（目标 %d）", e.progress.Confirmed, e.progress.Target)
+		}
+		e.opts.Log.Info(msg, "confirmed", e.progress.Confirmed, "target", e.progress.Target)
 	}
 }
 

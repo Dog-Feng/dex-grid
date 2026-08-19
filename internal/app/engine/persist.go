@@ -29,6 +29,7 @@ func (r *Runner) persist() {
 }
 
 func (r *Runner) recordFill(o order.Order) {
+	r.logOrderFill(o)
 	if r.cfg.Persist == nil || !o.FilledQty.IsPositive() {
 		return
 	}
