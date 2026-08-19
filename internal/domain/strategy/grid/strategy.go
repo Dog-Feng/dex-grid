@@ -530,7 +530,8 @@ func (s *Strategy) handleFill(idx int, o order.Order, now time.Time) []strategy.
 	if partial {
 		s.stats.PartialFills++
 	}
-	s.stats.FeePaid = s.stats.FeePaid.Add(s.fillFee(o))
+	fee := s.fillFee(o)
+	s.stats.FeePaid = s.stats.FeePaid.Add(fee)
 	if res.Completed {
 		s.stats.CompletedGrids++
 		profit := realizedRoundTrip(c, o.Side, o.FillPrice(), o.FilledQty)
@@ -541,10 +542,14 @@ func (s *Strategy) handleFill(idx int, o order.Order, now time.Time) []strategy.
 			}
 		}
 		s.stats.GridProfit = s.stats.GridProfit.Add(profit)
+		matched := matchedQty(c.OpenQty, o.FilledQty)
+		s.stats.CycleFee = s.stats.CycleFee.Add(scaleDec(c.OpenFee, matched, c.OpenQty)).Add(scaleDec(fee, matched, o.FilledQty))
 		c.OpenQty = decimal.Zero
 		c.OpenPrice = decimal.Zero
+		c.OpenFee = decimal.Zero
 	} else {
 		c.OpenPrice, c.OpenQty = mergeVWAP(c.OpenPrice, c.OpenQty, o.FillPrice(), o.FilledQty)
+		c.OpenFee = c.OpenFee.Add(fee)
 	}
 
 	if s.phase != strategy.PhaseRunning {
@@ -753,6 +758,29 @@ func (s *Strategy) fillFee(o order.Order) decimal.Decimal {
 		return decimal.Zero
 	}
 	return s.mkt.FeeFor(o.FillPrice(), o.FilledQty, o.IsMaker || o.TIF == order.PostOnly)
+}
+
+func matchedQty(openQty, closeQty decimal.Decimal) decimal.Decimal {
+	if !openQty.IsPositive() {
+		return closeQty
+	}
+	if openQty.LessThan(closeQty) {
+		return openQty
+	}
+	return closeQty
+}
+
+func scaleDec(total, part, whole decimal.Decimal) decimal.Decimal {
+	if !total.IsPositive() {
+		return decimal.Zero
+	}
+	if !whole.IsPositive() || part.GreaterThanOrEqual(whole) {
+		return total
+	}
+	if !part.IsPositive() {
+		return decimal.Zero
+	}
+	return total.Mul(part).Div(whole)
 }
 
 // mergeVWAP 把新成交并进已有均价。

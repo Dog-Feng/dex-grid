@@ -271,8 +271,11 @@ func TestCompletedGridCountsProfit(t *testing.T) {
 	if !st.FeePaid.IsPositive() {
 		t.Fatal("self-calculated realized path should accrue maker fees")
 	}
-	if !st.RealizedPnL.Equal(st.GridProfit.Sub(st.FeePaid)) {
-		t.Fatalf("realized pnl = %s, want grid_profit - fee_paid", st.RealizedPnL)
+	if !st.CycleFee.Equal(st.FeePaid) {
+		t.Fatalf("cycle fee = %s, want all fees on a fully closed round trip (%s)", st.CycleFee, st.FeePaid)
+	}
+	if !st.RealizedPnL.Equal(st.GridProfit.Sub(st.CycleFee)) {
+		t.Fatalf("realized pnl = %s, want %s - %s", st.RealizedPnL, st.GridProfit, st.CycleFee)
 	}
 }
 
@@ -306,8 +309,55 @@ func TestCompletedGridUsesFillVWAP(t *testing.T) {
 	if !st.GridProfit.Equal(d("26")) {
 		t.Fatalf("grid profit = %s, want 26 (125-99)", st.GridProfit)
 	}
-	if !st.RealizedPnL.Equal(st.GridProfit.Sub(st.FeePaid)) {
-		t.Fatalf("self-calculated realized = %s, want %s - %s", st.RealizedPnL, st.GridProfit, st.FeePaid)
+	if !st.RealizedPnL.Equal(st.GridProfit.Sub(st.CycleFee)) {
+		t.Fatalf("self-calculated realized = %s, want %s - %s", st.RealizedPnL, st.GridProfit, st.CycleFee)
+	}
+}
+
+// 已实现只扣闭合循环两腿的手续费，不能把下一格未配对开腿的手续费也减掉。
+func TestRealizedPnLExcludesOpenInventoryFee(t *testing.T) {
+	s := newStrategy(t, smallParams(Neutral))
+	acts, _ := s.Init(testState("150", "0"))
+
+	buy100 := findPlacement(t, acts, "100")
+	confirm(t, s, buy100, order.StateOpen, decimal.Zero)
+	moveMarket(t, s, "100.05", time.Second)
+	buyFill := orderEvent(buy100, order.StateFilled, buy100.Quantity)
+	next, err := s.OnEvent(buyFill)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sell125 := findPlacement(t, next, "125")
+	confirm(t, s, sell125, order.StateOpen, decimal.Zero)
+	moveMarket(t, s, "125", 2*time.Second)
+	afterClose, err := s.OnEvent(orderEvent(sell125, order.StateFilled, sell125.Quantity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := s.View().Stats
+	if closed.CompletedGrids != 1 {
+		t.Fatalf("completed = %d", closed.CompletedGrids)
+	}
+	if !closed.CycleFee.Equal(closed.FeePaid) {
+		t.Fatalf("after close cycle_fee=%s fee_paid=%s", closed.CycleFee, closed.FeePaid)
+	}
+
+	buyAgain := findPlacement(t, afterClose, "100")
+	confirm(t, s, buyAgain, order.StateOpen, decimal.Zero)
+	moveMarket(t, s, "100.05", 3*time.Second)
+	if _, err := s.OnEvent(orderEvent(buyAgain, order.StateFilled, buyAgain.Quantity)); err != nil {
+		t.Fatal(err)
+	}
+	st := s.View().Stats
+	if !st.FeePaid.GreaterThan(st.CycleFee) {
+		t.Fatalf("open-leg fee should remain in fee_paid (%s) not cycle_fee (%s)", st.FeePaid, st.CycleFee)
+	}
+	if !st.RealizedPnL.Equal(closed.RealizedPnL) {
+		t.Fatalf("realized changed after unpaired open fill: %s vs %s", st.RealizedPnL, closed.RealizedPnL)
+	}
+	if !st.RealizedPnL.Equal(st.GridProfit.Sub(st.CycleFee)) {
+		t.Fatalf("realized = %s, want %s - %s", st.RealizedPnL, st.GridProfit, st.CycleFee)
 	}
 }
 
@@ -372,8 +422,8 @@ func TestZeroVenuePnLKeepsSelfCalculatedRealized(t *testing.T) {
 	if before.VenueRealized {
 		t.Fatal("self-calculated path must not set venue_realized")
 	}
-	if !before.RealizedPnL.Equal(before.GridProfit.Sub(before.FeePaid)) {
-		t.Fatalf("realized = %s, want %s - %s", before.RealizedPnL, before.GridProfit, before.FeePaid)
+	if !before.RealizedPnL.Equal(before.GridProfit.Sub(before.CycleFee)) {
+		t.Fatalf("realized = %s, want %s - %s", before.RealizedPnL, before.GridProfit, before.CycleFee)
 	}
 
 	coid := order.MustEncode(order.Ref{Slot: 0, Epoch: s.epoch, Cell: 0, Purpose: order.PurposeClose, Seq: 1})

@@ -207,6 +207,7 @@ func (s *Strategy) handleTPFill(o order.Order, now time.Time) []strategy.Action 
 		}
 		s.stats.GridProfit = s.stats.GridProfit.Add(diff.Mul(o.FilledQty.Abs()))
 	}
+	s.stats.CycleFee = s.stats.FeePaid
 	s.cycles++
 	// 止盈成交：先撤掉本周期全部加仓挂单，再进入下一轮首单建仓。
 	s.clearLive()
