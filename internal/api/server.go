@@ -225,7 +225,9 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	v, err := s.sup.Status(r.Context(), r.PathValue("ex"))
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	v, err := s.sup.Status(ctx, r.PathValue("ex"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -234,7 +236,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLevels(w http.ResponseWriter, r *http.Request) {
-	v, err := s.sup.View(r.Context(), r.PathValue("ex"))
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	v, err := s.sup.View(ctx, r.PathValue("ex"))
 	if err != nil {
 		writeErr(w, err)
 		return

@@ -930,9 +930,21 @@ func (s *Strategy) needsEntry() bool {
 
 // isMakerPrice 判断以该价格挂单是否能成为 maker。
 //
-// 必须用盘口买卖一：用标记价会把价差内的单当成 maker，post-only/GTX 被交易所立刻过期，
-// 看门狗再以同一客户端订单号重挂。没有盘口时宁可空着等下一笔行情。
+// 中性网格按 mark 判定，与 SideForMark 同一套价：买 < mark、卖 > mark。
+// 盘口买卖一会和 mark 短暂错位，用盘口严格不等号会把相对 mark 已在外侧的单跳过。
+//
+// 做多/做空仍用买卖一：用 mark 会把价差内的单当成 maker，post-only/GTX 被立刻过期。
+// 没有盘口时做多/做空宁可空着等下一笔行情。马丁网格有自己的判定，不走这里。
 func (s *Strategy) isMakerPrice(side order.Side, price decimal.Decimal) bool {
+	if s.params.Direction == Neutral {
+		if !s.mark.IsPositive() {
+			return false
+		}
+		if side == order.Buy {
+			return price.LessThan(s.mark)
+		}
+		return price.GreaterThan(s.mark)
+	}
 	if !s.book.Valid() {
 		return false
 	}

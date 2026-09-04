@@ -41,6 +41,7 @@ type instance struct {
 	exCfg config.Exchange
 
 	mu      sync.RWMutex
+	startMu sync.Mutex // 串行重建本实例 Runner，不跨交易所持锁
 	runner  *engine.Runner
 	cancel  context.CancelFunc
 	runDone chan struct{}
@@ -284,7 +285,9 @@ func (s *Supervisor) View(ctx context.Context, name string) (engine.InstanceView
 
 // Status 返回页面「账户状态」所需的视图，未运行时也补上账户与行情。
 func (s *Supervisor) Status(ctx context.Context, name string) (engine.InstanceView, error) {
-	view, err := s.View(ctx, name)
+	viewCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	view, err := s.View(viewCtx, name)
+	cancel()
 	if err != nil {
 		return view, err
 	}
@@ -292,7 +295,9 @@ func (s *Supervisor) Status(ctx context.Context, name string) (engine.InstanceVi
 	if err != nil {
 		return view, err
 	}
-	if acct, err := inst.ex.Account(ctx); err == nil {
+	restCtx, cancel2 := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel2()
+	if acct, err := inst.ex.Account(restCtx); err == nil {
 		view.Account = acct
 	}
 	symbol := s.strategySymbol(name, view.Symbol)
@@ -302,7 +307,7 @@ func (s *Supervisor) Status(ctx context.Context, name string) (engine.InstanceVi
 	if symbol == "" {
 		return view, nil
 	}
-	if tick, err := inst.ex.Ticker(ctx, symbol); err == nil {
+	if tick, err := inst.ex.Ticker(restCtx, symbol); err == nil {
 		if tick.Mark.IsPositive() {
 			view.Mark = tick.Mark
 		} else if tick.Book.Valid() {
@@ -311,7 +316,7 @@ func (s *Supervisor) Status(ctx context.Context, name string) (engine.InstanceVi
 	}
 	needPos := view.Status == engine.StatusStopped.String() || view.Status == engine.StatusError.String() || view.Position.Symbol != symbol
 	if needPos {
-		if pos, err := inst.ex.Position(ctx, symbol); err == nil {
+		if pos, err := inst.ex.Position(restCtx, symbol); err == nil {
 			view.Position = pos
 			view.Residual = !pos.IsFlat()
 		}
@@ -340,9 +345,11 @@ func (s *Supervisor) Trades(name string, limit int) ([]store.Fill, error) {
 		return nil, err
 	}
 	symbol := ""
-	if view, err := s.View(context.Background(), name); err == nil {
+	viewCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if view, err := s.View(viewCtx, name); err == nil {
 		symbol = view.Symbol
 	}
+	cancel()
 	symbol = s.strategySymbol(name, symbol)
 	return s.store.ListFills(name, symbol, limit)
 }
@@ -457,8 +464,8 @@ func (s *Supervisor) command(ctx context.Context, name string, kind engine.Comma
 }
 
 func (s *Supervisor) ensureRunner(inst *instance, name string, params []byte, restore bool) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	inst.startMu.Lock()
+	defer inst.startMu.Unlock()
 
 	inst.mu.Lock()
 	if inst.runner != nil {
@@ -512,6 +519,14 @@ func (s *Supervisor) ensureRunner(inst *instance, name string, params []byte, re
 	runDone := make(chan struct{})
 
 	inst.mu.Lock()
+	if inst.runner != nil {
+		st := inst.runner.Status()
+		if st == engine.StatusRunning || st == engine.StatusStarting {
+			inst.mu.Unlock()
+			cancel()
+			return nil
+		}
+	}
 	inst.runner = runner
 	inst.cancel = cancel
 	inst.runDone = runDone

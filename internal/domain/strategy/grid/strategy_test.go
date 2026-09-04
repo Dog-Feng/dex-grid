@@ -1312,14 +1312,88 @@ func TestPendingAckMarksCellResting(t *testing.T) {
 }
 
 func TestSkipPlaceWithoutBook(t *testing.T) {
+	for _, dir := range []Direction{Long, Short} {
+		t.Run(dir.String(), func(t *testing.T) {
+			s := newStrategy(t, smallParams(dir))
+			if _, err := s.Init(testState("150", "0")); err != nil {
+				t.Fatal(err)
+			}
+			s.book = market.BookTicker{}
+			acts := s.placeActions(epoch0)
+			if n := len(placements(acts)); n != 0 {
+				t.Fatalf("%s placed %d without a book, want 0", dir, n)
+			}
+		})
+	}
+}
+
+// 中性网格按 mark 挂单，盘口缺失时仍应铺格。
+func TestNeutralPlacesWithoutBookUsingMark(t *testing.T) {
 	s := newStrategy(t, smallParams(Neutral))
 	if _, err := s.Init(testState("150", "0")); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.OnCommand(strategy.Command{Kind: strategy.CmdCancelOrders, Now: epoch0}); err != nil {
+		t.Fatal(err)
+	}
 	s.book = market.BookTicker{}
-	acts := s.placeActions(epoch0)
-	if len(placements(acts)) != 0 {
-		t.Fatalf("placed %d without a book, want 0", len(placements(acts)))
+	if len(placements(s.placeActions(epoch0))) == 0 {
+		t.Fatal("neutral should place using mark when book is missing")
+	}
+}
+
+// 盘口远高于 mark 时，中性网格仍应按 mark 挂相对外侧的卖单。
+func TestNeutralPlacesUsingMarkWhenBookIsStale(t *testing.T) {
+	s := newStrategy(t, smallParams(Neutral))
+	if _, err := s.Init(testState("150", "0")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.OnCommand(strategy.Command{Kind: strategy.CmdCancelOrders, Now: epoch0}); err != nil {
+		t.Fatal(err)
+	}
+	s.book = market.BookTicker{Bid: d("180"), Ask: d("181")}
+	s.mark = d("150")
+	got := placements(s.placeActions(epoch0.Add(time.Second)))
+	found := false
+	for _, p := range got {
+		if p.Side == order.Sell && p.Price.Equal(d("175")) {
+			found = true
+		}
+		if p.Side == order.Buy && p.Price.GreaterThanOrEqual(d("150")) {
+			t.Errorf("neutral buy at %s >= mark", p.Price)
+		}
+		if p.Side == order.Sell && p.Price.LessThanOrEqual(d("150")) {
+			t.Errorf("neutral sell at %s <= mark", p.Price)
+		}
+	}
+	if !found {
+		t.Fatalf("want sell @ 175 vs mark 150 despite bid 180, got %d placements", len(got))
+	}
+}
+
+// 做多/做空继续用买卖一，避免把价差内的单当成 maker。
+func TestDirectionalGridStillUsesBookForMakerCheck(t *testing.T) {
+	for _, dir := range []Direction{Long, Short} {
+		t.Run(dir.String(), func(t *testing.T) {
+			s := newStrategy(t, smallParams(dir))
+			if _, err := s.Init(testState("150", "0")); err != nil {
+				t.Fatal(err)
+			}
+			s.book = market.BookTicker{Bid: d("180"), Ask: d("181")}
+			s.mark = d("150")
+			got := placements(s.placeActions(epoch0.Add(time.Second)))
+			for _, p := range got {
+				if p.Side == order.Sell && !p.Price.GreaterThan(d("180")) {
+					t.Errorf("%s placed sell %s not above bid 180", dir, p.Price)
+				}
+				if p.Side == order.Buy && !p.Price.LessThan(d("181")) {
+					t.Errorf("%s placed buy %s not below ask 181", dir, p.Price)
+				}
+				if p.Side == order.Sell && p.Price.Equal(d("175")) {
+					t.Errorf("%s must not place sell @ 175 when bid is 180", dir)
+				}
+			}
+		})
 	}
 }
 

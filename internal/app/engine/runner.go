@@ -115,12 +115,15 @@ func (r *Runner) Run(ctx context.Context) error {
 
 		case se, ok := <-r.stream:
 			if !ok {
-				r.setStatus(StatusReconnecting)
-				if err := r.resubscribe(ctx); err != nil {
-					r.log.Error("resubscribe failed", "err", err)
-					continue
+				r.stream = nil
+				if r.shouldReconnect() {
+					r.setStatus(StatusReconnecting)
+					if err := r.resubscribe(ctx); err != nil {
+						r.log.Error("resubscribe failed", "err", err)
+						continue
+					}
+					r.syncStatus()
 				}
-				r.syncStatus()
 				continue
 			}
 			r.onStream(ctx, se)
@@ -186,11 +189,15 @@ func (r *Runner) Status() Status { return Status(r.status.Load()) }
 func (r *Runner) setStatus(s Status) { r.status.Store(uint32(s)) }
 
 // ViewSafe 从事件循环内部取视图快照。Run 未运行时直接读（此时无并发）。
+// 事件循环被 Stop/CancelAll 占用时 Call 可能超时：只回原子状态，避免卡住其它交易所的控制台刷新。
 func (r *Runner) ViewSafe(ctx context.Context) InstanceView {
 	if !r.loop.Load() {
 		return r.View()
 	}
 	res := r.Call(ctx, CmdView, nil)
+	if !res.OK {
+		return InstanceView{Exchange: r.cfg.Name, Status: r.Status().String()}
+	}
 	return res.View
 }
 
@@ -386,7 +393,9 @@ func (r *Runner) onStream(ctx context.Context, se exchange.StreamEvent) {
 	}
 	if se.Err != nil {
 		r.log.Warn("stream error", "err", se.Err)
-		r.setStatus(StatusReconnecting)
+		if r.shouldReconnect() {
+			r.setStatus(StatusReconnecting)
+		}
 		return
 	}
 	if se.Resync {
@@ -586,6 +595,7 @@ func (r *Runner) finishStop(ctx context.Context, reason strategy.StopReason) {
 	r.stopping = true
 	r.entering = false
 	r.pendingStop = 0
+	r.unsubscribe()
 	acts, err := r.strat.OnStop(reason)
 	if err != nil {
 		r.log.Error("strategy OnStop failed", "err", err)
@@ -679,12 +689,25 @@ func (r *Runner) staleReconnect(ctx context.Context, now time.Time) {
 	r.syncStatus()
 }
 
-func (r *Runner) subscribe(ctx context.Context) error {
+func (r *Runner) unsubscribe() {
 	if r.streamCancel != nil {
 		r.streamCancel()
 		r.streamCancel = nil
-		r.stream = nil
 	}
+	r.stream = nil
+}
+
+func (r *Runner) shouldReconnect() bool {
+	switch r.Status() {
+	case StatusRunning, StatusStarting, StatusPaused, StatusReconnecting:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *Runner) subscribe(ctx context.Context) error {
+	r.unsubscribe()
 	sctx, cancel := context.WithCancel(ctx)
 	ch, err := r.ex.Subscribe(sctx, r.symbol)
 	if err != nil {

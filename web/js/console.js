@@ -52,30 +52,42 @@ function headers() {
   return h;
 }
 
-async function api(method, path, body) {
-  const init = { method, headers: headers() };
-  if (body !== undefined) {
-    init.headers["Content-Type"] = "application/json";
-    init.body = JSON.stringify(body);
-  }
-  const res = await fetch(path, init);
-  const text = await res.text();
-  let env = {};
-  if (text) {
-    try {
-      env = JSON.parse(text);
-    } catch {
-      throw new Error(text || res.statusText);
+async function api(method, path, body, timeoutMs) {
+  const ctrl = new AbortController();
+  const ms = timeoutMs ?? (method === "GET" ? 8000 : 25000);
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const init = { method, headers: headers(), signal: ctrl.signal };
+    if (body !== undefined) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(body);
     }
+    const res = await fetch(path, init);
+    const text = await res.text();
+    let env = {};
+    if (text) {
+      try {
+        env = JSON.parse(text);
+      } catch {
+        throw new Error(text || res.statusText);
+      }
+    }
+    if (!res.ok || env.ok === false) {
+      const err = (env.error && env.error.message) || res.statusText || "请求失败";
+      const e = new Error(err);
+      e.status = res.status;
+      e.code = env.error && env.error.code;
+      throw e;
+    }
+    return env.data;
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw new Error("请求超时");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-  if (!res.ok || env.ok === false) {
-    const err = (env.error && env.error.message) || res.statusText || "请求失败";
-    const e = new Error(err);
-    e.status = res.status;
-    e.code = env.error && env.error.code;
-    throw e;
-  }
-  return env.data;
 }
 
 function switchTab(name) {
@@ -1180,7 +1192,7 @@ async function refreshLive() {
   const system = all[0];
   const map = {};
   names.forEach((n, i) => {
-    map[n] = all[1 + i];
+    map[n] = all[1 + i] || state.statuses[n] || null;
   });
   state.statuses = map;
   renderOverview();
@@ -1243,7 +1255,7 @@ function bindActions() {
   $("btn-stop").onclick = () =>
     openModal("停止策略", "只撤销本交易对挂单，保留仓位。不会市价平仓。", async () => {
       try {
-        await api("POST", `/api/exchanges/${state.exchange}/stop`);
+        await api("POST", `/api/exchanges/${state.exchange}/stop`, undefined, 35000);
         toast("已停止（撤单留仓）");
         await tick();
       } catch (err) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"dex-grid/internal/domain/strategy"
 	"dex-grid/internal/domain/strategy/grid"
 	"dex-grid/internal/domain/strategy/martingale"
+	"dex-grid/internal/exchange"
 	"dex-grid/internal/exchange/fake"
 
 	"github.com/shopspring/decimal"
@@ -310,6 +312,22 @@ func TestManualStopKeepsPositionAndCancelsOrders(t *testing.T) {
 	pos, _ := ex.Position(context.Background(), "BTC")
 	if !pos.Size.Equal(before.Size) {
 		t.Fatalf("stop must keep position %s, got %s", before.Size, pos.Size)
+	}
+}
+
+func TestStreamErrorAfterStopKeepsStopped(t *testing.T) {
+	r, _ := newRunner(t, grid.Neutral)
+	startOK(t, r, strategy.DefaultRiskParams())
+	res := r.Do(context.Background(), CmdStop, nil)
+	if !res.OK {
+		t.Fatalf("stop: %s", res.Message)
+	}
+	if r.Status() != StatusStopped {
+		t.Fatalf("status = %s after stop", r.Status())
+	}
+	r.onStream(context.Background(), exchange.StreamEvent{Err: fmt.Errorf("eof")})
+	if r.Status() != StatusStopped {
+		t.Fatalf("status = %s, stop must not become reconnecting", r.Status())
 	}
 }
 
