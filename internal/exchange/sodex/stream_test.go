@@ -10,8 +10,33 @@ import (
 	"dex-grid/internal/domain/order"
 	"dex-grid/internal/exchange"
 
+	"github.com/shopspring/decimal"
 	"github.com/sodex-tech/sodex-go-sdk-public/client"
 )
+
+func TestHandleMarkPriceBeforeBook(t *testing.T) {
+	a := &Adapter{
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		address:  "0xabc",
+		bySymbol: map[string]cachedMarket{},
+		byIndex:  map[int]cachedMarket{},
+		tickers:  map[string]client.Ticker{},
+	}
+	s := &stream{
+		adapter: a,
+		log:     a.log,
+		symbol:  "BTC-USD",
+		out:     make(chan exchange.StreamEvent, 8),
+	}
+	mark := `{"s":"BTC-USD","p":"80900","i":"80932","E":1788491693100}`
+	if err := s.handleMarkPrice(context.Background(), []byte(mark)); err != nil {
+		t.Fatal(err)
+	}
+	ev := <-s.out
+	if ev.Ticker == nil || !ev.Ticker.Mark.Equal(decimal.RequireFromString("80900")) {
+		t.Fatalf("mark-only ticker: %+v", ev.Ticker)
+	}
+}
 
 func TestHandleBookAndMark(t *testing.T) {
 	a := &Adapter{

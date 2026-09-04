@@ -310,9 +310,6 @@ func (s *stream) handleMarkPrice(ctx context.Context, data json.RawMessage) erro
 		s.latest.Symbol = s.symbol
 		s.latest.Mark = parseDec(m.MarkPx)
 		s.latest.Index = parseDec(m.IndexPx)
-		if !s.latest.Book.Valid() {
-			continue
-		}
 		s.emitTicker(ctx, ts)
 	}
 	return nil

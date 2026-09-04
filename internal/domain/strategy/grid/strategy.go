@@ -200,6 +200,12 @@ func (s *Strategy) OnEvent(ev strategy.Event) ([]strategy.Action, error) {
 
 	case strategy.ResyncEvent:
 		s.position = e.Position.Size
+		if e.Mark.IsPositive() {
+			s.mark = e.Mark
+		}
+		if e.Book.Valid() {
+			s.book = e.Book
+		}
 		cancels := s.syncFromOrders(e.Orders)
 		s.recoverFromPosition()
 		return append(cancels, s.resumeActions(e.Now)...), nil

@@ -762,6 +762,18 @@ func (r *Runner) watchdog(ctx context.Context) {
 		r.log.Warn("watchdog account failed", "err", err)
 		return
 	}
+	if tick, err := r.ex.Ticker(ctx, r.symbol); err != nil {
+		r.log.Warn("watchdog ticker failed", "err", err)
+	} else {
+		r.state.Book = tick.Book
+		if tick.Mark.IsPositive() {
+			r.state.Mark = tick.Mark
+		}
+		if r.guard != nil {
+			r.guard.SetMark(r.state.Mark, r.state.Book, time.Now().UTC())
+			r.guard.SetLast(tick.Last)
+		}
+	}
 
 	var cancels []strategy.Action
 	var ours []order.Order
@@ -790,6 +802,8 @@ func (r *Runner) watchdog(ctx context.Context) {
 		Position: pos,
 		Account:  acct,
 		Orders:   ours,
+		Mark:     r.state.Mark,
+		Book:     r.state.Book,
 		Now:      time.Now().UTC(),
 	})
 }
@@ -848,6 +862,8 @@ func (r *Runner) reconcile(ctx context.Context) error {
 			Position: pos,
 			Account:  acct,
 			Orders:   ours,
+			Mark:     r.state.Mark,
+			Book:     r.state.Book,
 			Now:      time.Now().UTC(),
 		})
 	}

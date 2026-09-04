@@ -166,6 +166,39 @@ func TestToPositionShort(t *testing.T) {
 	}
 }
 
+func TestToPositionBothSignedSize(t *testing.T) {
+	mark := decimal.RequireFromString("6.1435")
+	entry := decimal.RequireFromString("6.298450704225352112")
+
+	long := toPosition(client.Position{
+		Symbol:        "UNI-USD",
+		PositionSide:  "BOTH",
+		Size:          "71",
+		AvgEntryPrice: entry.String(),
+	}, mark)
+	if long.Direction() != position.Long {
+		t.Fatalf("long BOTH: got %s size=%s", long.Direction(), long.Size)
+	}
+	wantLong := decimal.RequireFromString("-11.0015")
+	if long.UnrealizedPnL.Sub(wantLong).Abs().GreaterThan(decimal.RequireFromString("0.01")) {
+		t.Fatalf("long upnl %s want ~%s", long.UnrealizedPnL, wantLong)
+	}
+
+	short := toPosition(client.Position{
+		Symbol:        "UNI-USD",
+		PositionSide:  "BOTH",
+		Size:          "-71",
+		AvgEntryPrice: entry.String(),
+	}, mark)
+	if short.Direction() != position.Short {
+		t.Fatalf("short BOTH: got %s size=%s", short.Direction(), short.Size)
+	}
+	wantShort := decimal.RequireFromString("11.0015")
+	if short.UnrealizedPnL.Sub(wantShort).Abs().GreaterThan(decimal.RequireFromString("0.01")) {
+		t.Fatalf("short upnl %s want ~%s", short.UnrealizedPnL, wantShort)
+	}
+}
+
 func TestToOrderFromWS(t *testing.T) {
 	o := toOrderFromWS(wsAccountOrderUpdate{
 		ClOrdID:   "4398046511105",

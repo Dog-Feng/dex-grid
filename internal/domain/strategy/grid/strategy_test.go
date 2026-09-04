@@ -1371,6 +1371,33 @@ func TestNeutralPlacesUsingMarkWhenBookIsStale(t *testing.T) {
 	}
 }
 
+// ResyncEvent 必须刷新 mark，否则 WS 断线后看门狗对账仍用旧价，补单会被 isMakerPrice 跳过。
+func TestResyncRefreshesMarkForNeutralRefill(t *testing.T) {
+	s := newStrategy(t, smallParams(Neutral))
+	if _, err := s.Init(testState("150", "0")); err != nil {
+		t.Fatal(err)
+	}
+	s.mark = d("150")
+	sellPx := d("140") // 相对旧 mark 150：不是 maker
+	if s.isMakerPrice(order.Sell, sellPx) {
+		t.Fatal("sell below stale mark should not be maker")
+	}
+	_, err := s.OnEvent(strategy.ResyncEvent{
+		Position: position.Position{Size: s.position},
+		Mark:     d("130"),
+		Now:      epoch0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.mark.Equal(d("130")) {
+		t.Fatalf("mark = %s, want 130", s.mark)
+	}
+	if !s.isMakerPrice(order.Sell, sellPx) {
+		t.Fatal("after resync, sell above fresh mark should be maker")
+	}
+}
+
 // 做多/做空继续用买卖一，避免把价差内的单当成 maker。
 func TestDirectionalGridStillUsesBookForMakerCheck(t *testing.T) {
 	for _, dir := range []Direction{Long, Short} {

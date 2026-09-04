@@ -74,7 +74,11 @@ type ResyncEvent struct {
 	Position position.Position
 	Account  account.Snapshot
 	Orders   []order.Order
-	Now      time.Time
+	// Mark/Book 来自 REST 对账时的行情快照。Watchdog/Reconcile 必须带上，
+	// 否则 WS 断线期间策略内部的 mark 会冻结，中性网格补单会被 isMakerPrice 跳过。
+	Mark decimal.Decimal
+	Book market.BookTicker
+	Now  time.Time
 }
 
 func (BookEvent) eventMarker()        {}

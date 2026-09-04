@@ -296,6 +296,40 @@ func (a *Adapter) tickerOf(symbol string) client.Ticker {
 	return a.tickers[strings.ToUpper(symbol)]
 }
 
+// freshMarks 拉取最新 ticker 并提取各交易对标记价（REST 持仓不含 unrealizedPnl，需用 mark 自算）。
+func (a *Adapter) freshMarks(ctx context.Context) (map[string]decimal.Decimal, error) {
+	ticks, err := a.rest.tickers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]decimal.Decimal, len(ticks))
+	for _, t := range ticks {
+		sym := strings.ToUpper(t.Symbol)
+		mark := parseDec(ptrStr(t.MarkPrice))
+		if !mark.IsPositive() {
+			mark = parseDec(t.LastPrice)
+		}
+		if mark.IsPositive() {
+			out[sym] = mark
+		}
+	}
+	return out, nil
+}
+
+func (a *Adapter) freshMark(ctx context.Context, symbol string) decimal.Decimal {
+	tick, err := a.Ticker(ctx, symbol)
+	if err != nil {
+		return decimal.Zero
+	}
+	if tick.Mark.IsPositive() {
+		return tick.Mark
+	}
+	if tick.Book.Valid() {
+		return tick.Book.Mid()
+	}
+	return decimal.Zero
+}
+
 func (a *Adapter) Markets(ctx context.Context) ([]exchange.MarketInfo, error) {
 	if err := a.ensureMarkets(ctx); err != nil {
 		return nil, err
@@ -451,8 +485,9 @@ func (a *Adapter) Account(ctx context.Context) (account.Snapshot, error) {
 	upnl, im := decimal.Zero, decimal.Zero
 	positions, err := a.rest.positions(ctx, a.address)
 	if err == nil {
+		marks, _ := a.freshMarks(ctx)
 		for _, p := range positions {
-			mark := parseDec(ptrStr(a.tickerOf(p.Symbol).MarkPrice))
+			mark := marks[strings.ToUpper(p.Symbol)]
 			pos := toPosition(p, mark)
 			if pos.IsFlat() {
 				continue
@@ -487,7 +522,7 @@ func (a *Adapter) Position(ctx context.Context, symbol string) (position.Positio
 	if err != nil {
 		return position.Position{}, err
 	}
-	mark := parseDec(ptrStr(a.tickerOf(cm.symbol.Symbol).MarkPrice))
+	mark := a.freshMark(ctx, cm.symbol.Symbol)
 	for _, p := range ps {
 		if strings.EqualFold(p.Symbol, cm.symbol.Symbol) {
 			return toPosition(p, mark), nil
@@ -505,9 +540,10 @@ func (a *Adapter) Positions(ctx context.Context) ([]position.Position, error) {
 	if err != nil {
 		return nil, err
 	}
+	marks, _ := a.freshMarks(ctx)
 	var out []position.Position
 	for _, p := range ps {
-		mark := parseDec(ptrStr(a.tickerOf(p.Symbol).MarkPrice))
+		mark := marks[strings.ToUpper(p.Symbol)]
 		pos := toPosition(p, mark)
 		if pos.IsFlat() {
 			continue

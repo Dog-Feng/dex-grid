@@ -388,6 +388,13 @@ func toPosition(p client.Position, mark decimal.Decimal) position.Position {
 		size = size.Abs().Neg()
 	case "LONG", "2":
 		size = size.Abs()
+	case "BOTH", "1", "":
+		// 单向净仓：size 带符号，正多负空；仅对正数字面量做 abs 规范化。
+		if size.IsPositive() {
+			size = size.Abs()
+		} else if size.IsNegative() {
+			size = size.Abs().Neg()
+		}
 	}
 	entry := parseDec(p.AvgEntryPrice)
 	upnl := decimal.Zero

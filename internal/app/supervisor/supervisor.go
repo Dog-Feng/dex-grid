@@ -314,12 +314,9 @@ func (s *Supervisor) Status(ctx context.Context, name string) (engine.InstanceVi
 			view.Mark = tick.Book.Mid()
 		}
 	}
-	needPos := view.Status == engine.StatusStopped.String() || view.Status == engine.StatusError.String() || view.Position.Symbol != symbol
-	if needPos {
-		if pos, err := inst.ex.Position(restCtx, symbol); err == nil {
-			view.Position = pos
-			view.Residual = !pos.IsFlat()
-		}
+	if pos, err := inst.ex.Position(restCtx, symbol); err == nil {
+		view.Position = pos
+		view.Residual = !pos.IsFlat()
 	}
 	return view, nil
 }
