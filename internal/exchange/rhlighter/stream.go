@@ -162,7 +162,7 @@ func (s *stream) session(ctx context.Context) error {
 			s.onFrame(data)
 		}
 		if err := s.handle(ctx, data); err != nil {
-			s.log.Warn("处理消息失败", "err", err)
+			return err
 		}
 	}
 }
@@ -292,12 +292,7 @@ func (s *stream) handle(ctx context.Context, data []byte) error {
 		return nil
 
 	case env.Type == "error":
-		// 订阅被拒（比如 auth 过期）不该被当成普通日志吞掉，
-		// 上抛让重连逻辑处理——重连会重新生成 auth token。
-		s.emit(ctx, exchange.StreamEvent{
-			Err: fmt.Errorf("lighter 事件流返回错误: %s (code=%d)", env.Message, env.Code),
-		})
-		return nil
+		return fmt.Errorf("lighter 事件流返回错误: %s (code=%d)", env.Message, env.Code)
 
 	case env.Type == "update/ticker" || env.Type == "subscribed/ticker":
 		return s.handleTicker(ctx, data)

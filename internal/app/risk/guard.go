@@ -9,6 +9,7 @@ import (
 
 	"dex-grid/internal/domain/account"
 	"dex-grid/internal/domain/market"
+	"dex-grid/internal/domain/order"
 	"dex-grid/internal/domain/position"
 	"dex-grid/internal/domain/strategy"
 
@@ -34,10 +35,15 @@ type Guard struct {
 	pos  position.Position
 	acct account.Snapshot
 
-	lastMarket time.Time
-	fails      int
-	blockOpens bool
-	reason     strategy.StopReason
+	lastMarket    time.Time
+	fails         int
+	blockOpens    bool
+	marginBlocked bool
+	reason        strategy.StopReason
+
+	slBelow  bool // 止损价在区间下方 → 价格向下穿越才触发
+	tpAbove  bool // 止盈价在区间上方 → 价格向上穿越才触发
+	sidesSet bool
 }
 
 // New 构造 Guard。params 应已 ApplyDefaults。
@@ -52,6 +58,9 @@ func (g *Guard) Observe(ev strategy.Event) {
 		g.book = e.Book
 		if e.Mark.IsPositive() {
 			g.mark = e.Mark
+		}
+		if e.Last.IsPositive() {
+			g.last = e.Last
 		}
 		g.lastMarket = e.Now
 	case strategy.PositionEvent:
@@ -71,11 +80,42 @@ func (g *Guard) SetPosition(p position.Position) { g.pos = p }
 // SetAccount 写入账户快照。
 func (g *Guard) SetAccount(a account.Snapshot) { g.acct = a }
 
-// SetMark 写入标记价。
+// SetMark 写入标记价。首次调用时按当前价相对止盈止损的位置锁存触发边。
 func (g *Guard) SetMark(mark decimal.Decimal, book market.BookTicker, now time.Time) {
 	g.mark = mark
 	g.book = book
 	g.lastMarket = now
+	g.latchSides(mark)
+}
+
+// SetLast 写入最新成交价。
+func (g *Guard) SetLast(last decimal.Decimal) {
+	if last.IsPositive() {
+		g.last = last
+	}
+}
+
+// SetTriggerSides 由策略按下边界声明止盈止损在哪一侧。覆盖 SetMark 的锁存。
+func (g *Guard) SetTriggerSides(slBelow, tpAbove bool) {
+	g.slBelow, g.tpAbove, g.sidesSet = slBelow, tpAbove, true
+}
+
+// NoteReconnect 重连后刷新静默计时，避免下一 tick 立刻再判定为过期。
+func (g *Guard) NoteReconnect(now time.Time) {
+	g.lastMarket = now
+}
+
+func (g *Guard) latchSides(ref decimal.Decimal) {
+	if g.sidesSet || !ref.IsPositive() {
+		return
+	}
+	if g.params.HasStopLoss() {
+		g.slBelow = g.params.StopLossPrice.LessThan(ref)
+	}
+	if g.params.HasTakeProfit() {
+		g.tpAbove = g.params.TakeProfitPrice.GreaterThan(ref)
+	}
+	g.sidesSet = true
 }
 
 // RecordFailures 计入一次 Apply 的失败数。返回是否应立即熔断。
@@ -90,6 +130,7 @@ func (g *Guard) RecordFailures(n int, fatal error) Verdict {
 	}
 	if n <= 0 {
 		g.fails = 0
+		g.marginBlocked = false
 		return Verdict{}
 	}
 	g.fails += n
@@ -108,8 +149,13 @@ func (g *Guard) RecordFailures(n int, fatal error) Verdict {
 	return Verdict{}
 }
 
-// BlockOpens 表示应暂停开仓腿（最大持仓或保证金率触发）。
-func (g *Guard) BlockOpens() bool { return g.blockOpens }
+// BlockOpens 表示应暂停开仓腿（最大持仓、保证金率或保证金不足）。
+func (g *Guard) BlockOpens() bool { return g.blockOpens || g.marginBlocked }
+
+// NoteInsufficientMargin 交易所回报保证金不足：暂停开仓，不计入熔断。
+func (g *Guard) NoteInsufficientMargin() {
+	g.marginBlocked = true
+}
 
 // Reason 返回最近一次停止原因。
 func (g *Guard) Reason() strategy.StopReason { return g.reason }
@@ -140,16 +186,20 @@ func (g *Guard) Check(ev strategy.Event) Verdict {
 		now.Sub(g.lastMarket) >= g.params.StaleTimeout.Std() {
 		return Verdict{Reconnect: true}
 	}
-	return Verdict{BlockOpens: g.blockOpens}
+	return Verdict{BlockOpens: g.BlockOpens()}
 }
 
 func (g *Guard) checkTPSL(price decimal.Decimal) Verdict {
-	long := g.pos.Size.IsPositive()
-	short := g.pos.Size.IsNegative()
+	g.latchSides(g.mark)
+	if !g.sidesSet {
+		g.latchSides(price)
+	}
 
 	if g.params.HasStopLoss() {
 		sl := g.params.StopLossPrice
-		if (long && price.LessThanOrEqual(sl)) || (short && price.GreaterThanOrEqual(sl)) {
+		hit := (g.slBelow && price.LessThanOrEqual(sl)) ||
+			(!g.slBelow && price.GreaterThanOrEqual(sl))
+		if hit {
 			g.reason = strategy.StopStopLoss
 			return Verdict{
 				Stop:    true,
@@ -160,7 +210,9 @@ func (g *Guard) checkTPSL(price decimal.Decimal) Verdict {
 	}
 	if g.params.HasTakeProfit() {
 		tp := g.params.TakeProfitPrice
-		if (long && price.GreaterThanOrEqual(tp)) || (short && price.LessThanOrEqual(tp)) {
+		hit := (g.tpAbove && price.GreaterThanOrEqual(tp)) ||
+			(!g.tpAbove && price.LessThanOrEqual(tp))
+		if hit {
 			g.reason = strategy.StopTakeProfit
 			return Verdict{
 				Stop:    true,
@@ -210,14 +262,29 @@ func circuitActions() []strategy.Action {
 	}
 }
 
-// FilterOpens 在 BlockOpens 时去掉非 reduce-only 的下单意图。
-func FilterOpens(acts []strategy.Action) []strategy.Action {
+// FilterOpens 在 BlockOpens 时去掉会继续加仓的下单意图。
+// reduce-only 以及会减小当前仓位的反向单保留，避免中性网格被卡死。
+func FilterOpens(acts []strategy.Action, pos position.Position) []strategy.Action {
 	var out []strategy.Action
 	for _, a := range acts {
-		if p, ok := a.(strategy.PlaceOrder); ok && !p.ReduceOnly {
+		p, ok := a.(strategy.PlaceOrder)
+		if !ok {
+			out = append(out, a)
 			continue
 		}
-		out = append(out, a)
+		if p.ReduceOnly || reducesPosition(p.Side, pos) {
+			out = append(out, a)
+		}
 	}
 	return out
+}
+
+func reducesPosition(side order.Side, pos position.Position) bool {
+	if pos.IsFlat() {
+		return false
+	}
+	if pos.Size.IsPositive() {
+		return side == order.Sell
+	}
+	return side == order.Buy
 }

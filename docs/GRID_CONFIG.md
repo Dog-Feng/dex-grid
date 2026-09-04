@@ -1,6 +1,6 @@
 # dex-grid 网格配置文档
 
-版本：v0.3
+版本：v0.4
 
 配置分两处，职责不重叠：
 
@@ -42,24 +42,26 @@ exchanges: # 各 DEX 凭证与连接参数
 | `tick_interval` | duration | `1s` | 定时事件间隔，驱动跟价、超时、止盈止损检查 |
 | `reconcile_interval` | duration | `15s` | 运行中对照交易所挂单：缺失补挂、多余撤销。`0` 时引擎仍按 15s 跑 |
 | `shutdown_timeout` | duration | `30s` | 优雅退出超时 |
+| `http_timeout` | duration | `15s` | 交易所 REST HTTP 客户端超时 |
 
 ## 2. server
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `addr` | string | `0.0.0.0:8080` | HTTP API 监听地址。`0.0.0.0` 对公网开放；只本机访问改成 `127.0.0.1:8080` |
-| `auth.enabled` | bool | `false` | 是否启用 Bearer Token 鉴权。默认关闭，公网可直接访问 API |
+| `addr` | string | `127.0.0.1:8080` | HTTP API 监听地址。默认只本机。公网 `0.0.0.0` 时必须启用 `auth` 或 `ip_whitelist` |
+| `auth.enabled` | bool | `false` | 是否启用 Bearer Token 鉴权。公网监听时必开其一（鉴权或白名单） |
 | `auth.token` | string | — | 访问令牌，仅 `auth.enabled = true` 时必填，**用环境变量注入** |
-| `metrics_enabled` | bool | `true` | 是否暴露 `/metrics` |
+| `metrics_enabled` | bool | `true` | 配置字段存在，当前**没有** `/metrics` 端点，改它无效果 |
 | `cors_origins` | []string | `["*"]` | 允许的跨域来源。`*` 表示任意 Origin；收紧时填具体地址 |
+| `trusted_proxies` | []string | 空 | 可信反向代理 IP/CIDR。只有 RemoteAddr 命中时才采信 `X-Forwarded-For` |
 | `ip_whitelist.enabled` | bool | `false` | 是否只允许白名单 IP 访问 HTTP API |
-| `ip_whitelist.allow` | []string | 空 | 单个 IP 或 CIDR。开启后本机 `127.0.0.1` / `::1` 始终放行 |
+| `ip_whitelist.allow` | []string | 空 | 单个 IP 或 CIDR。未配置 `trusted_proxies` 时本机 `127.0.0.1` / `::1` 始终放行 |
 
-> 鉴权与 IP 白名单都是可选项，可单独或同时开启。未开启时任何人都能调用启动/停止等写接口。
+> 默认只监听本机。若把 `addr` 改成 `0.0.0.0:8080` 且鉴权与白名单都关闭，启动会失败。反代场景请填写 `trusted_proxies`，并在反代或白名单层限制来源。
 
 ## 3. proxy
 
-国内网络访问部分 DEX 需要代理。连通性探测结果见 `GET /api/proxy`。
+国内网络访问部分 DEX 需要代理。`GET /api/proxy` 返回是否启用、URL、`no_proxy`（不含密码）。控制台没有代理配置页，改代理只能改 `config.yaml` 后重启。
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -67,8 +69,7 @@ exchanges: # 各 DEX 凭证与连接参数
 | `url` | string | — | `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:1080` |
 | `username` / `password` | string | — | 代理认证，建议用环境变量 |
 | `no_proxy` | []string | 空 | 绕过代理的主机列表 |
-| `health_url` | string | 交易所 REST 根路径 | 连通性探测目标 |
-| `health_interval` | duration | `60s` | 探测间隔，结果驱动页面状态灯 |
+| `health_interval` | duration | `60s` | 配置字段存在，当前没有周期性连通性探测 |
 
 代理对 REST 与 WebSocket 同时生效。
 
@@ -80,7 +81,7 @@ exchanges: # 各 DEX 凭证与连接参数
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `name` | string | — | 交易所标识：`lighter` 或 `rh_lighter`。同一个 name 只能出现一次 |
+| `name` | string | — | 交易所标识：`lighter`、`rh_lighter` 或 `sodex`。同一个 name 只能出现一次 |
 | `enabled` | bool | `true` | 关闭后该交易所不启动、不加载策略文件 |
 | `network` | string | `mainnet` | `mainnet` / `testnet` |
 | `base_url` / `ws_url` | string | 按 network 推导 | 覆盖默认端点 |
@@ -124,6 +125,24 @@ RH Lighter 是**另一条链上的独立 DEX**，配置段必须单独写、密�
 - 主网 `https://api.rh.lighter.xyz` / `wss://api.rh.lighter.xyz/stream`
 - 测试网 `https://api.rh-testnet.lighter.xyz` / `wss://api.rh-testnet.lighter.xyz/stream`
 
+### 4.4 SODEx 专有字段
+
+SODEx 是独立 DEX（Bolt 永续），配置段必须单独写，密钥用 `SODEX_*`。详见 [SODEX.md](SODEX.md)。
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `name` | string | — | 必须是 `sodex` |
+| `credentials.account_index` / `account_id` | int | — | SODEx 数字 `accountID`（二选一） |
+| `credentials.api_key_private_key` | string | — | API key 私钥（**不是**主钱包私钥，环境变量） |
+| `credentials.api_key_name` 或 `options.api_key_name` | string | — | API key 的 name，写入 `X-API-Key`（如 `api-key-01`） |
+| `credentials.account_address` 或 `options.user_address` | string | — | 主钱包地址，账户查询与 WS 用 |
+| `options.chain_id` | int | 按 network 推导 | 主网 `286623`，测试网 `138565` |
+
+未覆盖时 REST/WS：
+
+- 主网 `https://mainnet-gw.sodex.dev` / `wss://mainnet-gw.sodex.dev/ws/perps`
+- 测试网 `https://testnet-gw.sodex.dev` / `wss://testnet-gw.sodex.dev/ws/perps`
+
 ## 5. 完整示例
 
 ```yaml
@@ -134,9 +153,10 @@ app:
   tick_interval: 1s
   reconcile_interval: 15s
   shutdown_timeout: 30s
+  http_timeout: 15s
 
 server:
-  addr: "0.0.0.0:8080"
+  addr: "127.0.0.1:8080"
   auth:
     enabled: false
     token: ${GRIDBOT_TOKEN}
@@ -186,6 +206,20 @@ exchanges:
       rps: 10
       burst: 20
     autostart: false
+
+  - name: sodex
+    enabled: false
+    network: mainnet
+    credentials:
+      account_index: ${SODEX_ACCOUNT_ID}
+      api_key_private_key: ${SODEX_PRIVATE_KEY}
+    options:
+      api_key_name: ${SODEX_API_KEY}
+      user_address: ${SODEX_ADDRESS}
+    rate_limit:
+      rps: 10
+      burst: 20
+    autostart: false
 ```
 
 ---
@@ -218,7 +252,6 @@ exchanges:
 | 网格类型 | `direction` | string | `neutral` | `neutral`（中性）/ `long`（做多）/ `short`（做空） |
 | 杠杆 (x) | `leverage` | int | — | 1 - 市场上限 |
 | 保证金模式 | `margin_mode` | string | `cross` | `cross`（全仓，默认）/ `isolated`（逐仓） |
-| 风格 | `preset` | string | `stable` | `stable`（稳健）/ `aggressive`（激进）/ `safe`（成交少更安全）。仅影响「智能填充」的推荐值，不影响运行 |
 
 ## 7. grid —— 普通网格参数
 
@@ -227,7 +260,7 @@ exchanges:
 | 下边界 | `lower_price` | string | — | **区间最低价** |
 | 上边界 | `upper_price` | string | — | **区间最高价** |
 | 网格数量 | `grid_count` | int | — | **格子数**，产生 `grid_count + 1` 条价格线与 `grid_count` 笔挂单。范围 2 - 4096 |
-| 网格模式 | `spacing_mode` | string | `arithmetic` | `arithmetic`（等差）/ `geometric`（等比，第二阶段） |
+| 网格模式 | `spacing_mode` | string | `arithmetic` | 只支持 `arithmetic`（等差）。`geometric` 会校验失败 |
 | 数量输入方式 | `sizing_mode` | string | `per_grid_qty` | `per_grid_qty`（填每格数量，派生保证金）/ `margin`（填保证金，派生每格数量） |
 | 每格数量 (币) | `per_grid_qty` | string | — | `sizing_mode = per_grid_qty` 时必填 |
 | 保证金 (USDC) | `margin` | string | — | `sizing_mode = margin` 时必填 |
@@ -305,7 +338,7 @@ exchanges:
 **`stop_and_cancel` 的语义细节**
 
 - 撤单后**不平仓**。这是有意的：区间外往往是最差的平仓时机，把决定权交给用户。
-- 状态为 `Stopped(OutOfRange)`，页面醒目提示当前持仓、均价、浮亏与强平价，并提供「市价平仓」「重新配置区间后启动」两个后续操作入口。
+- 状态为 `Stopped(OutOfRange)`，页面提示当前持仓、均价、浮亏与强平价。恢复需重新配置区间后启动。控制台没有单独的「市价平仓」按钮。
 - 不会自动恢复，即使价格随后回到区间内也不会。
 
 > 区间外策略与止损价是两套独立机制，可以同时配置。止损价优先级更高（Guard 检查顺序 1、2 在区间外策略之前），触发止损会直接平仓停止。
@@ -320,15 +353,9 @@ exchanges:
 
 不满足时保存失败，返回具体字段的错误信息。
 
-## 10. reconcile —— 对账参数
+## 10. 看门狗（挂单对账）
 
-| 表单项 | JSON 字段 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| 仓位偏差容忍 | `reconcile.position_tolerance` | `"0.01"` | 1% 以内视为一致 |
-| 自动纠偏 | `reconcile.auto_fix` | `false` | 超阈值时是否自动市价纠偏。`false` 则转 error 状态等人工确认 |
-| 撤销孤儿单 | `reconcile.cancel_orphans` | `true` | 撤销属于本交易所但 epoch 已过期的挂单 |
-
-运行中另有挂单看门狗（`app.reconcile_interval`，默认 15s）：对照交易所真实挂单，**本实例多余的撤掉、缺失的格子补挂**。解不出本系统 COID 的手工单不动。现价所在格若会穿价，仍跳过（不是漏单）。
+没有策略 JSON 里的 `reconcile.*` 参数。运行中由 `app.reconcile_interval` 驱动（未配置时引擎按 15s）：对照交易所真实挂单，**本实例多余的撤掉、缺失的格子补挂**。解不出本系统 COID 的手工单不动。现价所在格若会穿价或没有盘口，仍跳过（不是漏单）。看门狗不发市价纠偏仓位。
 
 ## 11. order —— 挂单行为
 
@@ -348,7 +375,6 @@ exchanges:
 
 ```
 步长        step        = (upper − lower) / grid_count                    等差
-                        = (upper / lower)^(1/grid_count)                  等比（比例）
 价格线      P_i         = lower + i × step,  i = 0…grid_count
 格子        cell_i      = [P_i, P_{i+1}],    i = 0…grid_count-1     共 grid_count 个
 
@@ -398,7 +424,7 @@ exchanges:
 | `order.maker_tif == post_only` | 只允许 post-only |
 | `limit_price` 模式下建仓价与盘口方向关系 | post-only 会被立即拒绝 |
 
-**手续费校验是最重要的一条**。原型图的趋势卡片专门提示「建议单格间距不小于波动率的一半以覆盖手续费」，而后端要做的是硬拦截：单格毛利率必须大于双边 maker 费率的 2 倍，否则网格越跑越亏。
+**手续费校验是最重要的一条**：单格毛利率必须大于双边 maker 费率的 2 倍，否则网格越跑越亏，预览/保存会硬拦截。
 
 ### 13.2 警告（不阻断，页面黄色高亮）
 
@@ -409,7 +435,6 @@ exchanges:
 | `leverage > 20` | 高杠杆，强平价距区间边界很近时额外提示具体数值 |
 | 强平价落在网格区间内 | **区间未跑完就会强平**，这是致命配置，必须醒目提示 |
 | `out_of_range = pause` 且无止损 | 价格长期不回归时仓位一直挂着，无任何保护 |
-| 趋势分析方向与所选网格类型相反 | 例如下跌趋势中选做多网格 |
 
 「强平价落在区间内」这条值得单独强调：用户填了 30 倍杠杆和一个很宽的区间时，价格根本走不到下沿就爆仓了。这个校验必须在保存时就算出来并展示。
 
@@ -429,7 +454,6 @@ Content-Type: application/json
   "direction": "neutral",
   "leverage": 30,
   "margin_mode": "isolated",
-  "preset": "stable",
   "grid": {
     "lower_price": "60000",
     "upper_price": "66000",
@@ -451,8 +475,7 @@ Content-Type: application/json
     "close_on_stop": false,
     "max_consecutive_errors": 10
   },
-  "order": { "maker_tif": "post_only", "post_only_retry": 3, "reduce_only_close": true },
-  "reconcile": { "position_tolerance": "0.01", "auto_fix": false, "cancel_orphans": true }
+  "order": { "maker_tif": "post_only", "post_only_retry": 3, "reduce_only_close": true }
 }
 ```
 
@@ -619,7 +642,6 @@ k | 触发价  | 保证金  | 名义    | 累计名义 | 持仓均价 | 止盈�
 | 排序 | 后端已按 24 小时成交额降序返回，前端**不要重排**——活跃的排前面才好选 |
 | 搜索 | 对 `symbol` 做不区分大小写的子串匹配 |
 | 选项展示 | 主文本 `symbol`，副文本 `market_index · 标记价 · 最大杠杆` |
-| 长列表 | 200+ 条需要虚拟滚动，否则展开会卡 |
 | 选中后 | 立即拉取该市场的元数据与行情，并触发一次 `POST /preview` 刷新派生量 |
 | 切换限制 | 实例处于 Running/Paused 时禁止切换交易对，必须先停止策略（撤单留仓） |
 
@@ -638,8 +660,6 @@ lighterctl market -m 2       # 查看 market_index=2 的元数据与最小下单
 | `GET /api/exchanges/{ex}/klines` | 1h K 线，价格/网格曲线 |
 | `symbol` | 交易对可搜索下拉，见 20.1 |
 | `direction` | 中性 / 做多 / 做空 三选一按钮组 |
-| `preset` | 稳健 / 激进 / 成交少更安全 三选一 |
-| `POST /suggest` | 「智能填充参数」与「采用推荐策略 + 自动区间」按钮 |
 | `grid.*` | 数值输入组，每次 change 防抖 300ms 后调 `POST /preview` |
 | `POST /preview` 响应 | 表单下方派生量文字 + 警告条 |
 | `entry.mode` | 建仓方式两选一（跟价 / 指定价）；中性网格时整块置灰 |

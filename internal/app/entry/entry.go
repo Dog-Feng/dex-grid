@@ -68,6 +68,7 @@ type Trigger struct {
 	havePos     bool
 	posSize     decimal.Decimal // 交易所仓位，作成交下限，避免漏单后再挂一轮
 	repriceN    int
+	repriceSlot uint16
 	lastReprice time.Time
 	sliceIdx    int
 	lastSlice   time.Time
@@ -90,6 +91,7 @@ func (t *Trigger) Start(target, current decimal.Decimal, book market.BookTicker,
 	t.book = book
 	t.mark = mark
 	t.repriceN = 0
+	t.repriceSlot = 0
 	t.sliceIdx = 0
 	t.seq = 0
 	t.coid = 0
@@ -409,9 +411,11 @@ func (t *Trigger) placeNext(now time.Time) []strategy.Action {
 	}
 
 	t.seq = order.NextSeq(t.seq)
+	t.repriceSlot = (t.repriceSlot + 1) & 0x0FFF
 	coid, err := order.Encode(order.Ref{
 		Slot:    t.slot,
 		Epoch:   t.epoch,
+		Cell:    t.repriceSlot,
 		Purpose: order.PurposeEntry,
 		Seq:     t.seq,
 	})
@@ -426,7 +430,8 @@ func (t *Trigger) placeNext(now time.Time) []strategy.Action {
 	t.lastSlice = now
 	t.sliceIdx++
 
-	reduceOnly := t.currentSize().Mul(rem).IsNegative()
+	cur := t.currentSize()
+	reduceOnly := cur.Mul(rem).IsNegative() && rem.Abs().LessThanOrEqual(cur.Abs())
 	return []strategy.Action{strategy.PlaceOrder{
 		ClientOrderID: coid,
 		Side:          side,

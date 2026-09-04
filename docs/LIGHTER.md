@@ -54,7 +54,7 @@
 | 签名库 | `github.com/elliottech/lighter-go`（官方 Go SDK，**必须依赖**） |
 | 主网 chain_id | `304` |
 
-配置里 `options.tx_send_channel` 可选 `ws` / `rest`。设计上优先 WS 发送（延迟更低、与订阅共用连接）；当前实现走 REST `sendTx`。批量 `sendTxBatch` **尚未实现**，`Capabilities.BatchPlace = 0`，上层串行发。
+配置里 `options.tx_send_channel` 可选 `ws` / `rest`。当前发送走 REST `sendTx`。批量 `sendTxBatch` 未接，`Capabilities.BatchPlace = 0`，上层串行发。
 
 查询类走普通 REST：市场、盘口、K 线、账户、挂单、仓位。交易类一律本地签名后再提交，私钥不出进程。
 
@@ -150,7 +150,6 @@ sizeInt  = int64(qty.Shift(int32(m.SizeDecimals)).IntPart())
 | 本地校验失败（没发出去） | 不消耗 nonce |
 | 发送失败且确认未被接受 | 回退计数器，复用该 nonce |
 | 网络超时、无法确认是否入块 | **不回退**；下次发送前再拉 `nextNonce` 校准。服务端已前进说明交易实际被接受 |
-| `sendTxBatch`（未实现） | 一次应分配连续一段 nonce |
 
 两个进程用同一 API Key 会立刻把 nonce 打乱，所以进程启动必须抢 `data/gridbot.lock`。
 

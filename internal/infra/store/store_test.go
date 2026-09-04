@@ -113,6 +113,42 @@ func TestRecordOrderFillIsIncremental(t *testing.T) {
 	}
 }
 
+func TestFillProgressRejectsCorruptQty(t *testing.T) {
+	s := openTemp(t)
+	o := order.Order{
+		ClientOrderID: order.MustEncode(order.Ref{Slot: 1, Epoch: 1, Cell: 0, Purpose: order.PurposeOpen, Seq: 0}),
+		Symbol:        "BTC",
+		FilledQty:     d("1"),
+		AvgFillPrice:  d("100"),
+	}
+	if err := s.InsertFill(Fill{
+		Exchange: "lighter", Symbol: "BTC", COID: o.ClientOrderID, Side: "buy",
+		Price: "100", Qty: "not-a-number", Fee: "0", Time: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordOrderFill("lighter", o); err == nil {
+		t.Fatal("corrupt qty must not be skipped")
+	}
+}
+
+func TestListFillsDoesNotMixEmptySymbol(t *testing.T) {
+	s := openTemp(t)
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	_ = s.SaveConfig(Config{Exchange: "lighter", Symbol: "SOL"})
+	_ = s.InsertFill(Fill{Exchange: "lighter", Symbol: "", COID: 1, Side: "buy", Price: "1", Qty: "1", Fee: "0", Time: t0})
+	_ = s.InsertFill(Fill{Exchange: "lighter", Symbol: "BTC", COID: 2, Side: "buy", Price: "1", Qty: "1", Fee: "0", Time: t0})
+	sol, err := s.ListFills("lighter", "SOL", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range sol {
+		if f.Symbol != "SOL" {
+			t.Fatalf("ListFills(SOL) leaked symbol %q", f.Symbol)
+		}
+	}
+}
+
 func openTemp(t *testing.T) *Store {
 	t.Helper()
 	s, err := Open(filepath.Join(t.TempDir(), "gridbot.db"))

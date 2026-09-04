@@ -96,9 +96,15 @@ func (m Market) RoundPrice(p decimal.Decimal, mode Rounding) decimal.Decimal {
 
 // RoundQty 把数量向下规整到 LotSize 的整数倍。
 //
-// 数量一律向下取整：宁可少下一点，也不要因为向上取整导致保证金不足。
+// 开仓腿向下取整：宁可少下一点，也不要因为向上取整导致保证金不足。
 func (m Market) RoundQty(q decimal.Decimal) decimal.Decimal {
 	return roundTo(q, m.LotSize, RoundDown)
+}
+
+// RoundQtyUp 向上规整数量，仅用于带 reduce-only 的平仓腿。
+// 交易所会截断到实际仓位；向下取整会持续留下无法闭合的 dust。
+func (m Market) RoundQtyUp(q decimal.Decimal) decimal.Decimal {
+	return roundTo(q, m.LotSize, RoundUp)
 }
 
 // CheckOrder 校验规整后的价格与数量是否满足交易所的最小限制。

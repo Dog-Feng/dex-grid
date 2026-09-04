@@ -238,3 +238,48 @@ func TestIPWhitelist(t *testing.T) {
 	assertHealth("10.1.2.3:9", 200)
 	assertHealth("198.51.100.1:9", 403)
 }
+
+func TestCORSPreflightBypassesAuth(t *testing.T) {
+	s, _ := setupAPI(t)
+	s.cfg.Auth.Enabled = true
+	s.cfg.Auth.Token = "secret"
+	s.cfg.CORSOrigins = []string{"https://console.example"}
+	h := s.Handler()
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/exchanges", nil)
+	req.Header.Set("Origin", "https://console.example")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "https://console.example" {
+		t.Fatalf("missing CORS origin header: %v", rec.Header())
+	}
+}
+
+func TestTrustedProxyUsesXForwardedFor(t *testing.T) {
+	s, _ := setupAPI(t)
+	s.cfg.IPWhitelist.Enabled = true
+	s.cfg.IPWhitelist.Allow = []string{"203.0.113.10"}
+	s.cfg.TrustedProxies = []string{"127.0.0.1"}
+	h := s.Handler()
+
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	req.RemoteAddr = "127.0.0.1:9"
+	req.Header.Set("X-Forwarded-For", "203.0.113.10")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("trusted XFF should pass, got %d", rec.Code)
+	}
+
+	req = httptest.NewRequest("GET", "/healthz", nil)
+	req.RemoteAddr = "127.0.0.1:9"
+	req.Header.Set("X-Forwarded-For", "198.51.100.1")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 403 {
+		t.Fatalf("unlisted XFF should be forbidden, got %d", rec.Code)
+	}
+}

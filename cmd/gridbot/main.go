@@ -17,6 +17,7 @@ import (
 	"dex-grid/internal/config"
 	"dex-grid/internal/exchange"
 	"dex-grid/internal/exchange/rhlighter"
+	"dex-grid/internal/exchange/sodex"
 	"dex-grid/internal/infra/httpx"
 	"dex-grid/internal/infra/lockfile"
 	"dex-grid/internal/infra/logx"
@@ -28,8 +29,9 @@ import (
 )
 
 func init() {
-	// lighter 包 init 已占用 slot 0。RH Lighter 必须追加，不能插到中间。
+	// lighter 包 init 已占用 slot 0。后续 DEX 必须追加，不能插到中间。
 	exchange.Register(rhlighter.Name, rhlighter.New)
+	exchange.Register(sodex.Name, sodex.New)
 }
 
 func main() {
@@ -78,7 +80,7 @@ func run() error {
 	}
 	defer st.Close()
 
-	httpClient, err := httpx.New(cfg.Proxy, cfg.App.ShutdownTimeout.Std())
+	httpClient, err := httpx.New(cfg.Proxy, cfg.App.HTTPTimeout.Std())
 	if err != nil {
 		return err
 	}

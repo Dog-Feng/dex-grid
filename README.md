@@ -43,17 +43,18 @@ Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运
 
 ## 2. 支持矩阵
 
-| 交易所 | 阶段 | 状态 |
-| --- | --- | --- |
-| Lighter (zkLighter) | 第一阶段 | 已接入，可主网实盘 |
-| RH Lighter | 第二家 DEX | 已接入（独立实例，`rh_lighter`） |
+| 交易所 | 状态 |
+| --- | --- |
+| Lighter (zkLighter) | 已接入，可主网实盘（`lighter`） |
+| RH Lighter | 已接入，独立实例（`rh_lighter`） |
+| SODEx | 已接入，独立实例（`sodex`，永续 Bolt） |
 
-架构上新增一个交易所只需实现 `exchange.Exchange` 接口并在 `main.go` **追加**一行注册（不可插入中间，会改 ClientOrderID slot）。
+架构上新增一个交易所只需实现 `exchange.Exchange` 接口并在 `main.go` **追加**一行注册（不可插入中间，会改 ClientOrderID slot）。新增策略只改 `internal/domain/strategy/<name>/` 与配置结构体。
 
-| 策略 | 标的 | 方向 | 阶段 | 状态 |
-| --- | --- | --- | --- | --- |
-| 普通合约网格 | 永续合约 | 做多 / 做空 / 中性 | 第一阶段 | 已实现 |
-| 马丁合约网格 | 永续合约 | 做多 / 做空 | 第二阶段 | 已实现（控制台可切换） |
+| 策略 | 标的 | 方向 | 状态 |
+| --- | --- | --- | --- |
+| 普通合约网格 | 永续合约 | 做多 / 做空 / 中性 | 已实现 |
+| 马丁合约网格 | 永续合约 | 做多 / 做空 | 已实现（控制台可切换） |
 
 **不支持现货网格**，这是明确的设计边界而不是待办项。
 
@@ -79,23 +80,23 @@ Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运
 ┌───────────────────────────────────────────────────────────────┐
 │  Web 控制台（embed）/ 策略 YAML / REST API                          │
 └──────────────────────────┬────────────────────────────────────┘
-                REST（同一端口，默认 0.0.0.0:8080）
+                REST（同一端口，默认 127.0.0.1:8080）
 ┌──────────────────────────▼────────────────────────────────────┐
 │  api  HTTP 层：路由 · 参数校验 · 命令下发 · IP 白名单               │
 └──────────────────────────┬────────────────────────────────────┘
               命令 channel（阻塞等回执，保证单线程模型）
 ┌──────────────────────────▼────────────────────────────────────┐
-│  app  应用层：实例 Runner · 执行器 · 建仓触发 · 对账 · 风控 · 行情分析 │
+│  app  应用层：Supervisor · Runner · 执行器 · 建仓触发 · 风控 · 看门狗 │
 └───────┬──────────────────────────────────────┬────────────────┘
         │                                      │
 ┌───────▼──────────────────┐      ┌────────────▼─────────────────┐
 │ domain 领域层（纯逻辑）    │      │ exchange 端口 + 适配器          │
-│ 网格算法 · 策略状态机       │      │ Exchange 接口 · lighter/ ...  │
-│ 订单 / 仓位 / 市场模型      │      │ Capabilities 能力协商          │
-│ 零 IO、零第三方 SDK        │      └──────────────────────────────┘
-└──────────────────────────┘
+│ 网格算法 · 策略状态机       │      │ Exchange 接口 · lighter /      │
+│ 订单 / 仓位 / 市场模型      │      │ rh_lighter / sodex            │
+│ 零 IO、零第三方 SDK        │      │ Capabilities 能力协商          │
+└──────────────────────────┘      └──────────────────────────────┘
 ┌───────────────────────────────────────────────────────────────┐
-│  infra  配置 · SQLite · 日志环形缓冲 · 指标 · 代理                 │
+│  infra  配置 · SQLite · 日志环形缓冲 · HTTP 代理 · 文件锁         │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -111,7 +112,7 @@ Go 单体后端，编译成**一个可执行文件**，Windows / Linux 双端运
 
 **HTTP 请求不直接碰状态。** `POST /start`、`/stop`、`/adjust-range` 等把命令投进 Runner 的事件 channel 并等待回执。Runner 仍然是单 goroutine 顺序处理，HTTP 的并发不会破坏领域状态的一致性。
 
-详见 [开发设计文档](docs/DESIGN.md)。Lighter 协议与改单见 [LIGHTER.md](docs/LIGHTER.md)。
+详见 [开发设计文档](docs/DESIGN.md)。Lighter 协议与改单见 [LIGHTER.md](docs/LIGHTER.md)。SODEx 见 [SODEX.md](docs/SODEX.md)。
 
 ---
 
@@ -122,6 +123,7 @@ dex-grid/
 ├── cmd/gridbot/main.go             # 入口：加载配置 → 注册适配器 → 恢复实例 → 启动 HTTP
 ├── cmd/lighterctl/main.go          # Core Lighter 核对 CLI
 ├── cmd/rhlighterctl/main.go        # RH Lighter 核对 CLI
+├── cmd/sodexctl/main.go            # SODEx 核对 CLI
 ├── internal/
 │   ├── config/                     # config.yaml 结构体、环境变量展开、校验
 │   ├── domain/                     # 领域层（纯逻辑，无 IO）
@@ -133,27 +135,25 @@ dex-grid/
 │   │       ├── grid/               # 普通网格：价位生成 + 配对 + 状态机
 │   │       └── martingale/         # 马丁网格：加仓计划 + 改止盈
 │   ├── app/
-│   │   ├── engine/                 # Runner：单 goroutine 事件循环 + 命令处理
+│   │   ├── supervisor/             # 多交易所实例、配置落盘、命令转发
+│   │   ├── engine/                 # Runner：单 goroutine 事件循环 + 看门狗
 │   │   ├── executor/               # Action → Exchange，批量/限流/重试
-│   │   ├── entry/                  # 建仓触发器三种模式
-│   │   ├── reconcile/              # 启动与周期性对账
-│   │   ├── risk/                   # 止盈止损、区间外策略、熔断
-│   │   └── analysis/               # K 线 → EMA/斜率/ATR → 趋势判定与参数推荐
+│   │   ├── entry/                  # 建仓：跟价 / 指定价
+│   │   └── risk/                   # 止盈止损、区间外策略、熔断
 │   ├── api/
-│   │   ├── router.go               # REST 路由
-│   │   ├── handlers.go             # 各端点
-│   │   ├── stream.go               # WebSocket 实时推送
-│   │   └── dto.go                  # 请求/响应结构体
+│   │   └── server.go               # REST 路由 + 静态页托管
 │   ├── exchange/
 │   │   ├── exchange.go             # Exchange 端口 + Capabilities
 │   │   ├── registry.go             # 名称 → 构造函数
 │   │   ├── lighter/                # Lighter 适配器（slot 0）
-│   │   └── rhlighter/              # RH Lighter 适配器（slot 1，独立链）
+│   │   ├── rhlighter/              # RH Lighter 适配器（slot 1，独立链）
+│   │   ├── sodex/                  # SODEx 适配器（slot 2）
+│   │   └── fake/                   # 内存撮合，供单测
 │   └── infra/
-│       ├── store/                  # SQLite：策略配置、订单、成交、统计
+│       ├── store/                  # SQLite：策略配置、运行快照、成交、统计
 │       ├── logx/                   # slog + 内存环形缓冲
-│       ├── proxy/                  # HTTP/SOCKS5 代理与连通性探测
-│       └── metrics/                # Prometheus
+│       ├── httpx/                  # 带全局代理的 HTTP 客户端
+│       └── lockfile/               # 防双开文件锁
 ├── config/
 │   ├── config.example.yaml         # 密钥与运维示例（复制为 config.yaml）
 │   └── lighter-sol.yaml            # 可选 SOL 网格模板（需显式 strategy_file）
@@ -162,6 +162,7 @@ dex-grid/
 │   ├── DESIGN.md                   # 开发设计文档
 │   ├── LIGHTER.md                  # Lighter 适配：协议、签名、nonce、改单
 │   ├── RH_LIGHTER.md               # RH Lighter 适配：独立实例、端点、chain_id 466324
+│   ├── SODEX.md                    # SODEx 适配：EIP-712、replace、WS
 │   ├── GRID_CONFIG.md              # 网格配置文档
 │   ├── DEPLOYMENT.md               # 安装部署文档
 │   └── images/ui-prototype.png
@@ -237,11 +238,26 @@ go build -o rhlighterctl ./cmd/rhlighterctl
 ./rhlighterctl check
 ```
 
+SODEx 用独立工具 `sodexctl`（连 `mainnet-gw.sodex.dev`，读 `name: sodex` 那段配置）。协议细节见 [SODEX.md](docs/SODEX.md)。
+
+```bash
+go build -o sodexctl ./cmd/sodexctl
+./sodexctl markets -q btc
+./sodexctl check
+./sodexctl maker -m 1 -side buy -qty 0.001 -offset 0.02        # 演练
+./sodexctl maker -m 1 -side buy -qty 0.001 -offset 0.02 -yes
+./sodexctl modify -m 1 -coid <号> -price <价> -qty <量> -yes
+./sodexctl cancel -m 1 -coid <号> -yes
+./sodexctl cancel -m 16 -oid <交易所订单号> -yes   # 没有客户端订单号时
+./sodexctl taker -m 1 -side buy -qty 0.001 -yes
+./sodexctl close -m 1 -yes
+```
+
 ---
 
 ## 6. 运行时操作
 
-浏览器打开 `http://127.0.0.1:8080/`（与 API 同端口）。账户状态每秒刷新；价格/网格图默认 1 小时 K 线。页面数据始终对应当前策略交易对。
+浏览器打开 `http://127.0.0.1:8080/`（与 API 同端口）。控制台每秒轮询 REST（无页面 WebSocket）。价格/网格图默认 1 小时 K 线。页面数据始终对应当前策略交易对。
 
 | 操作 | 端点 | 行为 |
 | --- | --- | --- |
@@ -257,7 +273,7 @@ go build -o rhlighterctl ./cmd/rhlighterctl
 | 运行日志 | `GET /api/exchanges/{ex}/logs` | 启动、挂了 N 笔、某价成交；页面「运行日志」面板 |
 | K 线 | `GET /api/exchanges/{ex}/klines` | 默认 `interval=1h` |
 
-完整字段见 [网格配置文档](docs/GRID_CONFIG.md)。成交由交易所 WebSocket 推送后立刻翻转格子并挂对手单；`reconcile_interval`（默认 15s）只做挂单缺补/多撤兜底。控制台运行日志会打「已启动 / 挂了 N 笔 / 买成交价×量」，成交明细仍看成交记录表。
+完整字段见 [网格配置文档](docs/GRID_CONFIG.md)。成交由交易所 WebSocket 推送后立刻翻转格子并挂对手单；`reconcile_interval`（未配置时引擎按 15s）只做挂单缺补/多撤兜底。解不出本系统客户端订单号的挂单看门狗不碰。控制台运行日志会打「已启动 / 挂了 N 笔 / 买成交价×量」，成交明细仍看成交记录表。
 
 ---
 
@@ -266,7 +282,7 @@ go build -o rhlighterctl ./cmd/rhlighterctl
 1. **单实例单 goroutine**：一个交易所实例的所有事件（行情、成交回报、定时器、HTTP 命令）在同一 goroutine 顺序处理，领域状态无锁。
 2. **命令走 channel**：HTTP handler 不直接改状态，投递命令并等回执，超时返回 504。
 3. **意图幂等**：每笔订单携带确定性 `ClientOrderID`（编码交易所槽位 + 轮次 + 层级 + 用途 + 重挂序号），重放安全。
-4. **启动先对账**：恢复运行前先拉交易所真实挂单与仓位比对，撤孤儿单、补缺失单。
+4. **启动先对账**：恢复运行前拉交易所真实挂单与仓位，撤本实例过期轮次单、按仓位恢复已穿过的格子，再补缺失挂单。
 5. **失败不静默**：错误按类型分流（可重试 / 参数错 / 保证金不足 / post-only 被拒），连续失败达阈值则熔断并写日志。
 6. **停止只撤单**：停策略或关进程一律「撤销本交易对挂单 → 保留仓位 → 落盘终态」。止损市价吃单平仓；风控止盈 maker 跟价平仓。
 7. **精度先规整后发送**：价格按 `tick_size`、数量按 `lot_size` 规整，规整后为 0 直接丢弃并告警。
@@ -291,25 +307,7 @@ GOOS=windows GOARCH=amd64 go build -o dist/gridbot.exe ./cmd/gridbot
 
 ---
 
-## 9. 开发路线图
-
-| 阶段 | 内容 | 产出 |
-| --- | --- | --- |
-| **M1 骨架** | 配置加载、日志、Exchange 接口与注册表、Strategy 接口、Runner 事件循环、dry-run 执行器、假交易所 | 全链路跑通 |
-| **M2 网格算法** | 价位表生成、三方向配对逻辑、状态机、派生量纯函数 | 领域层单测覆盖 ≥ 80% |
-| **M3 Lighter 适配** | REST/WS 客户端、签名、nonce、市场元数据、下单撤单、订单与仓位订阅 | 主网真实成交，已完成 |
-| **M4 HTTP + 控制台** | REST + embed 静态控制台 | 页面可配置/启停/看状态与 1h 价格曲线 |
-| **M5 建仓与风控** | 三种建仓模式、止盈止损、区间外策略、trailing、熔断 | 主网小资金实盘 |
-| **M6 持久化与对账** | SQLite 落盘、启动恢复、周期漂移检查、指标 | 长时间无人值守 |
-| **M7 行情分析** | K 线已接入图表；EMA/斜率/ATR、趋势判定、参数推荐待做 | 图表可用 |
-| **M8 马丁网格** | 马丁策略（做多/做空）、预挂加仓、加仓后 Modify 止盈、止盈后同步 epoch 再开下一轮 | 已实现 |
-| **M9 多交易所** | 接入 RH Lighter（独立实例，验证端口抽象） | 已接入 `rh_lighter` |
-
-**扩展性验收标准**：新增交易所只允许改 `internal/exchange/<name>/` 与 `main.go` 一行注册；新增策略只允许改 `internal/domain/strategy/<name>/` 与配置结构体。若必须改 `app` 层，说明抽象有缺陷，先修抽象。
-
----
-
-## 10. 风险提示
+## 9. 风险提示
 
 永续合约带杠杆，**存在爆仓导致本金全部损失的风险**。网格策略在单边行情中持续逆势加仓，做多网格遇深度下跌、做空网格遇暴力拉升都会产生巨额浮亏。原型图里 30 倍杠杆只是示例，不是建议值。
 
@@ -317,14 +315,15 @@ GOOS=windows GOARCH=amd64 go build -o dist/gridbot.exe ./cmd/gridbot
 - 实盘从最小资金开始，**必须配置止损价**（区间外策略默认只是挂起等待回归，本身不构成保护）
 - 使用逐仓模式，控制单实例风险敞口
 - 密钥只通过环境变量注入，永远不提交到 Git
-- 默认监听 `0.0.0.0:8080` 且无鉴权。公网部署请打开 `server.ip_whitelist` 或 Bearer Token，或不需要对外时改成 `127.0.0.1:8080`
+- 默认监听 `127.0.0.1:8080`。若改成 `0.0.0.0:8080` 必须同时打开 `server.auth` 或 `server.ip_whitelist`
 
 ---
 
-## 11. 相关文档
+## 10. 相关文档
 
 - [开发设计文档 docs/DESIGN.md](docs/DESIGN.md) —— 分层职责、核心接口、网格算法、事件与命令流、HTTP API
 - [Lighter 适配 docs/LIGHTER.md](docs/LIGHTER.md) —— Core Lighter 协议、签名、nonce、改单
 - [RH Lighter 适配 docs/RH_LIGHTER.md](docs/RH_LIGHTER.md) —— Robinhood 链实例，与 Core 隔离
+- [SODEx 适配 docs/SODEX.md](docs/SODEX.md) —— SODEx 永续 EIP-712、replace、事件流
 - [网格配置文档 docs/GRID_CONFIG.md](docs/GRID_CONFIG.md) —— `config.yaml`、策略 YAML、REST 字段、派生量公式、校验规则
 - [安装部署文档 docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) —— Windows / Linux 安装、服务化、代理、升级、备份、排错

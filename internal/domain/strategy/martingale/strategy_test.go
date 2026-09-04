@@ -383,7 +383,7 @@ func TestTakeProfitRestartsCycle(t *testing.T) {
 			closePos++
 		}
 	}
-	if ensure != 1 || stop != 0 || cancelAll != 1 || closePos != 1 {
+	if ensure != 1 || stop != 0 || cancelAll != 1 || closePos != 0 {
 		t.Fatalf("restart acts ensure=%d stop=%d cancelAll=%d close=%d", ensure, stop, cancelAll, closePos)
 	}
 	if s.phase != strategy.PhaseEntering {
@@ -447,5 +447,70 @@ func TestAdjustRangeUnsupported(t *testing.T) {
 	_, err := s.OnCommand(strategy.Command{Kind: strategy.CmdAdjustRange, Now: epoch0})
 	if err != strategy.ErrUnsupportedCommand {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestTakeProfitPartialCancelRehangs(t *testing.T) {
+	s := newStrategy(t, testParams())
+	_, _ = s.Init(testState("100", "0"))
+	acts, _ := s.OnEvent(strategy.EntryDoneEvent{Filled: s.target, Now: epoch0})
+	var tp strategy.PlaceOrder
+	for _, p := range placements(acts) {
+		if p.ClientOrderID.Decode().Purpose == order.PurposeTakeProfit {
+			tp = p
+		}
+	}
+	if tp.ClientOrderID == 0 {
+		t.Fatal("missing take-profit order")
+	}
+	confirm(t, s, tp)
+
+	partial := tp.Quantity.Div(d("2"))
+	if !partial.IsPositive() {
+		t.Fatal("tp qty too small")
+	}
+	next, err := s.OnEvent(strategy.OrderEvent{
+		Order: order.Order{
+			ClientOrderID: tp.ClientOrderID,
+			Side:          tp.Side,
+			Price:         tp.Price,
+			Quantity:      tp.Quantity,
+			FilledQty:     partial,
+			AvgFillPrice:  tp.Price,
+			State:         order.StateCanceled,
+		},
+		Now: epoch0.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.phase != strategy.PhaseRunning {
+		t.Fatalf("phase = %s, want running", s.phase)
+	}
+	rehang := false
+	for _, p := range placements(next) {
+		if p.ClientOrderID.Decode().Purpose == order.PurposeTakeProfit {
+			rehang = true
+		}
+	}
+	if !rehang {
+		t.Fatalf("expected rehang take-profit, acts=%d", len(next))
+	}
+}
+
+func TestResumeEnteringWithInventoryStillEnsures(t *testing.T) {
+	s := newStrategy(t, testParams())
+	_, _ = s.Init(testState("100", "0"))
+	s.phase = strategy.PhaseEntering
+	s.position = s.target.Mul(d("1.5"))
+	acts := s.resumeActions(epoch0)
+	ensure := 0
+	for _, a := range acts {
+		if _, ok := a.(strategy.EnsurePosition); ok {
+			ensure++
+		}
+	}
+	if ensure != 1 {
+		t.Fatalf("EnsurePosition count = %d, want 1; acts=%d", ensure, len(acts))
 	}
 }

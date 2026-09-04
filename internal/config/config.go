@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -48,6 +49,7 @@ type App struct {
 	TickInterval      Duration `yaml:"tick_interval"`
 	ReconcileInterval Duration `yaml:"reconcile_interval"`
 	ShutdownTimeout   Duration `yaml:"shutdown_timeout"`
+	HTTPTimeout       Duration `yaml:"http_timeout"`
 }
 
 type Server struct {
@@ -56,6 +58,8 @@ type Server struct {
 	IPWhitelist    IPWhitelist `yaml:"ip_whitelist"`
 	MetricsEnabled bool        `yaml:"metrics_enabled"`
 	CORSOrigins    []string    `yaml:"cors_origins"`
+	// TrustedProxies 是可信反向代理的 IP/CIDR。只有 RemoteAddr 命中时才采信 X-Forwarded-For。
+	TrustedProxies []string `yaml:"trusted_proxies"`
 }
 
 type Auth struct {
@@ -102,9 +106,22 @@ type Exchange struct {
 }
 
 type Credentials struct {
-	AccountIndex     int64  `yaml:"account_index"`
+	AccountIndex int64 `yaml:"account_index"`
+	// AccountID 是 SODEx 等用数字账户号的别名；未填时用 AccountIndex。
+	AccountID        int64  `yaml:"account_id"`
 	APIKeyIndex      uint8  `yaml:"api_key_index"`
+	APIKeyName       string `yaml:"api_key_name"`
 	APIKeyPrivateKey string `yaml:"api_key_private_key"`
+	// AccountAddress 是主钱包地址（SODEx 账户查询 / WS 用户频道）。
+	AccountAddress string `yaml:"account_address"`
+}
+
+// AccountIDOrIndex 返回交易所账户号：优先 account_id，否则 account_index。
+func (c Credentials) AccountIDOrIndex() int64 {
+	if c.AccountID > 0 {
+		return c.AccountID
+	}
+	return c.AccountIndex
 }
 
 type RateLimit struct {
@@ -168,8 +185,11 @@ func (c *Config) applyDefaults() {
 	if c.App.ShutdownTimeout == 0 {
 		c.App.ShutdownTimeout = Duration(30 * time.Second)
 	}
+	if c.App.HTTPTimeout == 0 {
+		c.App.HTTPTimeout = Duration(15 * time.Second)
+	}
 	if c.Server.Addr == "" {
-		c.Server.Addr = "0.0.0.0:8080"
+		c.Server.Addr = "127.0.0.1:8080"
 	}
 	if c.Proxy.HealthInterval == 0 {
 		c.Proxy.HealthInterval = Duration(time.Minute)
@@ -220,6 +240,9 @@ func (c *Config) Validate() error {
 	if c.Server.IPWhitelist.Enabled && len(c.Server.IPWhitelist.Allow) == 0 {
 		return fmt.Errorf("server.ip_whitelist.enabled 为 true 时必须至少配置一条 allow")
 	}
+	if !c.Server.Auth.Enabled && !c.Server.IPWhitelist.Enabled && isPublicAddr(c.Server.Addr) {
+		return fmt.Errorf("server.addr 为 %s（公网可达）时必须启用 server.auth 或 server.ip_whitelist；只本机访问请改成 127.0.0.1:8080", c.Server.Addr)
+	}
 
 	if c.Proxy.Enabled {
 		if c.Proxy.URL == "" {
@@ -250,8 +273,8 @@ func (c *Config) Validate() error {
 		default:
 			return fmt.Errorf("exchanges[%s].network: 未知网络 %q", e.Name, e.Network)
 		}
-		if e.Credentials.AccountIndex <= 0 {
-			return fmt.Errorf("exchanges[%s].credentials.account_index 缺失", e.Name)
+		if e.Credentials.AccountIDOrIndex() <= 0 {
+			return fmt.Errorf("exchanges[%s].credentials.account_index / account_id 缺失", e.Name)
 		}
 		if strings.TrimSpace(e.Credentials.APIKeyPrivateKey) == "" {
 			return fmt.Errorf(
@@ -262,4 +285,17 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("没有启用任何交易所")
 	}
 	return nil
+}
+
+func isPublicAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && !ip.IsLoopback()
 }

@@ -37,6 +37,11 @@ func TestClassOf(t *testing.T) {
 	if ClassOf(por).Retryable() {
 		t.Fatal("post-only reject is not a retryable transport error")
 	}
+
+	margin := Classify(ClassInsufficientMargin, "place_order", errors.New("insufficient margin"))
+	if ClassOf(margin).CountsAsFailure() {
+		t.Fatal("insufficient margin must not count as circuit failure")
+	}
 }
 
 func TestErrorString(t *testing.T) {

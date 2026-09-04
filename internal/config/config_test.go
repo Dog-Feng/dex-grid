@@ -66,8 +66,8 @@ func TestLoadReportsMissingEnv(t *testing.T) {
 	}
 }
 
-// 公网监听且未开鉴权时允许启动（部署方可自行决定是否暴露 API）。
-func TestValidateAllowsPublicAddrWithoutAuth(t *testing.T) {
+// 公网监听且未开鉴权时拒绝启动。
+func TestValidateRejectsPublicAddrWithoutAuth(t *testing.T) {
 	cfg := &Config{}
 	cfg.Server.Addr = "0.0.0.0:8080"
 	cfg.Exchanges = []Exchange{{
@@ -78,8 +78,8 @@ func TestValidateAllowsPublicAddrWithoutAuth(t *testing.T) {
 	cfg.Server.Addr = "0.0.0.0:8080"
 	cfg.Server.Auth.Enabled = false
 
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("公网监听且无鉴权应当允许启动: %v", err)
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("公网监听且无鉴权应当拒绝启动")
 	}
 
 	cfg.Server.Auth.Enabled = true
@@ -102,6 +102,42 @@ func TestValidateRejectsDuplicateExchange(t *testing.T) {
 	cfg.applyDefaults()
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("重复配置同一个交易所时应当报错")
+	}
+}
+
+func TestLoadAcceptsSodexAccountID(t *testing.T) {
+	body := `
+app:
+  log_level: info
+  data_dir: ./data
+server:
+  addr: "127.0.0.1:9000"
+exchanges:
+  - name: sodex
+    enabled: true
+    network: mainnet
+    credentials:
+      account_id: 6222
+      account_address: "0x1111111111111111111111111111111111111111"
+      api_key_name: boom
+      api_key_private_key: dummy
+`
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex, ok := cfg.Find("sodex")
+	if !ok {
+		t.Fatal("未找到 sodex")
+	}
+	if ex.Credentials.AccountIDOrIndex() != 6222 {
+		t.Fatalf("AccountIDOrIndex = %d，期望 6222", ex.Credentials.AccountIDOrIndex())
+	}
+	if ex.Credentials.APIKeyName != "boom" {
+		t.Fatalf("APIKeyName = %q", ex.Credentials.APIKeyName)
+	}
+	if ex.Credentials.AccountAddress != "0x1111111111111111111111111111111111111111" {
+		t.Fatalf("AccountAddress = %q", ex.Credentials.AccountAddress)
 	}
 }
 

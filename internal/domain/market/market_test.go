@@ -55,6 +55,14 @@ func TestRoundQtyAlwaysDown(t *testing.T) {
 	}
 }
 
+func TestRoundQtyUp(t *testing.T) {
+	m := testMarket()
+	got := m.RoundQtyUp(d("0.0011"))
+	if !got.Equal(d("0.002")) {
+		t.Fatalf("RoundQtyUp(0.0011) = %s, want 0.002", got)
+	}
+}
+
 func TestCheckOrder(t *testing.T) {
 	m := testMarket()
 	if err := m.CheckOrder(d("60000"), d("0.002")); err != nil {

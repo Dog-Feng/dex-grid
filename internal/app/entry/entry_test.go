@@ -521,3 +521,38 @@ func TestPositionAtTargetCancelsRestingEntry(t *testing.T) {
 		t.Fatalf("expected cancel resting entry, got %#v", acts)
 	}
 }
+
+func TestCrossZeroFlipDoesNotUseReduceOnly(t *testing.T) {
+	p := strategy.DefaultEntryParams()
+	p.Mode = strategy.EntryMakerFollow
+	p.SliceCount = 1
+	tr := New(p, testMarket(), 0, 1)
+
+	acts := tr.Start(d("10"), d("-5"), book("149.9", "150.1"), d("150"), t0)
+	po := firstPlace(t, acts)
+	if po.ReduceOnly {
+		t.Fatal("cross-zero flip must not mark the whole order reduce-only")
+	}
+	if !po.Quantity.Equal(d("15")) {
+		t.Fatalf("qty = %s, want 15", po.Quantity)
+	}
+	if po.Side != order.Buy {
+		t.Fatalf("side = %s, want buy", po.Side)
+	}
+}
+
+func TestPureFlattenUsesReduceOnly(t *testing.T) {
+	p := strategy.DefaultEntryParams()
+	p.Mode = strategy.EntryMakerFollow
+	p.SliceCount = 1
+	tr := New(p, testMarket(), 0, 1)
+
+	acts := tr.Start(d("0"), d("5"), book("149.9", "150.1"), d("150"), t0)
+	po := firstPlace(t, acts)
+	if !po.ReduceOnly {
+		t.Fatal("pure flatten should be reduce-only")
+	}
+	if !po.Quantity.Equal(d("5")) {
+		t.Fatalf("qty = %s, want 5", po.Quantity)
+	}
+}

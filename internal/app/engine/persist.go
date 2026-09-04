@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"time"
+
 	"dex-grid/internal/domain/order"
 )
 
@@ -20,16 +22,36 @@ func (r *Runner) persist() {
 		snap = nil
 	}
 	reason := ""
-	if r.status == StatusStopped || r.status == StatusError {
+	if r.Status() == StatusStopped || r.Status() == StatusError {
 		reason = r.stopReason.String()
 	}
-	if err := r.cfg.Persist.SaveRuntime(r.cfg.Name, r.status.String(), reason, r.epoch, snap); err != nil {
+	if err := r.cfg.Persist.SaveRuntime(r.cfg.Name, r.Status().String(), reason, r.epoch, snap); err != nil {
 		r.log.Warn("persist runtime failed", "err", err)
 	}
+	r.lastPersist = time.Now()
+}
+
+// persistSoon 在成交、铺单后尽快落盘；同一秒内多次调用合并成一次。
+func (r *Runner) persistSoon() {
+	if r.cfg.Persist == nil || r.strat == nil {
+		return
+	}
+	if r.Status() == StatusStopped || r.Status() == StatusError {
+		r.persist()
+		return
+	}
+	now := time.Now()
+	if !r.lastPersist.IsZero() && now.Sub(r.lastPersist) < time.Second {
+		return
+	}
+	r.persist()
 }
 
 func (r *Runner) recordFill(o order.Order) {
 	r.logOrderFill(o)
+	if o.State.IsTerminal() && r.lastFillQty != nil {
+		delete(r.lastFillQty, o.ClientOrderID)
+	}
 	if r.cfg.Persist == nil || !o.FilledQty.IsPositive() {
 		return
 	}

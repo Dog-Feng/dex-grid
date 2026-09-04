@@ -7,6 +7,7 @@ import (
 
 	"dex-grid/internal/domain/account"
 	"dex-grid/internal/domain/market"
+	"dex-grid/internal/domain/order"
 	"dex-grid/internal/domain/position"
 	"dex-grid/internal/domain/strategy"
 	"dex-grid/internal/exchange"
@@ -106,12 +107,13 @@ func TestMaxNotionalBlocksOpens(t *testing.T) {
 	}
 
 	filtered := FilterOpens([]strategy.Action{
-		strategy.PlaceOrder{ReduceOnly: false, Quantity: d("1")},
+		strategy.PlaceOrder{Side: order.Buy, Quantity: d("1")},
+		strategy.PlaceOrder{Side: order.Sell, Quantity: d("1")},
 		strategy.PlaceOrder{ReduceOnly: true, Quantity: d("1")},
 		strategy.CancelAll{},
-	})
-	if len(filtered) != 2 {
-		t.Fatalf("filtered = %d, want 2 (reduce-only + cancel)", len(filtered))
+	}, position.Position{Symbol: "BTC", Size: d("1"), MarkPrice: d("150")})
+	if len(filtered) != 3 {
+		t.Fatalf("filtered = %d, want 3 (flattening sell + reduce-only + cancel)", len(filtered))
 	}
 }
 
@@ -128,6 +130,20 @@ func TestCircuitOnConsecutiveFailures(t *testing.T) {
 	}
 	if _, ok := v.Actions[1].(strategy.ClosePosition); ok {
 		t.Fatal("circuit must not close the position")
+	}
+}
+
+func TestInsufficientMarginBlocksOpensNotCircuit(t *testing.T) {
+	g := New(strategy.DefaultRiskParams())
+	g.NoteInsufficientMargin()
+	if !g.BlockOpens() {
+		t.Fatal("insufficient margin should block opens")
+	}
+	if v := g.RecordFailures(0, nil); v.Stop {
+		t.Fatal("clearing failures must not circuit")
+	}
+	if g.BlockOpens() {
+		t.Fatal("successful apply should clear the margin block")
 	}
 }
 
@@ -159,5 +175,53 @@ func TestMarginRatioBlocksOpens(t *testing.T) {
 	v := g.Check(strategy.TickEvent{Now: t0})
 	if !v.BlockOpens {
 		t.Fatalf("ratio %s should block opens", d("100").Div(d("80")))
+	}
+}
+
+func TestTPSLTriggerSidesMatrix(t *testing.T) {
+	// 方向由触发边决定，与仓位正负无关。价格未穿越时不得 Stop。
+	type tc struct {
+		name            string
+		sl, tp          string
+		slBelow, tpAbove bool
+		size, price     string
+		wantStop        bool
+		wantReason      strategy.StopReason
+	}
+	cases := []tc{
+		{name: "long sl below hit", sl: "95", tp: "115", slBelow: true, tpAbove: true, size: "1", price: "94", wantStop: true, wantReason: strategy.StopStopLoss},
+		{name: "long sl below miss", sl: "95", tp: "115", slBelow: true, tpAbove: true, size: "1", price: "105", wantStop: false},
+		{name: "long tp above hit", sl: "95", tp: "115", slBelow: true, tpAbove: true, size: "1", price: "116", wantStop: true, wantReason: strategy.StopTakeProfit},
+		{name: "short sl below miss at mid", sl: "95", tp: "115", slBelow: true, tpAbove: true, size: "-1", price: "105", wantStop: false},
+		{name: "short sl below still hits downside", sl: "95", tp: "115", slBelow: true, tpAbove: true, size: "-1", price: "94", wantStop: true, wantReason: strategy.StopStopLoss},
+		{name: "flat never", sl: "95", tp: "115", slBelow: true, tpAbove: true, size: "0", price: "90", wantStop: false},
+		{name: "short sl above hit", sl: "115", tp: "95", slBelow: false, tpAbove: false, size: "-1", price: "116", wantStop: true, wantReason: strategy.StopStopLoss},
+		{name: "short sl above miss", sl: "115", tp: "95", slBelow: false, tpAbove: false, size: "-1", price: "105", wantStop: false},
+		{name: "long sl above would false-positive without sides", sl: "115", tp: "95", slBelow: false, tpAbove: false, size: "1", price: "105", wantStop: false},
+		{name: "long tp below hit", sl: "115", tp: "95", slBelow: false, tpAbove: false, size: "1", price: "94", wantStop: true, wantReason: strategy.StopTakeProfit},
+		{name: "neutral short in range", sl: "95", tp: "115", slBelow: true, tpAbove: true, size: "-1", price: "105", wantStop: false},
+		{name: "neutral long in range", sl: "95", tp: "115", slBelow: true, tpAbove: true, size: "1", price: "105", wantStop: false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := strategy.DefaultRiskParams()
+			p.StopLossPrice = d(c.sl)
+			p.TakeProfitPrice = d(c.tp)
+			g := New(p)
+			g.SetTriggerSides(c.slBelow, c.tpAbove)
+			g.SetPosition(position.Position{Symbol: "BTC", Size: d(c.size), MarkPrice: d("105")})
+			g.SetMark(d("105"), market.BookTicker{Bid: d("104.9"), Ask: d("105.1")}, t0)
+			v := g.Check(strategy.BookEvent{
+				Book: market.BookTicker{Bid: d(c.price), Ask: d(c.price).Add(d("0.1"))},
+				Mark: d(c.price),
+				Now:  t0.Add(time.Second),
+			})
+			if v.Stop != c.wantStop {
+				t.Fatalf("stop=%v reason=%s, want stop=%v", v.Stop, v.Reason, c.wantStop)
+			}
+			if c.wantStop && v.Reason != c.wantReason {
+				t.Fatalf("reason=%s, want %s", v.Reason, c.wantReason)
+			}
+		})
 	}
 }

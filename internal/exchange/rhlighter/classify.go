@@ -68,12 +68,18 @@ var messagePatterns = []struct {
 		"would match", "immediately match", "would cross", "crosses the book",
 		"maker order would", "taker order not allowed",
 	}},
+	{exchange.ClassDuplicate, []string{
+		"duplicate", "already exists", "client order index", "order id exists",
+	}},
 	{exchange.ClassInsufficientMargin, []string{
 		"insufficient", "not enough", "exceeds available", "margin requirement",
 		"collateral", "below maintenance",
 	}},
+	{exchange.ClassNonceStale, []string{
+		"nonce",
+	}},
 	{exchange.ClassRetryable, []string{
-		"nonce", "rate limit", "too many requests", "timeout", "timed out",
+		"rate limit", "too many requests", "timeout", "timed out",
 		"temporarily", "try again", "sequencer is", "busy",
 	}},
 	{exchange.ClassFatal, []string{

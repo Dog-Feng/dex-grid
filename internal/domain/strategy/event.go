@@ -26,6 +26,8 @@ type BookEvent struct {
 	Book market.BookTicker
 	// Mark 是标记价。交易所不提供时由适配器填成中间价。
 	Mark decimal.Decimal
+	// Last 是最新成交价，供 price_source=last 使用。
+	Last decimal.Decimal
 	Now  time.Time
 }
 

@@ -93,6 +93,7 @@ function switchTab(name) {
 function exchangeLabel(name) {
   if (name === "rh_lighter") return "RH Lighter";
   if (name === "lighter") return "Lighter";
+  if (name === "sodex") return "SODEx";
   return titleCase(name);
 }
 
@@ -257,12 +258,24 @@ function annualizedReturn(pnl, capital, resetAt) {
   return ((pnl / capital) * (365 / days) * 100).toFixed(2);
 }
 
+// 空串不能交给后端的 decimal：JSON "" 无法转成数字。
+function decOrOmit(v) {
+  const s = String(v ?? "").trim();
+  return s === "" ? undefined : s;
+}
+
 function collectParams() {
   const prev = state.config || {};
   const entry = { ...(prev.entry || {}) };
   const risk = { ...(prev.risk || {}) };
+  delete entry.price;
+  delete risk.stop_loss_price;
+  delete risk.take_profit_price;
   entry.mode = $("entry-mode").value;
-  if (entry.mode === "limit_price") entry.price = $("entry-price").value;
+  if (entry.mode === "limit_price") {
+    const px = decOrOmit($("entry-price").value);
+    if (px) entry.price = px;
+  }
   const kind = selected("kind") || "grid";
   const out = {
     ...prev,
@@ -296,12 +309,17 @@ function collectParams() {
     return out;
   }
   const grid = { ...(prev.grid || {}) };
-  grid.lower_price = $("lower").value;
-  grid.upper_price = $("upper").value;
+  grid.lower_price = decOrOmit($("lower").value);
+  grid.upper_price = decOrOmit($("upper").value);
   grid.grid_count = Number($("count").value);
   grid.sizing_mode = $("sizing").value;
-  if (grid.sizing_mode === "margin") grid.margin = $("margin").value;
-  else grid.per_grid_qty = $("qty").value;
+  if (grid.sizing_mode === "margin") {
+    grid.margin = decOrOmit($("margin").value);
+    delete grid.per_grid_qty;
+  } else {
+    grid.per_grid_qty = decOrOmit($("qty").value);
+    delete grid.margin;
+  }
   out.grid = grid;
   out.risk = { ...out.risk, out_of_range: $("out-of-range").value };
   return out;
@@ -734,6 +752,9 @@ function applyPreview(d) {
   if (ws.length) {
     warn.classList.add("show");
     warn.textContent = ws.map((w) => w.message || w).join(" ");
+  } else {
+    warn.classList.remove("show");
+    warn.textContent = "";
   }
 }
 

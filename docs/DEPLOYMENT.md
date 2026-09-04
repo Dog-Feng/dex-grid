@@ -170,7 +170,7 @@ app:
   data_dir: ./data
 
 server:
-  addr: "0.0.0.0:8080"
+  addr: "127.0.0.1:8080"
   auth:
     enabled: false
   cors_origins: ["*"]
@@ -303,7 +303,7 @@ sudo -u gridbot env $(cat /etc/gridbot.env | xargs) \
   /opt/gridbot/gridbot
 ```
 
-看到日志 `api listening addr=0.0.0.0:8080` 后，另开终端：
+看到日志 `api listening addr=127.0.0.1:8080` 后，另开终端：
 
 ```bash
 curl -s http://127.0.0.1:8080/healthz
@@ -384,7 +384,7 @@ sudo journalctl -u gridbot -f
 
 ### 6.6 公网访问 API
 
-默认监听 `0.0.0.0:8080`，无鉴权、无反向代理。云厂商安全组与本机防火墙都要放行 TCP 8080。
+默认只监听 `127.0.0.1:8080`。若改成 `0.0.0.0:8080`，必须同时启用 `server.auth` 或 `server.ip_whitelist`，并在云厂商安全组与本机防火墙放行 TCP 8080。
 
 ```bash
 # Ubuntu / Debian
@@ -539,7 +539,7 @@ nssm edit    gridbot          # 图形界面编辑配置
 
 ### 7.6 Windows 防火墙
 
-监听 `0.0.0.0:8080` 时需要开放入站端口：
+监听 `0.0.0.0:8080`（且已开启鉴权或白名单）时需要开放入站端口：
 
 ```powershell
 New-NetFirewallRule -DisplayName "gridbot api" -Direction Inbound `
@@ -584,7 +584,7 @@ $env:HTTPS_PROXY = "http://127.0.0.1:7890"
 
 ## 9. 公网访问
 
-默认即公网可访问：`server.addr = 0.0.0.0:8080`，`auth.enabled = false`，不需要反向代理或 HTTPS。
+默认只本机访问：`server.addr = 127.0.0.1:8080`，`auth.enabled = false`。需要公网访问时改成 `0.0.0.0:8080` **并同时打开鉴权或 IP 白名单**。
 
 需要同时放行：
 
@@ -595,7 +595,8 @@ $env:HTTPS_PROXY = "http://127.0.0.1:7890"
 server:
   addr: "0.0.0.0:8080"
   auth:
-    enabled: false
+    enabled: true
+    token: ${GRIDBOT_TOKEN}
   cors_origins: ["*"]
   ip_whitelist:
     enabled: false

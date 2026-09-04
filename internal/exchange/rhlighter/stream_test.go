@@ -337,11 +337,25 @@ func TestStreamReconnectsAndResyncs(t *testing.T) {
 		t.Error("重连过程中应当至少收到一个行情事件")
 	}
 
+	deadline2 := time.After(time.Second)
+	for {
+		mu.Lock()
+		n := len(sessions)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		select {
+		case <-deadline2:
+			mu.Lock()
+			defer mu.Unlock()
+			t.Fatalf("服务端只收到 %d 次连接，期望至少 2 次", n)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
 	mu.Lock()
 	defer mu.Unlock()
-	if len(sessions) < 2 {
-		t.Fatalf("服务端只收到 %d 次连接，期望至少 2 次", len(sessions))
-	}
 	want := []string{"ticker/2", "market_stats/2", "account_market/2/411813"}
 	for i, got := range sessions[:2] {
 		if len(got) != len(want) {

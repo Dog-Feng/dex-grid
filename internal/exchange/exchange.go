@@ -43,8 +43,11 @@ type Exchange interface {
 
 	SetLeverage(ctx context.Context, symbol string, leverage int, mode market.MarginMode) error
 
+	// PlaceOrders 返回值必须与入参一一对应、顺序一致。
 	PlaceOrders(ctx context.Context, reqs []PlaceRequest) ([]PlaceResult, error)
+	// ModifyOrders 返回值必须与入参一一对应、顺序一致。
 	ModifyOrders(ctx context.Context, reqs []ModifyRequest) ([]ModifyResult, error)
+	// CancelOrders 返回值必须与入参一一对应、顺序一致。
 	CancelOrders(ctx context.Context, reqs []CancelRequest) ([]CancelResult, error)
 	// CancelAll 撤销指定交易对上的全部挂单，不得波及其他市场。
 	CancelAll(ctx context.Context, symbol string) error

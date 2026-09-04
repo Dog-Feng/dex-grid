@@ -20,6 +20,7 @@ const (
 	CmdResetStats
 	CmdReconnect
 	CmdSaveConfig
+	CmdView
 )
 
 func (k CommandKind) String() string {
@@ -40,6 +41,8 @@ func (k CommandKind) String() string {
 		return "reconnect"
 	case CmdSaveConfig:
 		return "save_config"
+	case CmdView:
+		return "view"
 	default:
 		return "unknown"
 	}

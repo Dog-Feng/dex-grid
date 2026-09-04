@@ -158,6 +158,16 @@ func (s *Store) migrateFillsSymbol() error {
 		}
 	}
 	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_fills_ex_symbol_ts ON fills(exchange, symbol, ts DESC)`)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`
+UPDATE fills SET symbol = (
+    SELECT symbol FROM strategy_configs WHERE strategy_configs.exchange = fills.exchange
+)
+WHERE symbol = '' AND EXISTS (
+    SELECT 1 FROM strategy_configs WHERE strategy_configs.exchange = fills.exchange
+)`)
 	return err
 }
 
@@ -303,10 +313,22 @@ func (s *Store) fillProgress(exchange string, coid order.ClientOrderID) (qty, no
 		}
 		q, err := decimal.NewFromString(qStr)
 		if err != nil {
-			continue
+			return decimal.Zero, decimal.Zero, decimal.Zero,
+				fmt.Errorf("store: fills 数据损坏 exchange=%s coid=%d qty=%q: %w",
+					exchange, coid, qStr, err)
 		}
-		p, _ := decimal.NewFromString(pStr)
-		f, _ := decimal.NewFromString(fStr)
+		p, err := decimal.NewFromString(pStr)
+		if err != nil {
+			return decimal.Zero, decimal.Zero, decimal.Zero,
+				fmt.Errorf("store: fills 数据损坏 exchange=%s coid=%d price=%q: %w",
+					exchange, coid, pStr, err)
+		}
+		f, err := decimal.NewFromString(fStr)
+		if err != nil {
+			return decimal.Zero, decimal.Zero, decimal.Zero,
+				fmt.Errorf("store: fills 数据损坏 exchange=%s coid=%d fee=%q: %w",
+					exchange, coid, fStr, err)
+		}
 		qty = qty.Add(q)
 		notional = notional.Add(q.Mul(p))
 		fee = fee.Add(f)
@@ -328,7 +350,7 @@ SELECT id, exchange, symbol, coid, side, price, qty, fee, is_maker, ts
 FROM fills WHERE exchange=? AND ts>=?`
 	args := []any{exchange, resetAt}
 	if symbol != "" {
-		q += ` AND (symbol=? OR symbol='')`
+		q += ` AND symbol=?`
 		args = append(args, symbol)
 	}
 	q += ` ORDER BY ts DESC, id DESC LIMIT ?`

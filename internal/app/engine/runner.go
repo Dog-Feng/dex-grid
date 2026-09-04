@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"dex-grid/internal/app/entry"
@@ -43,8 +44,8 @@ type Runner struct {
 
 	commands chan Command
 
-	status      Status
-	stopReason  strategy.StopReason
+	status     atomic.Uint32
+	stopReason strategy.StopReason
 	residual    bool
 	symbol      string
 	epoch       uint16
@@ -62,6 +63,11 @@ type Runner struct {
 	stopping     bool
 	pendingStop  strategy.StopReason // 风控止盈：先 maker 跟价平到 0，成交后再 finishStop
 	lastWatchdog time.Time
+	lastPersist  time.Time
+
+	loop            atomic.Bool
+	lastResubscribe time.Time
+	resubBackoff    time.Duration
 }
 
 // New 构造一个处于 Stopped 的 Runner。调用 Run 或 Do 之后才开始工作。
@@ -84,18 +90,19 @@ func New(ex exchange.StreamingExchange, strat strategy.Strategy, cfg Config) *Ru
 		strat:    strat,
 		cfg:      cfg,
 		commands: make(chan Command, 8),
-		status:   StatusStopped,
 	}
 }
 
 // Run 阻塞运行事件循环，直到 ctx 取消。
 func (r *Runner) Run(ctx context.Context) error {
+	r.loop.Store(true)
+	defer r.loop.Store(false)
 	ticker := time.NewTicker(r.cfg.TickInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			if r.status != StatusStopped && r.status != StatusError {
+			if r.Status() != StatusStopped && r.Status() != StatusError {
 				r.finishStop(context.WithoutCancel(ctx), strategy.StopShutdown)
 			}
 			return ctx.Err()
@@ -107,21 +114,25 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 
 		case se, ok := <-r.stream:
-			if r.stream == nil {
-				continue
-			}
 			if !ok {
-				r.status = StatusReconnecting
-				_ = r.resubscribe(ctx)
+				r.setStatus(StatusReconnecting)
+				if err := r.resubscribe(ctx); err != nil {
+					r.log.Error("resubscribe failed", "err", err)
+					continue
+				}
+				r.syncStatus()
 				continue
 			}
 			r.onStream(ctx, se)
 
 		case t := <-ticker.C:
-			if r.status == StatusRunning || r.status == StatusStarting || r.status == StatusPaused {
+			if r.Status() == StatusRunning || r.Status() == StatusStarting || r.Status() == StatusPaused {
 				r.dispatch(ctx, strategy.TickEvent{Now: t})
 			}
-			if r.status == StatusRunning && !r.entering {
+			if r.Status() == StatusReconnecting {
+				r.staleReconnect(ctx, t)
+			}
+			if r.Status() == StatusRunning && !r.entering {
 				r.maybeWatchdog(ctx, t)
 			}
 		}
@@ -170,13 +181,24 @@ func (r *Runner) Drain(ctx context.Context) {
 }
 
 // Status 返回当前对外状态。
-func (r *Runner) Status() Status { return r.status }
+func (r *Runner) Status() Status { return Status(r.status.Load()) }
 
-// View 返回控制台聚合视图。
+func (r *Runner) setStatus(s Status) { r.status.Store(uint32(s)) }
+
+// ViewSafe 从事件循环内部取视图快照。Run 未运行时直接读（此时无并发）。
+func (r *Runner) ViewSafe(ctx context.Context) InstanceView {
+	if !r.loop.Load() {
+		return r.View()
+	}
+	res := r.Call(ctx, CmdView, nil)
+	return res.View
+}
+
+// View 返回控制台聚合视图。仅允许在 Runner goroutine 内或 Run 未启动时调用。
 func (r *Runner) View() InstanceView {
 	v := InstanceView{
 		Exchange: r.cfg.Name,
-		Status:   r.status.String(),
+		Status:   r.Status().String(),
 		Residual: r.residual,
 		Entering: r.entering,
 		Symbol:   r.symbol,
@@ -184,7 +206,7 @@ func (r *Runner) View() InstanceView {
 		Position: r.state.Position,
 		Account:  r.state.Account,
 	}
-	if r.stopReason != 0 || r.status == StatusStopped {
+	if r.stopReason != 0 || r.Status() == StatusStopped {
 		v.StopReason = r.stopReason.String()
 	}
 	if r.strat != nil {
@@ -204,9 +226,12 @@ func (r *Runner) handleCommand(ctx context.Context, cmd Command) CommandResult {
 		if err := r.resubscribe(ctx); err != nil {
 			return r.failResult(err.Error())
 		}
+		r.syncStatus()
 		return CommandResult{OK: true, View: r.View()}
 	case CmdSaveConfig:
 		return r.failResult("配置持久化尚未接入")
+	case CmdView:
+		return CommandResult{OK: true, View: r.View()}
 	case CmdAdjustRange, CmdCancelOrders, CmdRefill, CmdResetStats:
 		return r.handleStrategyCommand(ctx, cmd)
 	default:
@@ -215,7 +240,7 @@ func (r *Runner) handleCommand(ctx context.Context, cmd Command) CommandResult {
 }
 
 func (r *Runner) handleStart(ctx context.Context, p StartPayload) CommandResult {
-	if r.status == StatusRunning || r.status == StatusStarting {
+	if r.Status() == StatusRunning || r.Status() == StatusStarting {
 		return r.failResult("实例已在运行")
 	}
 	if p.Symbol == "" {
@@ -281,6 +306,7 @@ func (r *Runner) handleStart(ctx context.Context, p StartPayload) CommandResult 
 	r.guard.SetPosition(pos)
 	r.guard.SetAccount(acct)
 	r.guard.SetMark(r.state.Mark, r.state.Book, now)
+	r.guard.SetLast(tick.Last)
 
 	r.exec = executor.New(r.ex, executor.Options{
 		Symbol:     p.Symbol,
@@ -291,7 +317,7 @@ func (r *Runner) handleStart(ctx context.Context, p StartPayload) CommandResult 
 		Log:        r.log,
 	})
 
-	r.status = StatusStarting
+	r.setStatus(StatusStarting)
 	r.stopReason = 0
 	r.pendingStop = 0
 	r.residual = false
@@ -299,14 +325,15 @@ func (r *Runner) handleStart(ctx context.Context, p StartPayload) CommandResult 
 
 	acts, err := r.strat.Init(r.state)
 	if err != nil {
-		r.status = StatusStopped
+		r.setStatus(StatusStopped)
 		return r.failResult(err.Error())
 	}
 	r.epoch = r.strat.View().Epoch
 	r.exec.SetEpoch(r.epoch)
+	r.refreshTriggerSides()
 
 	if err := r.subscribe(ctx); err != nil {
-		r.status = StatusStopped
+		r.setStatus(StatusStopped)
 		return r.failResult(err.Error())
 	}
 
@@ -320,7 +347,7 @@ func (r *Runner) handleStart(ctx context.Context, p StartPayload) CommandResult 
 }
 
 func (r *Runner) handleStop(ctx context.Context) CommandResult {
-	if r.status == StatusStopped {
+	if r.Status() == StatusStopped {
 		return CommandResult{OK: true, Message: "already stopped", View: r.View()}
 	}
 	r.finishStop(ctx, strategy.StopManual)
@@ -329,7 +356,7 @@ func (r *Runner) handleStop(ctx context.Context) CommandResult {
 }
 
 func (r *Runner) handleStrategyCommand(ctx context.Context, cmd Command) CommandResult {
-	if r.status != StatusRunning && r.status != StatusPaused && r.status != StatusStarting {
+	if r.Status() != StatusRunning && r.Status() != StatusPaused && r.Status() != StatusStarting {
 		return r.failResult("当前状态不能执行 " + cmd.Kind.String())
 	}
 	sk, ok := toStrategyKind(cmd.Kind)
@@ -359,6 +386,7 @@ func (r *Runner) onStream(ctx context.Context, se exchange.StreamEvent) {
 	}
 	if se.Err != nil {
 		r.log.Warn("stream error", "err", se.Err)
+		r.setStatus(StatusReconnecting)
 		return
 	}
 	if se.Resync {
@@ -372,7 +400,8 @@ func (r *Runner) onStream(ctx context.Context, se exchange.StreamEvent) {
 		if se.Ticker.Mark.IsPositive() {
 			r.state.Mark = se.Ticker.Mark
 		}
-		r.dispatch(ctx, strategy.BookEvent{Book: r.state.Book, Mark: r.state.Mark, Now: now})
+		last := se.Ticker.Last
+		r.dispatch(ctx, strategy.BookEvent{Book: r.state.Book, Mark: r.state.Mark, Last: last, Now: now})
 	}
 	if se.Order != nil {
 		r.recordFill(*se.Order)
@@ -399,15 +428,15 @@ func (r *Runner) onStream(ctx context.Context, se exchange.StreamEvent) {
 }
 
 func (r *Runner) dispatch(ctx context.Context, ev strategy.Event) {
-	if r.status != StatusRunning && r.status != StatusStarting {
+	// Paused 仍要把行情、成交和止损交给策略：区间外回归、反弹平仓、止损都不能停。
+	if r.Status() != StatusRunning && r.Status() != StatusStarting && r.Status() != StatusPaused {
 		r.updateViewOnly(ev)
 		return
 	}
 	if r.guard != nil && r.pendingStop == 0 {
 		v := r.guard.Check(ev)
 		if v.Reconnect {
-			r.log.Warn("market data stale, reconnecting")
-			_ = r.resubscribe(ctx)
+			r.staleReconnect(ctx, ev.At())
 			return
 		}
 		if v.Stop {
@@ -417,12 +446,15 @@ func (r *Runner) dispatch(ctx context.Context, ev strategy.Event) {
 				return
 			}
 			r.apply(ctx, v.Actions, ev.At())
-			r.finishStop(ctx, v.Reason)
+			if r.Status() != StatusStopped && r.Status() != StatusError {
+				r.finishStop(ctx, v.Reason)
+			}
 			return
 		}
 	}
 	r.route(ctx, ev)
 	r.syncStatus()
+	r.persistSoon()
 }
 
 func (r *Runner) route(ctx context.Context, ev strategy.Event) {
@@ -478,7 +510,7 @@ func (r *Runner) apply(ctx context.Context, acts []strategy.Action, now time.Tim
 	}
 	r.syncEpoch()
 	if r.guard != nil && r.guard.BlockOpens() {
-		acts = risk.FilterOpens(acts)
+		acts = risk.FilterOpens(acts, r.state.Position)
 		if len(acts) == 0 {
 			return
 		}
@@ -489,6 +521,9 @@ func (r *Runner) apply(ctx context.Context, acts []strategy.Action, now time.Tim
 			r.exec.Apply(ctx, stripControl(v.Actions))
 			r.finishStop(ctx, v.Reason)
 			return
+		}
+		if res.InsufficientMargin {
+			r.guard.NoteInsufficientMargin()
 		}
 	} else if res.Fatal != nil {
 		r.fail(ctx, res.Fatal)
@@ -504,6 +539,7 @@ func (r *Runner) apply(ctx context.Context, acts []strategy.Action, now time.Tim
 	if res.Stop != nil && r.pendingStop == 0 {
 		r.finishStop(ctx, res.Stop.Reason)
 	}
+	r.persistSoon()
 }
 
 func (r *Runner) startEntry(ctx context.Context, req strategy.EnsurePosition, now time.Time) {
@@ -529,7 +565,7 @@ func (r *Runner) startEntry(ctx context.Context, req strategy.EnsurePosition, no
 		return
 	}
 	r.entering = true
-	r.status = StatusStarting
+	r.setStatus(StatusStarting)
 	r.apply(ctx, acts, now)
 }
 
@@ -544,7 +580,7 @@ func (r *Runner) completePendingStop(ctx context.Context) bool {
 }
 
 func (r *Runner) finishStop(ctx context.Context, reason strategy.StopReason) {
-	if r.status == StatusStopped && r.stopping {
+	if r.stopping || r.Status() == StatusStopped || r.Status() == StatusError {
 		return
 	}
 	r.stopping = true
@@ -555,13 +591,14 @@ func (r *Runner) finishStop(ctx context.Context, reason strategy.StopReason) {
 		r.log.Error("strategy OnStop failed", "err", err)
 	} else {
 		r.refreshPosition(ctx)
-		// 止盈若仓位还在，不能 CancelAll，否则刚挂上的 maker 平仓单会被撤掉。
-		if reason != strategy.StopTakeProfit || r.state.Position.IsFlat() {
+		// 止盈/止损的平仓单还在场上时不能再 CancelAll，否则刚挂上的 IOC/maker 会被撤掉。
+		keepClose := (reason == strategy.StopTakeProfit || reason == strategy.StopStopLoss) && !r.state.Position.IsFlat()
+		if !keepClose {
 			r.execApplyQuiet(ctx, stripControl(acts))
 		}
 	}
 	r.refreshPosition(ctx)
-	r.status = StatusStopped
+	r.setStatus(StatusStopped)
 	r.stopReason = reason
 	r.residual = !r.state.Position.IsFlat()
 	r.stopping = false
@@ -572,7 +609,7 @@ func (r *Runner) finishStop(ctx context.Context, reason strategy.StopReason) {
 func (r *Runner) fail(ctx context.Context, err error) {
 	r.log.Error("instance failed", "err", err)
 	r.finishStop(ctx, strategy.StopError)
-	r.status = StatusError
+	r.setStatus(StatusError)
 }
 
 func (r *Runner) execApplyQuiet(ctx context.Context, acts []strategy.Action) {
@@ -604,6 +641,42 @@ func (r *Runner) syncEpoch() {
 	if r.exec != nil {
 		r.exec.SetEpoch(ep)
 	}
+	r.lastFillQty = nil
+	r.refreshTriggerSides()
+}
+
+func (r *Runner) refreshTriggerSides() {
+	if r.guard == nil || r.strat == nil {
+		return
+	}
+	v := r.strat.View()
+	sl, tp := r.riskP.StopLossPrice, r.riskP.TakeProfitPrice
+	r.guard.SetTriggerSides(sl.IsPositive() && sl.LessThan(v.LowerPrice), tp.IsPositive() && tp.GreaterThan(v.UpperPrice))
+}
+
+func (r *Runner) staleReconnect(ctx context.Context, now time.Time) {
+	if r.resubBackoff <= 0 {
+		r.resubBackoff = 5 * time.Second
+	}
+	if !r.lastResubscribe.IsZero() && now.Sub(r.lastResubscribe) < r.resubBackoff {
+		return
+	}
+	r.lastResubscribe = now
+	r.log.Warn("market data stale, reconnecting", "backoff", r.resubBackoff)
+	if err := r.resubscribe(ctx); err != nil {
+		r.log.Error("resubscribe failed", "err", err)
+		r.resubBackoff *= 2
+		if r.resubBackoff > 2*time.Minute {
+			r.resubBackoff = 2 * time.Minute
+		}
+		return
+	}
+	r.resubBackoff = 5 * time.Second
+	if r.guard != nil {
+		r.guard.NoteReconnect(now)
+		r.guard.SetMark(r.state.Mark, r.state.Book, now)
+	}
+	r.syncStatus()
 }
 
 func (r *Runner) subscribe(ctx context.Context) error {
@@ -728,13 +801,17 @@ func (r *Runner) reconcile(ctx context.Context) error {
 		r.guard.SetPosition(pos)
 		r.guard.SetAccount(acct)
 		r.guard.SetMark(r.state.Mark, r.state.Book, time.Now().UTC())
+		r.guard.SetLast(tick.Last)
 	}
 
 	var cancels []strategy.Action
 	var ours []order.Order
 	for _, o := range orders {
+		if !o.ClientOrderID.Valid() {
+			continue // 解不出本系统 COID 的手工单不动
+		}
 		ref := o.ClientOrderID.Decode()
-		if !o.ClientOrderID.Valid() || ref.Slot != r.cfg.Slot || (r.epoch > 0 && ref.Epoch != r.epoch) {
+		if ref.Slot != r.cfg.Slot || (r.epoch > 0 && ref.Epoch != r.epoch) {
 			cancels = append(cancels, strategy.CancelOrder{ClientOrderID: o.ClientOrderID})
 			continue
 		}
@@ -743,7 +820,7 @@ func (r *Runner) reconcile(ctx context.Context) error {
 	if len(cancels) > 0 {
 		r.execApplyQuiet(ctx, cancels)
 	}
-	if r.status == StatusRunning || r.status == StatusStarting {
+	if r.Status() == StatusRunning || r.Status() == StatusStarting {
 		r.dispatch(ctx, strategy.ResyncEvent{
 			Position: pos,
 			Account:  acct,
@@ -764,22 +841,23 @@ func (r *Runner) updateViewOnly(ev strategy.Event) {
 	case strategy.PositionEvent:
 		r.state.Position = e.Position
 		r.state.Account = e.Account
+		r.residual = !e.Position.IsFlat()
 	}
 }
 
 func (r *Runner) syncStatus() {
-	if r.status == StatusError || r.status == StatusReconnecting || r.status == StatusStopped {
+	if r.Status() == StatusError || r.Status() == StatusStopped {
 		return
 	}
 	switch r.strat.View().Phase {
 	case strategy.PhaseOutOfRange, strategy.PhasePaused:
-		r.status = StatusPaused
+		r.setStatus(StatusPaused)
 	case strategy.PhaseEntering:
-		r.status = StatusStarting
+		r.setStatus(StatusStarting)
 	case strategy.PhaseRunning:
-		r.status = StatusRunning
+		r.setStatus(StatusRunning)
 	case strategy.PhaseStopped:
-		r.status = StatusStopped
+		r.setStatus(StatusStopped)
 	}
 }
 
@@ -844,6 +922,9 @@ func (r *Runner) logOrderFill(o order.Order) {
 	}
 	r.log.Info(fmt.Sprintf("%s成交 %s × %s", side, px, delta),
 		"symbol", r.symbol, "side", o.Side.String(), "price", px.String(), "qty", delta.String())
+	if o.State.IsTerminal() {
+		delete(r.lastFillQty, o.ClientOrderID)
+	}
 }
 
 func gridDirCN(dir string) string {

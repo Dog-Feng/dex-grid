@@ -305,6 +305,22 @@ func (g *Grid) OnFill(index int, side order.Side) FillResult {
 	return res
 }
 
+// PivotCell 返回现价所在格子的索引；现价在区间外时返回最近的边界格。
+func (g *Grid) PivotCell(mark decimal.Decimal) int {
+	if len(g.Cells) == 0 {
+		return 0
+	}
+	for i := range g.Cells {
+		if mark.GreaterThanOrEqual(g.Cells[i].Low) && mark.LessThan(g.Cells[i].High) {
+			return i
+		}
+	}
+	if mark.LessThan(g.Lower()) {
+		return 0
+	}
+	return len(g.Cells) - 1
+}
+
 // ActiveWindow 返回在挂单窗口限制下应该挂单的格子索引集合。
 //
 // maxActive 为 0 时返回全部格子。否则只保留距现价最近的若干格，
@@ -318,13 +334,7 @@ func (g *Grid) ActiveWindow(mark decimal.Decimal, maxActive int) map[int]bool {
 		return out
 	}
 
-	// 找到距现价最近的格子，向两侧扩散。
-	pivot := 0
-	for i := range g.Cells {
-		if g.Cells[i].High.LessThanOrEqual(mark) {
-			pivot = i
-		}
-	}
+	pivot := g.PivotCell(mark)
 	lo, hi := pivot, pivot
 	out[pivot] = true
 	for len(out) < maxActive {

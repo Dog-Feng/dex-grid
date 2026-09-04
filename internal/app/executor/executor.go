@@ -42,11 +42,12 @@ type Progress struct {
 
 // Results 是一次 Apply 的汇总。
 type Results struct {
-	Events   []strategy.Event
-	Failures int
-	Fatal    error
-	Stop     *strategy.Stop
-	Ensure   *strategy.EnsurePosition
+	Events             []strategy.Event
+	Failures           int
+	Fatal              error
+	Stop               *strategy.Stop
+	Ensure             *strategy.EnsurePosition
+	InsufficientMargin bool
 }
 
 // Executor 把 Action 列表同步执行完再返回。
@@ -226,6 +227,10 @@ func (e *Executor) place(ctx context.Context, places []strategy.PlaceOrder, now 
 				return
 			}
 			results, err := e.ex.PlaceOrders(ctx, chunk)
+			if err == nil && len(results) != len(chunk) {
+				err = exchange.Classify(exchange.ClassUnknown, "place_order",
+					fmt.Errorf("适配器返回 %d 条结果，请求 %d 条", len(results), len(chunk)))
+			}
 			if err != nil {
 				class := exchange.ClassOf(err)
 				if class == exchange.ClassFatal {
@@ -258,7 +263,7 @@ func (e *Executor) place(ctx context.Context, places []strategy.PlaceOrder, now 
 							Price:         req.Price,
 							Quantity:      req.Quantity,
 							ReduceOnly:    req.ReduceOnly,
-							State:         order.StatePending,
+							State:         order.StateOpen,
 							UpdatedAt:     now,
 						},
 						Now: now,
@@ -266,6 +271,26 @@ func (e *Executor) place(ctx context.Context, places []strategy.PlaceOrder, now 
 					continue
 				}
 				class := exchange.ClassOf(r.Err)
+				if class == exchange.ClassDuplicate {
+					e.progress.Confirmed++
+					res.Events = append(res.Events, strategy.OrderEvent{
+						Order: order.Order{
+							ClientOrderID: req.ClientOrderID,
+							ExchangeID:    r.ExchangeID,
+							Symbol:        e.opts.Symbol,
+							Side:          req.Side,
+							Type:          req.Type,
+							TIF:           req.TIF,
+							Price:         req.Price,
+							Quantity:      req.Quantity,
+							ReduceOnly:    req.ReduceOnly,
+							State:         order.StateOpen,
+							UpdatedAt:     now,
+						},
+						Now: now,
+					})
+					continue
+				}
 				if class.Retryable() && attempt < e.opts.MaxRetries {
 					retry = append(retry, req)
 					continue
@@ -344,6 +369,10 @@ func (e *Executor) modify(ctx context.Context, mods []strategy.ModifyOrder, now 
 				return
 			}
 			results, err := e.ex.ModifyOrders(ctx, chunk)
+			if err == nil && len(results) != len(chunk) {
+				err = exchange.Classify(exchange.ClassUnknown, "modify_order",
+					fmt.Errorf("适配器返回 %d 条结果，请求 %d 条", len(results), len(chunk)))
+			}
 			if err != nil {
 				class := exchange.ClassOf(err)
 				if class == exchange.ClassFatal {
@@ -409,6 +438,10 @@ func (e *Executor) cancel(ctx context.Context, cancels []strategy.CancelOrder, n
 			return
 		}
 		results, err := e.ex.CancelOrders(ctx, chunk)
+		if err == nil && len(results) != len(chunk) {
+			err = exchange.Classify(exchange.ClassUnknown, "cancel_order",
+				fmt.Errorf("适配器返回 %d 条结果，请求 %d 条", len(results), len(chunk)))
+		}
 		if err != nil {
 			if exchange.ClassOf(err) == exchange.ClassFatal {
 				res.Fatal = err
@@ -422,6 +455,10 @@ func (e *Executor) cancel(ctx context.Context, cancels []strategy.CancelOrder, n
 					return
 				}
 				results, err = e.ex.CancelOrders(ctx, chunk)
+				if err == nil && len(results) != len(chunk) {
+					err = exchange.Classify(exchange.ClassUnknown, "cancel_order",
+						fmt.Errorf("适配器返回 %d 条结果，请求 %d 条", len(results), len(chunk)))
+				}
 			}
 			if err != nil {
 				e.recordClass(exchange.ClassOf(err), res)
@@ -433,8 +470,15 @@ func (e *Executor) cancel(ctx context.Context, cancels []strategy.CancelOrder, n
 				continue
 			}
 			e.recordClass(exchange.ClassOf(r.Err), res)
-			_ = now
-			_ = chunk[i]
+			res.Events = append(res.Events, strategy.OrderEvent{
+				Order: order.Order{
+					ClientOrderID: chunk[i].ClientOrderID,
+					Symbol:        e.opts.Symbol,
+					State:         order.StateOpen,
+					UpdatedAt:     now,
+				},
+				Now: now,
+			})
 		}
 	}
 }
@@ -544,6 +588,10 @@ func (e *Executor) noteError(err error, res *Results) {
 }
 
 func (e *Executor) recordClass(class exchange.ErrorClass, res *Results) {
+	if class == exchange.ClassInsufficientMargin {
+		res.InsufficientMargin = true
+		return
+	}
 	if class.CountsAsFailure() {
 		res.Failures++
 		e.fails++

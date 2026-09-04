@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"sync"
 	"time"
 
@@ -34,12 +35,21 @@ type Supervisor struct {
 }
 
 type instance struct {
-	name   string
-	slot   uint8
-	ex     exchange.StreamingExchange
-	exCfg  config.Exchange
-	runner *engine.Runner
-	cancel context.CancelFunc
+	name  string
+	slot  uint8
+	ex    exchange.StreamingExchange
+	exCfg config.Exchange
+
+	mu      sync.RWMutex
+	runner  *engine.Runner
+	cancel  context.CancelFunc
+	runDone chan struct{}
+}
+
+func (i *instance) currentRunner() *engine.Runner {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.runner
 }
 
 // New 构造 Supervisor，不创建交易所连接。调用 Attach 注入适配器。
@@ -67,14 +77,33 @@ func (s *Supervisor) Attach(exCfg config.Exchange, ex exchange.StreamingExchange
 // Close 停止所有 Runner 并关闭交易所连接。
 func (s *Supervisor) Close(ctx context.Context) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	list := make([]*instance, 0, len(s.inst))
 	for _, inst := range s.inst {
-		if inst.runner != nil && inst.runner.Status() != engine.StatusStopped {
-			_ = inst.runner.Call(ctx, engine.CmdStop, nil)
+		list = append(list, inst)
+	}
+	s.mu.Unlock()
+
+	for _, inst := range list {
+		r := inst.currentRunner()
+		if r != nil && r.Status() != engine.StatusStopped {
+			_ = r.Call(ctx, engine.CmdStop, nil)
 		}
+		inst.mu.Lock()
 		if inst.cancel != nil {
 			inst.cancel()
+			inst.cancel = nil
 		}
+		done := inst.runDone
+		inst.mu.Unlock()
+		if done == nil {
+			continue
+		}
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+	}
+	for _, inst := range list {
 		_ = inst.ex.Close()
 	}
 }
@@ -96,8 +125,8 @@ func (s *Supervisor) SystemStatus() map[string]any {
 	exs := make([]map[string]any, 0, len(s.inst))
 	for _, inst := range s.inst {
 		st := "idle"
-		if inst.runner != nil {
-			st = inst.runner.Status().String()
+		if r := inst.currentRunner(); r != nil {
+			st = r.Status().String()
 		}
 		exs = append(exs, map[string]any{
 			"name":   inst.name,
@@ -214,8 +243,8 @@ func (s *Supervisor) PutConfig(ctx context.Context, name string, raw []byte) (an
 	if err != nil {
 		return nil, err
 	}
-	if inst.runner != nil {
-		st := inst.runner.Status()
+	if r := inst.currentRunner(); r != nil {
+		st := r.Status()
 		if st == engine.StatusRunning || st == engine.StatusStarting {
 			return nil, fmt.Errorf("实例运行中，不能修改配置")
 		}
@@ -241,20 +270,21 @@ func (s *Supervisor) PutConfig(ctx context.Context, name string, raw []byte) (an
 }
 
 // View 返回实例聚合视图。
-func (s *Supervisor) View(name string) (engine.InstanceView, error) {
+func (s *Supervisor) View(ctx context.Context, name string) (engine.InstanceView, error) {
 	inst, err := s.get(name)
 	if err != nil {
 		return engine.InstanceView{}, err
 	}
-	if inst.runner == nil {
+	r := inst.currentRunner()
+	if r == nil {
 		return engine.InstanceView{Exchange: name, Status: engine.StatusStopped.String()}, nil
 	}
-	return inst.runner.View(), nil
+	return r.ViewSafe(ctx), nil
 }
 
 // Status 返回页面「账户状态」所需的视图，未运行时也补上账户与行情。
 func (s *Supervisor) Status(ctx context.Context, name string) (engine.InstanceView, error) {
-	view, err := s.View(name)
+	view, err := s.View(ctx, name)
 	if err != nil {
 		return view, err
 	}
@@ -289,12 +319,17 @@ func (s *Supervisor) Status(ctx context.Context, name string) (engine.InstanceVi
 	return view, nil
 }
 
-// Proxy 返回代理配置的只读视图（不含密码）。
+// Proxy 返回代理配置的只读视图（不含用户名密码）。
 func (s *Supervisor) Proxy() map[string]any {
 	p := s.cfg.Proxy
+	safe := p.URL
+	if u, err := url.Parse(p.URL); err == nil && u.User != nil {
+		u.User = nil
+		safe = u.String()
+	}
 	return map[string]any{
 		"enabled":  p.Enabled,
-		"url":      p.URL,
+		"url":      safe,
 		"no_proxy": p.NoProxy,
 	}
 }
@@ -305,7 +340,7 @@ func (s *Supervisor) Trades(name string, limit int) ([]store.Fill, error) {
 		return nil, err
 	}
 	symbol := ""
-	if view, err := s.View(name); err == nil {
+	if view, err := s.View(context.Background(), name); err == nil {
 		symbol = view.Symbol
 	}
 	symbol = s.strategySymbol(name, symbol)
@@ -350,7 +385,11 @@ func (s *Supervisor) Start(ctx context.Context, name string) (engine.InstanceVie
 	if err := s.ensureRunner(inst, common.Strategy, c.Params, false); err != nil {
 		return engine.InstanceView{}, err
 	}
-	res := inst.runner.Call(ctx, engine.CmdStart, engine.StartPayload{
+	r := inst.currentRunner()
+	if r == nil {
+		return engine.InstanceView{}, fmt.Errorf("实例尚未启动")
+	}
+	res := r.Call(ctx, engine.CmdStart, engine.StartPayload{
 		Symbol: common.Symbol,
 		Entry:  common.Entry,
 		Risk:   common.Risk,
@@ -385,7 +424,7 @@ func (s *Supervisor) ResetStats(ctx context.Context, name string) (engine.Instan
 	if err != nil {
 		return engine.InstanceView{}, err
 	}
-	if inst.runner == nil {
+	if inst.currentRunner() == nil {
 		return engine.InstanceView{Exchange: name, Status: engine.StatusStopped.String()}, nil
 	}
 	return s.command(ctx, name, engine.CmdResetStats, nil)
@@ -406,10 +445,11 @@ func (s *Supervisor) command(ctx context.Context, name string, kind engine.Comma
 	if err != nil {
 		return engine.InstanceView{}, err
 	}
-	if inst.runner == nil {
+	r := inst.currentRunner()
+	if r == nil {
 		return engine.InstanceView{}, fmt.Errorf("实例尚未启动")
 	}
-	res := inst.runner.Call(ctx, kind, payload)
+	res := r.Call(ctx, kind, payload)
 	if !res.OK {
 		return res.View, fmt.Errorf("%s", res.Message)
 	}
@@ -419,9 +459,12 @@ func (s *Supervisor) command(ctx context.Context, name string, kind engine.Comma
 func (s *Supervisor) ensureRunner(inst *instance, name string, params []byte, restore bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	inst.mu.Lock()
 	if inst.runner != nil {
 		st := inst.runner.Status()
 		if st == engine.StatusRunning || st == engine.StatusStarting {
+			inst.mu.Unlock()
 			return nil
 		}
 	}
@@ -429,6 +472,18 @@ func (s *Supervisor) ensureRunner(inst *instance, name string, params []byte, re
 		inst.cancel()
 		inst.cancel = nil
 	}
+	done := inst.runDone
+	inst.mu.Unlock()
+
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			s.log.Error("旧事件循环退出超时，放弃重建", "exchange", inst.name)
+			return fmt.Errorf("实例 %s 上一轮尚未退出", inst.name)
+		}
+	}
+
 	if name == "" {
 		name = strategy.NameOf(params)
 	}
@@ -443,7 +498,8 @@ func (s *Supervisor) ensureRunner(inst *instance, name string, params []byte, re
 			}
 		}
 	}
-	inst.runner = engine.New(inst.ex, strat, engine.Config{
+
+	runner := engine.New(inst.ex, strat, engine.Config{
 		Name:             inst.name,
 		Slot:             inst.slot,
 		TickInterval:     s.cfg.App.TickInterval.Std(),
@@ -453,8 +509,18 @@ func (s *Supervisor) ensureRunner(inst *instance, name string, params []byte, re
 		Persist:          persistAdapter{store: s.store},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+
+	inst.mu.Lock()
+	inst.runner = runner
 	inst.cancel = cancel
-	go func() { _ = inst.runner.Run(ctx) }()
+	inst.runDone = runDone
+	inst.mu.Unlock()
+
+	go func() {
+		defer close(runDone)
+		_ = runner.Run(ctx)
+	}()
 	return nil
 }
 
@@ -496,8 +562,8 @@ func (s *Supervisor) Autostart(ctx context.Context) {
 			s.log.Error("autostart skipped", "exchange", e.Name, "err", err)
 			continue
 		}
-		if inst.runner != nil {
-			st := inst.runner.Status()
+		if r := inst.currentRunner(); r != nil {
+			st := r.Status()
 			if st == engine.StatusRunning || st == engine.StatusStarting {
 				continue
 			}
@@ -509,7 +575,8 @@ func (s *Supervisor) Autostart(ctx context.Context) {
 	}
 }
 
-// RestoreRunning 进程启动时把上次 running 的实例拉起来。
+// RestoreRunning 进程启动时按快照恢复上次 running/starting/paused 的实例。
+// 必须 Restore 快照后再 Start：走用户 Start 会丢掉格子配对，当成全新开局。
 func (s *Supervisor) RestoreRunning(ctx context.Context) {
 	s.mu.RLock()
 	names := make([]string, 0, len(s.inst))
@@ -523,8 +590,37 @@ func (s *Supervisor) RestoreRunning(ctx context.Context) {
 			continue
 		}
 		s.log.Info("restoring instance", "exchange", name, "status", rt.Status)
-		if _, err := s.Start(ctx, name); err != nil {
+		inst, err := s.get(name)
+		if err != nil {
 			s.log.Error("restore failed", "exchange", name, "err", err)
+			continue
+		}
+		cfg, ok, err := s.store.LoadConfig(name)
+		if err != nil || !ok {
+			s.log.Error("restore failed: no saved config", "exchange", name, "err", err)
+			continue
+		}
+		common, err := strategy.ParseCommon(cfg.Params)
+		if err != nil {
+			s.log.Error("restore failed", "exchange", name, "err", err)
+			continue
+		}
+		if err := s.ensureRunner(inst, common.Strategy, cfg.Params, true); err != nil {
+			s.log.Error("restore failed", "exchange", name, "err", err)
+			continue
+		}
+		r := inst.currentRunner()
+		if r == nil {
+			s.log.Error("restore failed", "exchange", name, "err", "实例尚未启动")
+			continue
+		}
+		res := r.Call(ctx, engine.CmdStart, engine.StartPayload{
+			Symbol: common.Symbol,
+			Entry:  common.Entry,
+			Risk:   common.Risk,
+		})
+		if !res.OK {
+			s.log.Error("restore failed", "exchange", name, "err", res.Message)
 		}
 	}
 }

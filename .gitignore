@@ -19,6 +19,8 @@ config/config.yaml
 /gridbot.exe~
 /lighterctl
 /lighterctl.exe
+/sodexctl
+/sodexctl.exe
 *.exe~
 
 # 备份

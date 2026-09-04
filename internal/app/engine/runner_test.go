@@ -522,3 +522,176 @@ func TestMartingaleTakeProfitClearsOldEpochAdds(t *testing.T) {
 		}
 	}
 }
+
+func TestOutOfRangePauseResumesOnTick(t *testing.T) {
+	r, ex := newRunner(t, grid.Neutral)
+	startOK(t, r, strategy.DefaultRiskParams())
+
+	ex.SetMark(d("99"))
+	ex.SetBook(d("98.9"), d("99.1"))
+	r.Drain(context.Background())
+	if r.Status() != StatusPaused {
+		t.Fatalf("status = %s, want paused", r.Status())
+	}
+
+	ex.SetMark(d("150"))
+	ex.SetBook(d("149.9"), d("150.1"))
+	r.Drain(context.Background())
+	if r.Status() != StatusPaused {
+		t.Fatalf("status = %s, still confirming", r.Status())
+	}
+
+	r.dispatch(context.Background(), strategy.TickEvent{Now: time.Now().UTC().Add(10 * time.Second)})
+	if r.Status() != StatusRunning {
+		t.Fatalf("status = %s, want running after resume confirm", r.Status())
+	}
+}
+
+func TestStopLossFiresWhilePaused(t *testing.T) {
+	r, ex := newRunner(t, grid.Long)
+	riskP := strategy.DefaultRiskParams()
+	riskP.StopLossPrice = d("90")
+	res := r.Do(context.Background(), CmdStart, StartPayload{
+		Symbol: "BTC",
+		Entry: strategy.EntryParams{
+			Mode:          strategy.EntryMarket,
+			SliceCount:    1,
+			FillTolerance: d("0.01"),
+			MaxSlippage:   d("0.01"),
+		},
+		Risk: riskP,
+	})
+	if !res.OK {
+		t.Fatalf("start: %s", res.Message)
+	}
+	drainEntry(t, r, ex)
+
+	ex.SetMark(d("99"))
+	ex.SetBook(d("98.9"), d("99.1"))
+	r.Drain(context.Background())
+	if r.Status() != StatusPaused {
+		t.Fatalf("status = %s, want paused below range", r.Status())
+	}
+
+	ex.SetMark(d("89"))
+	ex.SetBook(d("88.9"), d("89.1"))
+	r.Drain(context.Background())
+	if r.Status() != StatusStopped && r.Status() != StatusError {
+		t.Fatalf("status = %s, want stopped by stop-loss while paused", r.Status())
+	}
+	if r.View().StopReason != strategy.StopStopLoss.String() {
+		t.Fatalf("reason = %s", r.View().StopReason)
+	}
+}
+
+func TestReconcileLeavesManualOrders(t *testing.T) {
+	r, ex := newRunner(t, grid.Neutral)
+	startOK(t, r, strategy.DefaultRiskParams())
+	r.Drain(context.Background())
+	before := len(ex.Resting())
+
+	manual := order.Order{
+		ClientOrderID: 1,
+		Side:          order.Buy,
+		Price:         d("90"),
+		Quantity:      d("1"),
+		State:         order.StateOpen,
+		Symbol:        "BTC",
+	}
+	ex.InjectOpenOrder(manual)
+	if err := r.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(ex.Resting()); n != before+1 {
+		t.Fatalf("resting = %d, want %d (manual order kept)", n, before+1)
+	}
+	found := false
+	for _, o := range ex.Resting() {
+		if o.ClientOrderID == 1 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("reconcile must not cancel undecodable manual orders")
+	}
+}
+
+func TestStartRestoresSnapshotEpoch(t *testing.T) {
+	r, _ := newRunner(t, grid.Neutral)
+	startOK(t, r, strategy.DefaultRiskParams())
+	adj := r.Do(context.Background(), CmdAdjustRange, grid.AdjustRange{LowerPrice: d("120"), UpperPrice: d("220")})
+	if !adj.OK {
+		t.Fatalf("adjust: %s", adj.Message)
+	}
+	epoch := r.View().Strategy.Epoch
+	if epoch < 2 {
+		t.Fatalf("epoch = %d after adjust", epoch)
+	}
+	blob, err := r.strat.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ex2 := fake.New(testMarket())
+	ex2.SetBook(d("149.9"), d("150.1"))
+	ex2.SetMark(d("150"))
+	raw, err := json.Marshal(smallParams(grid.Neutral))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := grid.New(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Restore(blob); err != nil {
+		t.Fatal(err)
+	}
+	r2 := New(ex2, s2, Config{Name: "fake", Slot: 0, TickInterval: time.Second, MaxRetries: 2})
+	res := r2.Do(context.Background(), CmdStart, StartPayload{
+		Symbol: "BTC",
+		Entry:  strategy.DefaultEntryParams(),
+		Risk:   strategy.DefaultRiskParams(),
+	})
+	if !res.OK {
+		t.Fatalf("restore start: %s", res.Message)
+	}
+	if r2.View().Strategy.Epoch != epoch {
+		t.Fatalf("restored epoch = %d, want %d", r2.View().Strategy.Epoch, epoch)
+	}
+}
+
+func TestViewSafeFromHTTPGoroutine(t *testing.T) {
+	r, _ := newRunner(t, grid.Neutral)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- r.Run(ctx) }()
+
+	deadline := time.Now().Add(time.Second)
+	for !r.loop.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("event loop did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	res := r.Call(ctx, CmdStart, StartPayload{
+		Symbol: "BTC",
+		Entry:  strategy.DefaultEntryParams(),
+		Risk:   strategy.DefaultRiskParams(),
+	})
+	if !res.OK {
+		t.Fatalf("start: %s", res.Message)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			_ = r.ViewSafe(ctx)
+		}
+	}()
+	<-done
+	cancel()
+	<-errCh
+}

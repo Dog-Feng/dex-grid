@@ -25,6 +25,10 @@ const (
 	ClassInvalidParam
 	// ClassFatal 签名失败、认证失败。立刻熔断。
 	ClassFatal
+	// ClassNonceStale 本地 nonce 与服务端脱节：必须重新取号后再重试。
+	ClassNonceStale
+	// ClassDuplicate 客户端订单号重复：原单仍然存活，意图已经生效，不算失败。
+	ClassDuplicate
 )
 
 func (c ErrorClass) String() string {
@@ -39,20 +43,26 @@ func (c ErrorClass) String() string {
 		return "invalid_param"
 	case ClassFatal:
 		return "fatal"
+	case ClassNonceStale:
+		return "nonce_stale"
+	case ClassDuplicate:
+		return "duplicate"
 	default:
 		return "unknown"
 	}
 }
 
 // Retryable 表示该分类值得退避后重试。
-func (c ErrorClass) Retryable() bool { return c == ClassRetryable }
+func (c ErrorClass) Retryable() bool {
+	return c == ClassRetryable || c == ClassNonceStale
+}
 
 // CountsAsFailure 表示该分类应当计入连续失败计数（熔断依据）。
 //
 // post-only 被拒不算失败：行情快速穿过挂单价位时它会频繁出现，
 // 把它计入熔断会在正常波动中误杀实例。
 func (c ErrorClass) CountsAsFailure() bool {
-	return c != ClassPostOnlyRejected
+	return c != ClassPostOnlyRejected && c != ClassInsufficientMargin && c != ClassDuplicate
 }
 
 // Error 是带分类的交易所错误。

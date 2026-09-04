@@ -1,8 +1,8 @@
 # dex-grid 开发设计文档
 
-版本：v0.4（Lighter + RH Lighter + 普通/马丁网格。Web 控制台已 embed，默认不自动开网格）
+版本：v0.5（Lighter + RH Lighter + SODEx + 普通/马丁网格。Web 控制台已 embed，默认不自动开网格。本文只写当前已实现行为。）
 
-本文描述分层职责、核心抽象、网格算法、事件与命令流、HTTP API 契约与工程约定。Lighter 协议、签名、nonce、改单与主网踩坑见 [LIGHTER.md](LIGHTER.md)。RH Lighter（独立实例）见 [RH_LIGHTER.md](RH_LIGHTER.md)。配置字段规范见 [GRID_CONFIG.md](GRID_CONFIG.md)，部署见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+本文描述分层职责、核心抽象、网格算法、事件与命令流、HTTP API 契约与工程约定。Lighter 协议见 [LIGHTER.md](LIGHTER.md)。RH Lighter 见 [RH_LIGHTER.md](RH_LIGHTER.md)。SODEx 永续见 [SODEX.md](SODEX.md)。配置字段规范见 [GRID_CONFIG.md](GRID_CONFIG.md)，部署见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
 ---
 
@@ -19,16 +19,15 @@
 9. [订单标识与幂等](#9-订单标识与幂等)
 10. [风控、止盈止损与区间外策略](#10-风控止盈止损与区间外策略)
 11. [Trailing 网格](#11-trailing-网格)
-12. [行情分析与参数推荐](#12-行情分析与参数推荐)
-13. [Lighter 适配器](#13-lighter-适配器)（正文在 [LIGHTER.md](LIGHTER.md)）
-14. [持久化与对账](#14-持久化与对账)
-15. [错误处理与限流](#15-错误处理与限流)
-16. [可观测性与日志面板](#16-可观测性与日志面板)
-17. [跨平台工程约定](#17-跨平台工程约定)
-18. [马丁网格](#18-马丁网格)
-19. [测试策略](#19-测试策略)
-20. [依赖清单](#20-依赖清单)
-21. [扩展指南](#21-扩展指南)
+12. [Lighter 适配器](#12-lighter-适配器)（正文在 [LIGHTER.md](LIGHTER.md)）
+13. [持久化与对账](#13-持久化与对账)
+14. [错误处理与限流](#14-错误处理与限流)
+15. [可观测性与日志面板](#15-可观测性与日志面板)
+16. [跨平台工程约定](#16-跨平台工程约定)
+17. [马丁网格](#17-马丁网格)
+18. [测试策略](#18-测试策略)
+19. [依赖清单](#19-依赖清单)
+20. [扩展指南](#20-扩展指南)
 
 ---
 
@@ -88,22 +87,22 @@ Lighter 主网的实际分布：235 个市场 = 227 个永续 + 8 个现货（`E
    Web 控制台（go:embed web/）/ 策略 YAML / REST
         │  同源 HTTP（静态页 + REST）
    ┌────▼──────────────────────────────────────────┐
-   │ api    路由 · DTO 校验 · 命令下发 · 实时推送      │
+   │ api    路由 · 参数校验 · 命令下发 · 静态页         │
    └────┬──────────────────────────────────────────┘
         │ 命令 channel（阻塞等回执）
    ┌────▼──────────────────────────────────────────┐
-   │ app    engine.Runner · executor · entry        │
-   │        reconcile · risk · analysis             │
+   │ app    supervisor · engine.Runner · executor    │
+   │        entry · risk（看门狗在 Runner 内）         │
    └────┬───────────────────────┬──────────────────┘
         │ 调用接口                │ 调用接口
    ┌────▼───────────────┐  ┌────▼──────────────────┐
    │ domain（纯逻辑）     │  │ exchange 端口 + 适配器  │
    │ strategy.Strategy   │  │ exchange.Exchange      │
-   │ grid / martingale   │  │ lighter / <后续 DEX>    │
+   │ grid / martingale   │  │ lighter / rh_lighter / sodex │
    │ market/order/position│ └───────────────────────┘
    └─────────────────────┘
    ┌───────────────────────────────────────────────┐
-   │ infra  config · store · logx · proxy · metrics │
+   │ infra  config · store · logx · httpx · lockfile │
    └───────────────────────────────────────────────┘
 ```
 
@@ -118,17 +117,19 @@ go list -deps ./internal/domain/... | grep -E "dex-grid/internal/(app|api|exchan
 
 | 包 | 职责 | 明确不做 |
 | --- | --- | --- |
-| `api` | HTTP 路由、DTO 校验、把请求翻译成命令、WS 广播 | 不持有策略状态，不直接调 Exchange |
-| `app/engine` | 事件循环、命令处理、生命周期 | 不含策略逻辑 |
+| `api` | HTTP 路由、参数校验、把请求翻译成 Supervisor 命令 | 不持有策略状态 |
+| `app/supervisor` | 按交易所起 Runner、读写 SQLite 配置、转发命令 | 不含策略逻辑 |
+| `app/engine` | 事件循环、命令处理、启动/重连对账、运行中看门狗 | 不含策略逻辑 |
 | `app/executor` | Action → Exchange，批量拆分、限流、重试 | 不决定"该下什么单" |
-| `app/entry` | 三种建仓模式的状态机 | 不管网格排布 |
-| `app/reconcile` | 启动/周期对账 | 不改策略内部结构 |
+| `app/entry` | 建仓：`maker_follow` / `limit_price` | 不管网格排布 |
 | `app/risk` | 止盈止损、区间外策略、熔断 | 不直接下单，返回 Action |
-| `app/analysis` | K 线 → 指标 → 趋势判定 → 参数推荐 | 不下单、不改配置，只返回建议 |
-| `domain/grid` | 价位表、层级配对、成交后的下一步意图、派生量计算 | 不知道 Lighter 存在 |
+| `domain/grid` | 价位表、层级配对、成交后的下一步意图、派生量计算 | 不知道具体 DEX |
 | `exchange/lighter` | 协议翻译、签名、nonce、WS 重连、精度换算 | 不含策略语义 |
+| `exchange/rhlighter` | RH Lighter：独立链、独立 slot | 不含策略语义 |
+| `exchange/sodex` | SODEx 永续：EIP-712 签名 REST + WS | 不含策略语义 |
 | `infra/logx` | slog 输出 + 内存环形缓冲（页面日志面板数据源） | — |
-| `infra/proxy` | 代理拨号器与连通性探测（对应页面「IP 配置」与顶部「代理正常」） | — |
+| `infra/httpx` | 按 `config.yaml` 的全局代理构造 HTTP 客户端 | 不含连通性探测 UI |
+| `infra/lockfile` | 同一数据目录防双开 | — |
 
 ---
 
@@ -256,6 +257,7 @@ type Stop          struct{ Reason StopReason }
 ```go
 exchange.Register("lighter", lighter.New)          // slot 0（lighter 包 init）
 exchange.Register("rh_lighter", rhlighter.New)    // slot 1，只能追加
+exchange.Register("sodex", sodex.New)             // slot 2，只能追加
 strategy.Register("grid", grid.New)
 strategy.Register("martingale", martingale.New)
 ```
@@ -277,12 +279,7 @@ step = (U - L) / n
 P_i  = L + i × step          i = 0 … n
 ```
 
-**等比（geometric，第二阶段）**
-
-```
-r    = (U / L)^(1/n)
-P_i  = L × r^i               i = 0 … n
-```
+`spacing_mode` 只接受 `arithmetic`。其它值（含 `geometric`）保存/预览会报「等比网格尚未实现」。
 
 生成后按 `tick_size` 规整到最近可交易价并去重；去重后价位数 < 2 则校验失败（区间太窄或格数太多）。
 
@@ -299,7 +296,7 @@ P_i  = L × r^i               i = 0 … n
 
 `per_grid_qty` 下所有格数量相同；`margin` 下按 `qty_mode` 选 `equal_notional`（每格金额相同）或 `equal_qty`（每格数量相同）。
 
-数量按 `lot_size` 向下规整；规整后 `q × P_i < min_notional` 则校验失败并提示最小可行值。
+数量按 `lot_size` 向下规整；规整后 `q × P_i < min_notional` 则校验失败并提示最小可行值。预览/保存还要求单格毛利率大于双边 maker 费率的 2 倍，否则拒绝（网格太密会越跑越亏）。
 
 ### 4.3 格子模型与配对
 
@@ -355,9 +352,9 @@ Lighter 的挂单额度足以支撑 80 格全挂，但换到挂单上限低的�
 
 ### 4.5 post-only 前置检查
 
-生成挂单意图前先判断该价格会不会立即成交：买单要求 `price < best_ask`，卖单要求 `price > best_bid`（盘口不可用时退化为与标记价比较）。会穿价的格子直接跳过，等下一个 `TickEvent` 用新价格再试。
+生成挂单意图前先判断该价格会不会立即成交：买单要求 `price < best_ask`，卖单要求 `price > best_bid`。**没有有效盘口时不下 post-only**（不用标记价代替），等下一笔行情再试。
 
-这一步不能省。价格快速穿过若干格时，被穿过的格子会翻转成「在现价错误一侧挂单」的状态，不做检查就会连续发出必被拒绝的 post-only 单，白白消耗请求配额并把连续失败计数推向熔断阈值。
+这一步不能省。价格快速穿过若干格时，被穿过的格子会翻转成「在现价错误一侧挂单」的状态，不做检查就会连续发出必被拒绝的 post-only 单，白白消耗请求配额并把连续失败计数推向熔断阈值。用标记价代替盘口会把价差内的单当成 maker，GTX/post-only 会被交易所立刻过期，看门狗再以同一客户端订单号重挂。
 
 ### 4.6 数值精度
 
@@ -423,6 +420,7 @@ func (r *Runner) Run(ctx context.Context) error {
 
         case t := <-ticker.C:
             r.dispatch(ctx, strategy.TickEvent{Now: t})
+            r.maybeWatchdog(ctx, t)             // 仅 Running 且非建仓中：对照交易所挂单缺补、多撤
         }
     }
 }
@@ -446,8 +444,7 @@ func (r *Runner) dispatch(ctx context.Context, ev strategy.Event) {
     for _, e := range r.executor.Apply(ctx, acts).Events() {
         r.enqueue(e)                            // 下单结果作为 OrderEvent 回灌
     }
-    r.publish()                                 // 向 WebSocket 广播最新视图
-    r.persistIfDirty()
+    r.persistSoon()                             // 成交 / 铺单后尽快落盘运行快照
 }
 ```
 
@@ -472,7 +469,7 @@ func (e *Executor) Apply(ctx context.Context, acts []strategy.Action) Results
 4. **限流**：per-exchange 令牌桶。
 5. **重试**：只对可重试错误退避重试，带上限。改单失败**不**发 `Rejected` 回灌，旧单留在盘上。
 6. **进度计数**：维护「挂单目标 / 已确认 / 待重试」三个计数供页面显示（80 格网格铺满即 80 / 80 / 0）。
-7. **dry-run**：`-dry-run` 时换成 `LogExecutor`，只打印不发送。
+7. **下单成功立即标 Open**：REST ACK 后回灌 `StateOpen`，不等交易所 WS 的 NEW；否则格子会一直 pending，看门狗按同一 COID 反复补挂。
 
 ### 6.3 Supervisor
 
@@ -480,8 +477,9 @@ func (e *Executor) Apply(ctx context.Context, acts []strategy.Action) Results
 
 ```
 Supervisor
- ├── Runner(lighter)  ──▶ lighter.Adapter
- └── Runner(<后续 DEX>) ──▶ <后续 DEX>.Adapter
+ ├── Runner(lighter)     ──▶ lighter.Adapter      (slot 0)
+ ├── Runner(rh_lighter)  ──▶ rhlighter.Adapter    (slot 1)
+ └── Runner(sodex)       ──▶ sodex.Adapter        (slot 2)
 ```
 
 ---
@@ -506,7 +504,6 @@ const (
     CmdRefill                    // 补齐网格挂单（一键补格）
     CmdResetStats                // 重置统计
     CmdReconnect                 // 重连交易所
-    CmdSaveConfig                // 保存策略配置（未运行时）
 )
 
 type CommandResult struct {
@@ -516,7 +513,9 @@ type CommandResult struct {
 }
 ```
 
-API handler 投递命令后阻塞等待 `Reply`，默认超时 10s（`CmdStop` 因涉及平仓放宽到 30s），超时返回 504 并在日志标记该命令仍在执行中。
+API handler 投递命令后阻塞等待 `Reply`。启动 / 调区间 / 重连约 15s，停止 30s，其余约 10s，超时返回 504。
+
+策略配置不走这条命令：`PUT /api/exchanges/{ex}/config` 由 Supervisor 直接写 SQLite。
 
 ### 7.2 各命令语义
 
@@ -529,7 +528,6 @@ API handler 投递命令后阻塞等待 `Reply`，默认超时 10s（`CmdStop` �
 | `Refill` | Running / Paused(Manual) | 对账 → 计算缺失层级 → 补挂；从 Paused(Manual) 调用时同时转回 Running | 部分失败计入待重试计数，下个 tick 继续补 |
 | `ResetStats` | 任意 | 清零已实现盈亏、成交计数、完成格数；**不动挂单与持仓** | — |
 | `Reconnect` | 任意 | 关闭并重建 WS/REST 连接 → 重新订阅 → 全量对账；**不动挂单与持仓** | 重连失败保持原状态并告警 |
-| `SaveConfig` | 状态为 Stopped | 校验 → 写 SQLite → 返回派生量 | 校验失败返回逐字段错误 |
 
 **`Paused` 状态**由「撤销所有挂单（保留持仓）」与「区间外暂停」两个场景引入：策略层级表仍在、仓位保留、不产生新的交易意图。它让用户可以在行情剧烈时先撤单避险，冷静后一键补格恢复，而不必走「停止 + 平仓 + 重新配置 + 重新建仓」这一整套。完整状态机见 10.3。
 
@@ -559,7 +557,7 @@ API handler 投递命令后阻塞等待 `Reply`，默认超时 10s（`CmdStop` �
 
 ## 8. HTTP API 契约
 
-单端口同时服务静态资源、REST 与 WebSocket。所有 REST 响应统一信封：
+单端口同时服务静态资源与 REST。控制台每秒轮询 REST，**没有**页面 WebSocket。所有 REST 响应统一信封：
 
 ```json
 { "ok": true, "data": {...} }
@@ -570,15 +568,13 @@ API handler 投递命令后阻塞等待 `Reply`，默认超时 10s（`CmdStop` �
 
 | 方法 | 路径 | 说明 | 对应 UI |
 | --- | --- | --- | --- |
-| GET | `/api/system/status` | 各交易所连接状态、代理状态、版本、运行时长 | 顶部状态徽章 |
+| GET | `/api/system/status` | 各交易所运行状态、代理是否启用、版本、运行时长 | 顶部状态徽章 |
 | GET | `/api/exchanges` | 已启用交易所列表与能力 | Tab 列表 |
 | GET | `/api/exchanges/{ex}/symbols` | 可交易对列表 | 交易对下拉 |
 | GET | `/api/exchanges/{ex}/klines?symbol=&interval=&limit=` | K 线（默认 1h） | 价格/网格曲线 |
-| GET | `/api/exchanges/{ex}/analysis?symbol=&interval=` | 趋势分析结果 | 趋势分析卡片 |
-| POST | `/api/exchanges/{ex}/suggest` | 按风格预设生成推荐参数与自动区间 | 「智能填充参数」「采用推荐策略 + 自动区间」 |
 | GET | `/api/exchanges/{ex}/config` | 当前策略配置 | 策略配置表单回填 |
 | POST | `/api/exchanges/{ex}/preview` | 只校验并计算派生量，不保存 | 表单下方实时派生量 |
-| PUT | `/api/exchanges/{ex}/config` | 保存策略配置（`CmdSaveConfig`） | 表单保存 |
+| PUT | `/api/exchanges/{ex}/config` | 保存策略配置到 SQLite | 表单保存 |
 | GET | `/api/exchanges/{ex}/status` | 运行状态、持仓、盈亏、挂单进度 | 账户状态卡片 |
 | GET | `/api/exchanges/{ex}/levels` | 网格层级表（价格/数量/角色/状态） | 图表网格线 |
 | GET | `/api/exchanges/{ex}/trades?limit=` | 成交记录 | 成交记录表 |
@@ -590,28 +586,16 @@ API handler 投递命令后阻塞等待 `Reply`，默认超时 10s（`CmdStop` �
 | POST | `/api/exchanges/{ex}/refill` | 补齐挂单 | 「补齐网格挂单（一键补格）」 |
 | POST | `/api/exchanges/{ex}/reset-stats` | 重置统计 | 「重置统计」 |
 | POST | `/api/exchanges/{ex}/reconnect` | 重连交易所 | 「重连交易所」 |
-| GET | `/api/proxy` / PUT | 代理配置与连通性探测 | 「IP 配置」Tab |
-| GET | `/healthz` | 健康检查 | — |
-| GET | `/metrics` | Prometheus | — |
-| WS | `/api/stream` | 实时推送 | 全页面 |
+| GET | `/api/proxy` | 只读：代理是否启用、URL、no_proxy（不含密码） | — |
+| GET | `/healthz` | 进程存活，始终 `{status: ok}` | — |
 
-### 8.2 WebSocket 推送
+### 8.2 控制台刷新
 
-客户端连接后按交易所订阅，服务端推送增量：
-
-```json
-{ "type": "status",  "exchange": "lighter", "data": { ... } }
-{ "type": "ticker",  "exchange": "lighter", "data": { "price": "62942.7", "ts": 1234567890 } }
-{ "type": "trade",   "exchange": "lighter", "data": { "ts": ..., "side": "buy", "price": "62925", "qty": "0.002" } }
-{ "type": "levels",  "exchange": "lighter", "data": [ ... ] }
-{ "type": "log",     "exchange": "lighter", "data": { "level": "warn", "ts": ..., "msg": "..." } }
-```
-
-推送做**合流限频**：`status` 与 `ticker` 最多 2 次/秒（按最新值覆盖），`trade` 与 `log` 逐条推但带背压丢弃（客户端消费不过来时丢最旧的，并发一条「日志已截断」提示）。避免行情剧烈时 WS 缓冲爆掉。
+页面每秒请求 `GET /status`、`GET /levels` 等 REST，没有 `/api/stream`。交易所侧行情与成交仍走各所 WebSocket，由 Runner 写入内存视图后再被轮询读走。
 
 ### 8.3 鉴权
 
-默认监听 `0.0.0.0:8080`，无鉴权，可直接公网访问 REST API。`config.yaml` 中开启 `server.auth.enabled` 后启用 Bearer Token（token 从环境变量读），所有 `/api/*` 校验。鉴权与反向代理均为可选项，不是启动前提。
+默认监听 `127.0.0.1:8080`，无鉴权。公网监听（`0.0.0.0`）时必须启用 `server.auth` 或 `server.ip_whitelist`，否则配置校验失败。`config.yaml` 中开启 `server.auth.enabled` 后启用 Bearer Token（token 从环境变量读），所有 `/api/*` 校验。跨域预检 `OPTIONS` 在鉴权之前放行。
 
 ---
 
@@ -645,7 +629,7 @@ func (c ClientOrderID) Decode() (slot uint8, epoch, level uint16, purpose Purpos
 
 `seq` 只有 4 位（0-15 循环）是可接受的：同一层级在同一 epoch 内重挂超过 16 次的概率极低，且循环回绕时旧单早已终结。
 
-对于 `ClientOrderID` 位宽不足的其他交易所，适配器降级为字符串前缀 `dg-<slot>-<epoch>-<level>-<purpose>-<seq>`，语义一致。
+当前三家 DEX 的客户端订单号都用这套 48 位整数，没有字符串前缀映射。
 
 ---
 
@@ -665,7 +649,7 @@ func (c ClientOrderID) Decode() (slot uint8, epoch, level uint16, purpose Purpos
 
 **触发价格源**默认用标记价（mark price）而非最新成交价，避免被瞬时插针触发。交易所不提供标记价时退化为 `(bid+ask)/2` 并在启动日志明确提示。
 
-**为什么默认本地触发而非交易所原生条件单**：跨交易所行为一致、不占挂单额度、能保证「先撤全部网格单再平仓」的顺序（原生条件单做不到）。可切换到原生条件单，代价是需要额外维护条件单与网格单的一致性。
+**为什么用本地触发而非交易所原生条件单**：跨交易所行为一致、不占挂单额度、能保证「先撤全部网格单再平仓」的顺序。`Capabilities.NativeTPSL` 仅作能力申报，策略止盈止损不走交易所条件单。
 
 **止损后状态**：进入 `Stopped(StopLoss)` 终态并落盘，**不自动重启**。防止单边行情中反复止损。页面显示醒目的停止原因。
 
@@ -697,7 +681,7 @@ func (c ClientOrderID) Decode() (slot uint8, epoch, level uint16, purpose Purpos
 **`stop_and_cancel` 的实现要点**
 
 - 撤单后**不平仓**。这是有意为之：脱离区间往往是最差的平仓时机，把决定权交给用户比程序自作主张更好。
-- 转入 `Stopped(OutOfRange)` 终态，页面醒目展示持仓、均价、浮亏、强平价，并给出「市价平仓」与「重新配置区间后启动」两个入口。
+- 转入 `Stopped(OutOfRange)` 终态。页面展示持仓、均价、浮亏、强平价。恢复只能重新配置区间后启动；控制台没有单独的「市价平仓」按钮（可用核对 CLI 的 `close`）。
 - 不自动恢复，即使价格随后回到区间内。
 
 **与止损价的关系**：两者独立，可同时配置。止损价优先级更高（检查顺序 1、2 在区间外策略之前），命中止损直接平仓停止，不再走区间外逻辑。
@@ -753,8 +737,6 @@ epoch' = epoch + 1
 
 执行序列复用「调整区间」的路径（见 7.3）：全撤 → epoch+1 → 重建格子 → 调仓 → 重铺。把 trailing 和手动调区间统一到一套代码，是避免两处逻辑各自漂移的关键。
 
-等比网格用乘法：`lower' = lower × r^k`。
-
 **约束**
 
 - `trailing_max_shifts`（默认 0 = 不限）限制总移动次数。
@@ -763,54 +745,7 @@ epoch' = epoch + 1
 
 ---
 
-## 12. 行情分析与参数推荐
-
-`app/analysis` 是纯计算模块，输入 K 线，输出建议，**不产生任何交易行为**。
-
-### 12.1 指标
-
-| 指标 | 计算 | 用途 |
-| --- | --- | --- |
-| EMA 差 | `(EMA_fast − EMA_slow) / EMA_slow`，默认 fast=12 slow=26 | 趋势方向与强度 |
-| 斜率 | 对最近 `N` 根收盘价做最小二乘线性回归，归一化为「每根 K 线百分比变化」 | 趋势陡峭度 |
-| ATR% | `ATR(14) / 最新价` | 波动率，决定网格间距下限 |
-| 区间高低 | 最近 `N` 根的最高价与最低价 | 自动区间的基准 |
-
-原型图上「EMA 差 −0.28%，斜率 −0.031%/根，波动率 ATR 0.33%」就是这三个值。
-
-### 12.2 趋势判定
-
-```
-|EMA差| < ema_threshold  且  |斜率| < slope_threshold   →  震荡  → 推荐中性网格
- EMA差 > ema_threshold   且   斜率 > slope_threshold    →  上涨  → 推荐做多网格
- EMA差 < −ema_threshold  且   斜率 < −slope_threshold   →  下跌  → 推荐做空网格
-其余                                                    →  转换中 → 推荐中性网格 + 降低强度
-```
-
-强度 = 三个指标归一化后的加权得分，映射到 0-100%。原型图显示「震荡 ↔ 推荐：中性网格 · 强度 7%」，低强度意味着信号弱，页面应提示谨慎。
-
-### 12.3 参数推荐与自动区间
-
-| 风格 | 网格数 | 区间宽度 | 杠杆建议 |
-| --- | --- | --- | --- |
-| `stable`（稳健） | 少（格宽，成交少但每格利润厚） | ±2 × ATR% × √N | 低 |
-| `aggressive`（激进） | 多（格密，成交频繁） | ±1 × ATR% × √N | 中 |
-| `safe`（成交少更安全） | 最少 | ±3 × ATR% × √N | 最低 |
-
-**手续费硬约束**（原型图上「建议单格间距不小于该值的一半以覆盖手续费」的严谨版本）：
-
-```
-单格毛利率 = step / P ≈ (upper − lower) / (grid_count × P)
-必要条件：单格毛利率 > (maker_fee_rate × 2) × safety_mult      safety_mult 默认 2.0
-```
-
-不满足时 `suggest` 会自动收敛格数，`preview` 会返回明确错误：「当前格数下单格毛利率 0.08% 低于双边手续费 0.04% 的 2 倍，建议格数不超过 XX」。这是网格策略最常见的亏损原因，必须在保存配置时就拦住。
-
-自动区间同时受账户余额约束：推荐的每格数量必须满足 `所需保证金 ≤ 可用余额 × max_margin_usage`（默认 0.5）。
-
----
-
-## 13. Lighter 适配器
+## 12. Lighter 适配器
 
 协议、签名、nonce、改单、事件流与主网踩坑已独立成篇：[LIGHTER.md](LIGHTER.md)。
 
@@ -823,14 +758,14 @@ epoch' = epoch + 1
 
 ---
 
-## 14. 持久化与对账
+## 13. 持久化与对账
 
-### 14.1 存储
+### 13.1 存储
 
-SQLite（`modernc.org/sqlite`，纯 Go 无 CGO，Windows 编译友好），单文件 `data/gridbot.db`。
+SQLite（`modernc.org/sqlite`，纯 Go 无 CGO，Windows 编译友好），单文件 `data/gridbot.db`。实际读写的是：
 
 ```sql
--- 策略配置：页面下发，每个交易所一行
+-- 策略配置：页面 / PUT 下发，每个交易所一行
 CREATE TABLE strategy_configs (
     exchange    TEXT PRIMARY KEY,
     symbol      TEXT NOT NULL,
@@ -840,7 +775,7 @@ CREATE TABLE strategy_configs (
     updated_at  INTEGER NOT NULL
 );
 
--- 运行状态：每个交易所一行
+-- 运行快照：每个交易所一行
 CREATE TABLE runtime_state (
     exchange    TEXT PRIMARY KEY,
     status      TEXT NOT NULL,        -- stopped | running | paused | error
@@ -848,21 +783,6 @@ CREATE TABLE runtime_state (
     epoch       INTEGER NOT NULL,
     snapshot    BLOB,                 -- strategy.Snapshot() 的 JSON
     updated_at  INTEGER NOT NULL
-);
-
-CREATE TABLE orders (
-    exchange     TEXT NOT NULL,
-    coid         INTEGER NOT NULL,
-    exchange_oid TEXT,
-    epoch        INTEGER NOT NULL,
-    level        INTEGER NOT NULL,
-    side         TEXT NOT NULL,
-    price        TEXT NOT NULL,       -- decimal 存字符串，避免精度损失
-    qty          TEXT NOT NULL,
-    filled_qty   TEXT NOT NULL,
-    state        TEXT NOT NULL,
-    updated_at   INTEGER NOT NULL,
-    PRIMARY KEY (exchange, coid)
 );
 
 CREATE TABLE fills (
@@ -874,31 +794,32 @@ CREATE TABLE fills (
     qty        TEXT NOT NULL,
     fee        TEXT NOT NULL,
     is_maker   INTEGER NOT NULL,
-    ts         INTEGER NOT NULL
+    ts         INTEGER NOT NULL,
+    symbol     TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX idx_fills_ex_ts ON fills(exchange, ts DESC);
 
--- 统计：支持「重置统计」而不丢历史成交
 CREATE TABLE stats (
-    exchange       TEXT PRIMARY KEY,
-    reset_at       INTEGER NOT NULL,  -- 重置时间点，统计只算此后的 fills
-    realized_pnl   TEXT NOT NULL,
+    exchange        TEXT PRIMARY KEY,
+    reset_at        INTEGER NOT NULL,  -- 重置时间点，列表只展示此后的 fills
+    realized_pnl    TEXT NOT NULL,
     completed_grids INTEGER NOT NULL,
-    updated_at     INTEGER NOT NULL
+    updated_at      INTEGER NOT NULL
 );
 ```
 
-「重置统计」实现为把 `stats.reset_at` 更新为当前时间并清零累计值，`fills` 表原样保留 —— 用户清零的是显示，不是审计记录。
+schema 里还有一张 `orders` 表，当前没有读写。挂单以交易所为准，本地只靠策略快照。
 
-写入时机：每次 `Apply` 后状态有变更则批量写一个事务。不追求每笔实时落盘，崩溃丢失部分由对账补回。
+「重置统计」把 `stats.reset_at` 更新为当前时间并清零累计值，`fills` 原样保留。
 
-### 14.2 启动恢复
+写入时机：成交、铺单后 `persistSoon` 落盘运行快照；成交增量写入 `fills`。崩溃丢失的挂单状态由下次对账从交易所拉回。
+
+### 13.2 启动恢复
 
 ```
 1. 加载 config.yaml，建立各交易所连接
 2. 对每个交易所读 strategy_configs + runtime_state
 3. status == running：
-     执行对账（见 14.3）→ 恢复 Running
+     执行对账（见 13.3）→ 恢复 Running
      若当前价已在区间外 → 按 out_of_range 策略处理，而不是直接进 Running
      对账失败 → 转 error 状态，页面显示原因，等人工处理
 4. status == paused(out_of_range)：
@@ -906,48 +827,32 @@ CREATE TABLE stats (
 5. status == paused(manual)：
      对账 → 维持 Paused，等用户点「补齐网格挂单」
 6. status == stopped（含 out_of_range / circuit 等带仓位的终态）：
-     Runner 空转，只推送行情与账户数据；若有残留仓位，页面醒目提示
+     Runner 空转，控制台轮询仍能看到行情与账户；若有残留仓位，页面醒目提示
 ```
 
-**进程重启后自动恢复运行**是必需的（服务化部署会因为升级、崩溃、机器重启而重启进程），但有两条底线：**对账失败时绝不盲目恢复**，以及**恢复前必须重新判定价格是否在区间内** —— 进程停了几小时后价格早已跑出区间的情况很常见，直接进 Running 会立刻触发一堆异常挂单。
+**进程重启后自动恢复运行**是必需的。底线：**对账失败时绝不盲目恢复**，以及**恢复前必须重新判定价格是否在区间内**。
 
-### 14.3 对账算法
+### 13.3 对账与看门狗
 
-启动时以及每次事件流重连后执行：
+启动、事件流重连、以及运行中按 `app.reconcile_interval`（未配置时引擎按 15s）执行同一套逻辑：
 
 ```
-1. exchangeOrders ← Exchange.OpenOrders(symbol)
-2. exchangePos    ← Exchange.Position(symbol)
-3. localState     ← store 读取 + strategy.Restore
-
-4. 遍历 exchangeOrders，解码 ClientOrderID：
-     ├ slot 不是本交易所 / 解码失败 → 忽略（手动单，不动）
-     ├ epoch 旧于当前              → 加入待撤列表
-     └ epoch 为当前                → 标记该层级 Resting，写回本地
-
-5. 遍历 localState 中标记 Resting 但交易所没有的：
-     查该 coid 的历史（fills / 订单终态）
-     ├ 已成交 → 补记成交，触发策略生成对手单
-     ├ 已撤销 → 层级置 Empty，等待重挂
-     └ 查不到 → 层级置 Empty，告警（保守处理）
-
-6. 比较实际仓位与策略期望仓位：
-     drift = |actual − expected| / max(|expected|, minDenominator)
-     ├ drift <= position_tolerance（默认 1%）→ 接受实际值
-     └ drift >  position_tolerance
-         ├ auto_fix = true  → 生成市价补齐/减仓意图
-         └ auto_fix = false → 转 error 状态，页面展示对比明细，等人工确认（默认）
-
-7. 执行待撤列表 → 执行补单意图 → 进入正常循环
+1. OpenOrders(symbol) + Position(symbol) + Account
+2. 遍历交易所挂单：
+     ├ 解不出本系统 ClientOrderID → 忽略（手工单，不动）
+     ├ slot 不是本实例 / epoch 不是当前轮 → 撤销
+     └ 其余交给策略 Resync
+3. 策略 syncFromOrders：本轮格子对上的标 Resting；策略不认的多余单撤销
+4. recoverFromPosition：超出初始目标的仓位记到已经穿过、但 Seq 仍为 0 的空格子
+     （避免漏成交后格子永远 Empty，看门狗死循环补挂）
+5. 缺失的格子补挂；会穿价或没有盘口的跳过，等下一 tick
 ```
 
-**默认保守**：仓位漂移超阈值时默认停在 error 状态而非自动市价纠偏，因为误判下的自动纠偏会造成真实亏损。页面提供「确认并自动纠偏」按钮把决定权交给用户。
-
-周期性对账现已接到运行循环（`app.reconcile_interval`，默认 15s）：对照交易所真实挂单，**本实例多余的撤掉、缺失的格子补挂**。仓位漂移超阈值仍默认不自动市价纠偏。解不出本系统 COID 的手工单不动。
+看门狗**不**按仓位偏差发市价纠偏单，也没有「确认并自动纠偏」按钮。仓位是否到位只用于建仓完成判定（相对容忍约 1%，写死在策略里）。
 
 ---
 
-## 15. 错误处理与限流
+## 14. 错误处理与限流
 
 ```go
 type ErrClass int
@@ -976,9 +881,9 @@ const (
 
 ---
 
-## 16. 可观测性与日志面板
+## 15. 可观测性与日志面板
 
-**日志**：`log/slog`，JSON 输出到文件/stdout。同时写入一个**内存环形缓冲**（默认 2000 条），供页面日志面板读取与 WS 推送。每条日志强制带 `exchange` 字段（Runner 构造时通过 `logger.With` 注入）。页面只展示 `msg` 正文（不展开 attrs）。
+**日志**：`log/slog`，JSON 输出到文件/stdout。同时写入一个**内存环形缓冲**（默认 2000 条），供页面日志面板通过 `GET /logs` 读取。每条日志强制带 `exchange` 字段（Runner 构造时通过 `logger.With` 注入）。页面只展示 `msg` 正文（不展开 attrs）。
 
 环形缓冲的存在是为了让页面不依赖读文件，跨平台行为一致（Windows 上读正在写入的日志文件容易踩锁）。
 
@@ -993,26 +898,11 @@ const (
 
 挂单进度与成交明细仍以账户状态卡片、成交记录表为准；日志只做操作员可读的摘要。
 
-**指标**（Prometheus，`/metrics`）：
-
-| 指标 | 类型 | 说明 |
-| --- | --- | --- |
-| `grid_open_orders` | Gauge | 当前挂单数（按 exchange/side） |
-| `grid_order_progress` | Gauge | 挂单目标 / 已确认 / 待重试（按 exchange/kind） |
-| `grid_fills_total` | Counter | 成交笔数（按 exchange/side/maker） |
-| `grid_completed_grids` | Counter | 完成的网格套利循环数 |
-| `grid_realized_pnl` / `grid_unrealized_pnl` | Gauge | 盈亏 |
-| `grid_position_size` | Gauge | 当前仓位（带符号） |
-| `grid_reconcile_drift` | Gauge | 对账仓位偏差比例 |
-| `exchange_requests_total` | Counter | 请求数（按 exchange/method/result） |
-| `exchange_request_duration` | Histogram | 请求耗时 |
-| `instance_status` | Gauge | 1=running 0=stopped/paused −1=error |
-
-**健康检查** `/healthz`：任一实例处于 error 返回 503。
+**健康检查** `/healthz`：进程存活即 `{ "status": "ok" }`，不根据实例 error 返回 503。
 
 ---
 
-## 17. 跨平台工程约定
+## 16. 跨平台工程约定
 
 | 项 | 约定 |
 | --- | --- |
@@ -1029,7 +919,7 @@ const (
 
 ---
 
-## 18. 马丁网格
+## 17. 马丁网格
 
 已实现。复用 `Strategy` 接口、`entry` 建仓触发器、`Executor`、`Guard`、对账；`ClientOrderID` 的 `Cell` 位段表示「第几次加仓」，止盈用 `PurposeTakeProfit`。
 
@@ -1062,53 +952,53 @@ const (
 
 ---
 
-## 19. 测试策略
+## 18. 测试策略
 
 | 层级 | 方式 | 覆盖目标 |
 | --- | --- | --- |
-| `domain` | 表驱动单测，纯函数 | 价位表生成（等差/等比/规整/去重）、三方向配对、两种 sizing 模式、派生量公式、`ClientOrderID` 编解码往返、精度规整边界 |
-| `app` | 内存撮合引擎 `fakeexchange` | 完整场景：启动 → 建仓 → 铺网格 → 波动成交 → 配对补单 → 止盈退出；断线重连对账；post-only 被拒时跳过与重挂；调整区间与 trailing 的全量重铺；区间外暂停与回归恢复 |
-| `api` | `httptest` + fake Runner | 端点契约、命令超时、鉴权、WS 推送限频与背压丢弃 |
+| `domain` | 表驱动单测，纯函数 | 价位表生成（等差/规整/去重）、三方向配对、两种 sizing 模式、派生量公式、`ClientOrderID` 编解码往返、精度规整边界 |
+| `app` | 内存撮合 `internal/exchange/fake` | 完整场景：启动 → 建仓 → 铺网格 → 波动成交 → 配对补单 → 止盈退出；断线重连对账；post-only 被拒时跳过与重挂；调整区间与 trailing 的全量重铺；区间外暂停与回归恢复 |
+| `api` | `httptest` | 端点契约、命令超时、鉴权、IP 白名单 |
 | `exchange/lighter` | 录制回放 + 测试网冒烟 | 签名正确性、精度换算、nonce 序列（含超时不回退场景）、WS 重连、错误码分类 |
 | 端到端 | 测试网小资金跑 24h，Windows 与 Linux 各一轮 | 内存/句柄泄漏、nonce 长期一致性、对账稳定性、跨平台差异 |
 
-`fakeexchange` 是本项目测试的核心资产：约 200 行的内存撮合器，支持限价挂单、价格驱动撮合、post-only 拒绝模拟、部分成交模拟、限流与超时注入。有了它绝大部分逻辑不连网就能测。
+`internal/exchange/fake` 是内存撮合器，支持限价挂单、价格驱动撮合、post-only 拒绝模拟、部分成交模拟。绝大部分逻辑不连网就能测。
 
 **确定性要求**：`domain` 不允许调用 `time.Now()` 与 `rand`，时间来自事件字段，随机来自注入，保证测试可复现。
 
 ---
 
-## 20. 依赖清单
+## 19. 依赖清单
 
 | 依赖 | 用途 |
 | --- | --- |
 | `github.com/shopspring/decimal` | 精确十进制运算 |
 | `gopkg.in/yaml.v3` | 配置解析 |
-| `github.com/coder/websocket` | WebSocket（客户端连交易所 + 服务端推页面） |
-| `github.com/go-chi/chi/v5` | HTTP 路由（标准库 mux 也可，chi 的中间件更省事） |
-| `golang.org/x/time/rate` | 限流 |
-| `golang.org/x/net/proxy` | SOCKS5 代理 |
+| `github.com/coder/websocket` | 客户端连接交易所行情/订单 WebSocket |
+| `golang.org/x/time` | 限流 |
+| `golang.org/x/net` | SOCKS5 代理 |
 | `modernc.org/sqlite` | 纯 Go SQLite，无 CGO |
-| `github.com/prometheus/client_golang` | 指标 |
 | `github.com/elliottech/lighter-go` | Lighter 交易签名与类型定义 |
+| `github.com/sodex-tech/sodex-go-sdk-public` | SODEx 永续 EIP-712 签名与 REST 客户端 |
+| `github.com/ethereum/go-ethereum` | SODEx 签名依赖 |
+| `net/http`（标准库 ServeMux） | HTTP 路由 |
 | `log/slog`（标准库） | 结构化日志 |
 
 不引入：DI 框架、ORM、大型 web 框架、通用事件总线。
 
-前端：`web/` 纯静态文件，`internal/api` 通过 `dex-grid/web` 的 `embed.FS` 同源托管。账户状态每秒刷新；价格曲线默认 1h K 线。成交路径是交易所 WS 推送后立刻翻转格子，看门狗只做挂单缺补。
+前端：`web/` 纯静态文件，`internal/api` 通过 `dex-grid/web` 的 `embed.FS` 同源托管。控制台每秒轮询 REST；价格曲线默认 1h K 线。成交路径是交易所 WS 推送后立刻翻转格子，看门狗只做挂单缺补。
 
 ---
 
-## 21. 扩展指南
+## 20. 扩展指南
 
 ### 新增一个交易所
 
 1. `internal/exchange/<name>/` 实现 `exchange.Exchange`
 2. 正确填写 `Capabilities()`（尤其 `PostOnly` 与 `BatchPlace`）
-3. 若原生 client order id 格式不兼容 48 位整数，实现降级的字符串映射
+3. 客户端订单号沿用本系统 48 位整数 `ClientOrderID`（当前三家 DEX 均如此）
 4. `main.go` **追加**一行 `exchange.Register("<name>", <name>.New)`（不可插入到中间，会改变 slot）
-5. `config.yaml` 增加该交易所的凭证段
-6. 在 `config.yaml` 增加该交易所的凭证段与可选 `strategy_file`
+5. `config.yaml` 增加该交易所的凭证段与可选 `strategy_file`
 
 **不允许**改动 `app` 与 `domain`。若必须改，说明 `Exchange` 或 `Capabilities` 抽象不足，先修抽象。
 

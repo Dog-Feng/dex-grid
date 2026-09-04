@@ -5,6 +5,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -33,7 +34,14 @@ type Server struct {
 func New(sup *supervisor.Supervisor, cfg config.Server) *Server {
 	s := &Server{sup: sup, cfg: cfg, mux: http.NewServeMux()}
 	s.routes()
-	s.http = &http.Server{Addr: cfg.Addr, Handler: s.withAccess(s.mux)}
+	s.http = &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           s.withAccess(s.mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	return s
 }
 
@@ -86,15 +94,26 @@ func noCache(next http.Handler) http.Handler {
 	})
 }
 
+const maxRequestBody = 1 << 20 // 1MB
+
 func (s *Server) withAccess(next http.Handler) http.Handler {
-	return s.withIPWhitelist(s.withAuth(next))
+	return s.withIPWhitelist(s.withAuth(s.withBodyLimit(next)))
+}
+
+func (s *Server) withBodyLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) withIPWhitelist(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.IPWhitelist.Enabled {
-			ip := clientIP(r)
-			if !ipAllowed(ip, s.cfg.IPWhitelist.Allow) {
+			ip := s.clientIP(r)
+			if !ipAllowed(ip, s.cfg.IPWhitelist.Allow, len(s.cfg.TrustedProxies) == 0) {
 				writeError(w, http.StatusForbidden, "FORBIDDEN", "来源 IP 不在白名单", "")
 				return
 			}
@@ -102,27 +121,33 @@ func (s *Server) withIPWhitelist(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+func (s *Server) writeCORS(w http.ResponseWriter, r *http.Request) {
+	if len(s.cfg.CORSOrigins) == 0 {
+		return
+	}
+	origin := r.Header.Get("Origin")
+	for _, o := range s.cfg.CORSOrigins {
+		if o == origin || o == "*" {
+			w.Header().Set("Access-Control-Allow-Origin", o)
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+			break
+		}
+	}
+}
+
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.writeCORS(w, r)
+		if r.Method == http.MethodOptions && len(s.cfg.CORSOrigins) > 0 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if s.cfg.Auth.Enabled && strings.HasPrefix(r.URL.Path, "/api/") {
 			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if got == "" || got != s.cfg.Auth.Token {
+			if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.Auth.Token)) != 1 {
 				writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "无效的访问令牌", "")
-				return
-			}
-		}
-		if len(s.cfg.CORSOrigins) > 0 {
-			origin := r.Header.Get("Origin")
-			for _, o := range s.cfg.CORSOrigins {
-				if o == origin || o == "*" {
-					w.Header().Set("Access-Control-Allow-Origin", o)
-					w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-					w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
-					break
-				}
-			}
-			if r.Method == http.MethodOptions {
-				w.WriteHeader(http.StatusNoContent)
 				return
 			}
 		}
@@ -209,7 +234,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLevels(w http.ResponseWriter, r *http.Request) {
-	v, err := s.sup.View(r.PathValue("ex"))
+	v, err := s.sup.View(r.Context(), r.PathValue("ex"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -347,19 +372,40 @@ func writeErr(w http.ResponseWriter, err error) {
 	writeError(w, status, code, msg, "")
 }
 
-func clientIP(r *http.Request) net.IP {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+func parseHostIP(addr string) net.IP {
+	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
-		host = r.RemoteAddr
+		host = addr
 	}
-	return net.ParseIP(host)
+	return net.ParseIP(strings.Trim(host, "[]"))
 }
 
-func ipAllowed(ip net.IP, allow []string) bool {
+func (s *Server) clientIP(r *http.Request) net.IP {
+	direct := parseHostIP(r.RemoteAddr)
+	if len(s.cfg.TrustedProxies) == 0 || direct == nil {
+		return direct
+	}
+	if !ipAllowed(direct, s.cfg.TrustedProxies, false) {
+		return direct
+	}
+	parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		ip := net.ParseIP(strings.TrimSpace(parts[i]))
+		if ip == nil {
+			continue
+		}
+		if !ipAllowed(ip, s.cfg.TrustedProxies, false) {
+			return ip
+		}
+	}
+	return direct
+}
+
+func ipAllowed(ip net.IP, allow []string, allowLoopback bool) bool {
 	if ip == nil {
 		return false
 	}
-	if ip.IsLoopback() {
+	if allowLoopback && ip.IsLoopback() {
 		return true
 	}
 	for _, raw := range allow {

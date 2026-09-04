@@ -76,6 +76,8 @@ type Strategy struct {
 	retrying map[int]int
 	// lastRetryMark 是上次刷新 retrying 时的 mark，用于在价格变动后恢复被拒格子。
 	lastRetryMark decimal.Decimal
+	lastTrailAt   time.Time
+	trailShifts   int
 
 	stats      strategy.Stats
 	seenTrades map[int64]struct{}
@@ -116,6 +118,7 @@ func (s *Strategy) Init(st strategy.State) ([]strategy.Action, error) {
 	if s.restored && s.grid != nil {
 		// 从快照恢复：沿用原有网格与轮次，按对账结果同步格子状态。
 		cancels := s.syncFromOrders(st.Orders)
+		s.recoverFromPosition()
 		return append(cancels, s.resumeActions(st.Now)...), nil
 	}
 
@@ -198,6 +201,7 @@ func (s *Strategy) OnEvent(ev strategy.Event) ([]strategy.Action, error) {
 	case strategy.ResyncEvent:
 		s.position = e.Position.Size
 		cancels := s.syncFromOrders(e.Orders)
+		s.recoverFromPosition()
 		return append(cancels, s.resumeActions(e.Now)...), nil
 
 	default:
@@ -317,8 +321,11 @@ func (s *Strategy) adjustRange(req AdjustRange, cmd strategy.Command) ([]strateg
 	return append(acts, s.placeActions(cmd.Now)...), nil
 }
 
-// tick 处理时间推进：先判区间，再回收超时的挂单请求，最后补挂缺失的单。
+// tick 处理时间推进：先跟价移格，再判区间，再回收超时挂单并补挂。
 func (s *Strategy) tick(now time.Time) []strategy.Action {
+	if acts, ok := s.maybeTrail(now); ok {
+		return acts
+	}
 	if acts, handled := s.checkRange(now); handled {
 		return acts
 	}
@@ -413,8 +420,7 @@ func (s *Strategy) checkRange(now time.Time) (acts []strategy.Action, handled bo
 	}
 
 	buffer := s.mkt.TickSize.Mul(decimal.NewFromInt(int64(s.params.Risk.ExitBufferTicks)))
-	outside := s.mark.LessThan(s.grid.Lower().Sub(buffer)) ||
-		s.mark.GreaterThan(s.grid.Upper().Add(buffer))
+	outside := s.isAdverseOutside(buffer)
 
 	if s.phase == strategy.PhaseRunning {
 		if !outside {
@@ -452,6 +458,100 @@ func (s *Strategy) checkRange(now time.Time) (acts []strategy.Action, handled bo
 	return s.placeActions(now), true
 }
 
+func (s *Strategy) isAdverseOutside(buffer decimal.Decimal) bool {
+	if s.grid == nil || !s.mark.IsPositive() {
+		return false
+	}
+	switch s.params.Direction {
+	case Long:
+		return s.mark.LessThan(s.grid.Lower().Sub(buffer))
+	case Short:
+		return s.mark.GreaterThan(s.grid.Upper().Add(buffer))
+	default:
+		return s.mark.LessThan(s.grid.Lower().Sub(buffer)) ||
+			s.mark.GreaterThan(s.grid.Upper().Add(buffer))
+	}
+}
+
+// maybeTrail 在突破区间有利侧时整体平移网格。ok 为真时调用方不应再铺单。
+func (s *Strategy) maybeTrail(now time.Time) ([]strategy.Action, bool) {
+	if s.grid == nil || s.phase != strategy.PhaseRunning || !s.mark.IsPositive() {
+		return nil, false
+	}
+	up := s.params.Grid.TrailingUp
+	down := s.params.Grid.TrailingDown
+	if !up && !down {
+		return nil, false
+	}
+	max := s.params.Grid.TrailingMaxShifts
+	if max > 0 && s.trailShifts >= max {
+		return nil, false
+	}
+	cool := s.params.Grid.TrailingCooldown.Std()
+	if cool > 0 && !s.lastTrailAt.IsZero() && now.Sub(s.lastTrailAt) < cool {
+		return nil, false
+	}
+	ticks := s.params.Grid.TrailingTriggerTicks
+	if ticks < 0 {
+		ticks = 0
+	}
+	trigger := s.mkt.TickSize.Mul(decimal.NewFromInt(int64(ticks)))
+	stepN := s.params.Grid.TrailingStepGrids
+	if stepN <= 0 {
+		stepN = 1
+	}
+	n := s.grid.Count()
+	if n <= 0 {
+		return nil, false
+	}
+	step := s.grid.Upper().Sub(s.grid.Lower()).Div(decimal.NewFromInt(int64(n)))
+	if !step.IsPositive() {
+		return nil, false
+	}
+	shift := step.Mul(decimal.NewFromInt(int64(stepN)))
+
+	var lower, upper decimal.Decimal
+	switch {
+	case up && s.mark.GreaterThan(s.grid.Upper().Add(trigger)):
+		lower = s.grid.Lower().Add(shift)
+		upper = s.grid.Upper().Add(shift)
+	case down && s.mark.LessThan(s.grid.Lower().Sub(trigger)):
+		lower = s.grid.Lower().Sub(shift)
+		upper = s.grid.Upper().Sub(shift)
+	default:
+		return nil, false
+	}
+	if !lower.IsPositive() || !upper.GreaterThan(lower) {
+		return nil, false
+	}
+
+	s.lastTrailAt = now
+	s.trailShifts++
+	acts, err := s.adjustRange(AdjustRange{LowerPrice: lower, UpperPrice: upper}, strategy.Command{
+		Mark: s.mark,
+		Now:  now,
+	})
+	if err != nil {
+		s.trailShifts--
+		s.lastTrailAt = time.Time{}
+		return nil, false
+	}
+	return acts, true
+}
+
+func (s *Strategy) orderQty(c *Cell) decimal.Decimal {
+	if c.Armed && c.OpenQty.IsPositive() {
+		q := s.mkt.RoundQty(c.OpenQty)
+		if s.params.reduceOnlyFor(c.Side) {
+			q = s.mkt.RoundQtyUp(c.OpenQty)
+		}
+		if q.IsPositive() {
+			return q
+		}
+	}
+	return c.Qty
+}
+
 func (s *Strategy) onTrade(t order.Trade) {
 	if s.seenTrades == nil {
 		s.seenTrades = map[int64]struct{}{}
@@ -476,7 +576,7 @@ func (s *Strategy) onOrder(e strategy.OrderEvent) ([]strategy.Action, error) {
 	}
 
 	switch o.State {
-	case order.StateOpen:
+	case order.StateOpen, order.StatePending:
 		c.State = CellResting
 		delete(s.retrying, idx)
 		return nil, nil
@@ -510,16 +610,24 @@ func (s *Strategy) onOrder(e strategy.OrderEvent) ([]strategy.Action, error) {
 }
 
 // handleFill 处理成交：更新统计、翻转格子方向、挂出对手单。
+// 部分成交按实际成交量记账；未完成的平仓腿不翻转，对手单数量用已开仓量。
 func (s *Strategy) handleFill(idx int, o order.Order, now time.Time) []strategy.Action {
 	c := &s.grid.Cells[idx]
+	filled := o.FilledQty
+	if !filled.IsPositive() {
+		c.State = CellEmpty
+		c.PendingSince = time.Time{}
+		return nil
+	}
 
-	// 部分成交后被撤/过期时，仍按整格翻转处理，由对账修正仓位偏差。
-	// 这是有意的简化：让一个格子同时挂两笔单会破坏「每格一单」的模型，
-	// 而仓位漂移本来就有对账兜底。
-	partial := o.FilledQty.LessThan(c.Qty)
-
-	res := s.grid.OnFill(idx, o.Side)
-	delete(s.retrying, idx)
+	openQty := c.OpenQty
+	if !openQty.IsPositive() {
+		openQty = c.Qty
+	}
+	partial := filled.LessThan(c.Qty)
+	if c.Armed && filled.LessThan(openQty) {
+		partial = true
+	}
 
 	s.stats.Fills++
 	if o.Side == order.Buy {
@@ -532,24 +640,45 @@ func (s *Strategy) handleFill(idx int, o order.Order, now time.Time) []strategy.
 	}
 	fee := s.fillFee(o)
 	s.stats.FeePaid = s.stats.FeePaid.Add(fee)
-	if res.Completed {
-		s.stats.CompletedGrids++
-		profit := realizedRoundTrip(c, o.Side, o.FillPrice(), o.FilledQty)
-		if profit.IsZero() {
-			profit = res.GrossProfit
-			if partial && c.Qty.IsPositive() {
-				profit = profit.Mul(o.FilledQty).Div(c.Qty)
+	delete(s.retrying, idx)
+
+	if c.Armed {
+		if filled.LessThan(openQty) && o.State != order.StateFilled {
+			remain := openQty.Sub(filled)
+			if !s.mkt.LotSize.IsPositive() || remain.GreaterThan(s.mkt.LotSize) {
+				c.OpenFee = scaleDec(c.OpenFee, remain, openQty)
+				c.OpenQty = remain
+				c.State = CellEmpty
+				c.COID = 0
+				c.Seq = order.NextSeq(c.Seq)
+				c.PendingSince = time.Time{}
+				if s.phase != strategy.PhaseRunning {
+					return nil
+				}
+				return s.placeActions(now)
 			}
 		}
-		s.stats.GridProfit = s.stats.GridProfit.Add(profit)
-		matched := matchedQty(c.OpenQty, o.FilledQty)
-		s.stats.CycleFee = s.stats.CycleFee.Add(scaleDec(c.OpenFee, matched, c.OpenQty)).Add(scaleDec(fee, matched, o.FilledQty))
+		res := s.grid.OnFill(idx, o.Side)
+		profit := realizedRoundTrip(c, o.Side, o.FillPrice(), filled)
+		if profit.IsZero() {
+			profit = res.GrossProfit
+			if c.Qty.IsPositive() && filled.LessThan(c.Qty) {
+				profit = profit.Mul(filled).Div(c.Qty)
+			}
+		}
+		if res.Completed {
+			s.stats.CompletedGrids++
+			s.stats.GridProfit = s.stats.GridProfit.Add(profit)
+			matched := matchedQty(openQty, filled)
+			s.stats.CycleFee = s.stats.CycleFee.Add(scaleDec(c.OpenFee, matched, openQty)).Add(scaleDec(fee, matched, filled))
+		}
 		c.OpenQty = decimal.Zero
 		c.OpenPrice = decimal.Zero
 		c.OpenFee = decimal.Zero
 	} else {
-		c.OpenPrice, c.OpenQty = mergeVWAP(c.OpenPrice, c.OpenQty, o.FillPrice(), o.FilledQty)
+		c.OpenPrice, c.OpenQty = mergeVWAP(c.OpenPrice, c.OpenQty, o.FillPrice(), filled)
 		c.OpenFee = c.OpenFee.Add(fee)
+		s.grid.OnFill(idx, o.Side)
 	}
 
 	if s.phase != strategy.PhaseRunning {
@@ -572,12 +701,17 @@ func (s *Strategy) placeActions(now time.Time) []strategy.Action {
 		c := &s.grid.Cells[i]
 
 		if !window[i] {
-			if c.State != CellEmpty && c.COID != 0 {
-				acts = append(acts, strategy.CancelOrder{ClientOrderID: c.COID})
-				c.State = CellEmpty
-				c.COID = 0
-				c.PendingSince = time.Time{}
+			if c.State == CellEmpty || c.COID == 0 {
+				continue
 			}
+			// 已被现价穿过的挂单可能正在成交，撤单会和成交赛跑。
+			// 保留 COID，等成交/撤单回报把格子推到下一状态。
+			if c.State == CellResting && crossedByMark(c.Side, c.OrderPrice(), s.mark) {
+				continue
+			}
+			acts = append(acts, strategy.CancelOrder{ClientOrderID: c.COID})
+			c.State = CellEmpty
+			c.PendingSince = time.Time{}
 			continue
 		}
 		if c.State != CellEmpty {
@@ -610,7 +744,7 @@ func (s *Strategy) placeActions(now time.Time) []strategy.Action {
 			Side:          c.Side,
 			Type:          order.Limit,
 			Price:         price,
-			Quantity:      c.Qty,
+			Quantity:      s.orderQty(c),
 			TIF:           order.PostOnly,
 			ReduceOnly:    s.params.reduceOnlyFor(c.Side),
 		})
@@ -684,6 +818,84 @@ func (s *Strategy) syncFromOrders(orders []order.Order) []strategy.Action {
 	return extra
 }
 
+// recoverFromPosition 把「超出初始目标的仓位」记到已经穿过买/卖价、但 Seq 仍为 0 的空格子上。
+//
+// 成交回报丢失时格子会一直当成从未成交，realignGrid 会在标记价附近把方向翻回去并重挂开仓单。
+// 只处理 target 之外的增量，避免把做多/做空网格的底仓误当成格子成交。
+func (s *Strategy) recoverFromPosition() {
+	if s.grid == nil || !s.mark.IsPositive() {
+		return
+	}
+	delta := s.position.Sub(s.target)
+	for i := range s.grid.Cells {
+		c := &s.grid.Cells[i]
+		if !c.Armed || !c.OpenQty.IsPositive() {
+			continue
+		}
+		if c.Side == order.Sell {
+			delta = delta.Sub(c.OpenQty)
+		} else {
+			delta = delta.Add(c.OpenQty)
+		}
+	}
+	lot := s.mkt.LotSize
+	if !lot.IsPositive() {
+		lot = decimal.NewFromInt(1).Shift(-12)
+	}
+
+	if delta.IsPositive() {
+		for i := 0; i < len(s.grid.Cells) && delta.GreaterThanOrEqual(lot); i++ {
+			c := &s.grid.Cells[i]
+			if c.State != CellEmpty || c.Seq != 0 || c.Armed {
+				continue
+			}
+			if !s.mark.LessThanOrEqual(c.Low) {
+				continue
+			}
+			qty := c.Qty
+			if !qty.IsPositive() {
+				continue
+			}
+			if delta.LessThan(qty) {
+				qty = delta
+			}
+			c.Armed = true
+			c.Side = order.Sell
+			c.Seq = order.NextSeq(c.Seq)
+			c.OpenQty = qty
+			c.OpenPrice = c.Low
+			delta = delta.Sub(qty)
+		}
+		return
+	}
+
+	if delta.IsNegative() {
+		need := delta.Abs()
+		for i := len(s.grid.Cells) - 1; i >= 0 && need.GreaterThanOrEqual(lot); i-- {
+			c := &s.grid.Cells[i]
+			if c.State != CellEmpty || c.Seq != 0 || c.Armed {
+				continue
+			}
+			if !s.mark.GreaterThanOrEqual(c.High) {
+				continue
+			}
+			qty := c.Qty
+			if !qty.IsPositive() {
+				continue
+			}
+			if need.LessThan(qty) {
+				qty = need
+			}
+			c.Armed = true
+			c.Side = order.Buy
+			c.Seq = order.NextSeq(c.Seq)
+			c.OpenQty = qty
+			c.OpenPrice = c.High
+			need = need.Sub(qty)
+		}
+	}
+}
+
 func (s *Strategy) clearCells() {
 	if s.grid == nil {
 		return
@@ -718,18 +930,16 @@ func (s *Strategy) needsEntry() bool {
 
 // isMakerPrice 判断以该价格挂单是否能成为 maker。
 //
-// 盘口可用时用买一/卖一判断，否则退化为与标记价比较。
+// 必须用盘口买卖一：用标记价会把价差内的单当成 maker，post-only/GTX 被交易所立刻过期，
+// 看门狗再以同一客户端订单号重挂。没有盘口时宁可空着等下一笔行情。
 func (s *Strategy) isMakerPrice(side order.Side, price decimal.Decimal) bool {
-	if s.book.Valid() {
-		if side == order.Buy {
-			return price.LessThan(s.book.Ask)
-		}
-		return price.GreaterThan(s.book.Bid)
+	if !s.book.Valid() {
+		return false
 	}
 	if side == order.Buy {
-		return price.LessThan(s.mark)
+		return price.LessThan(s.book.Ask)
 	}
-	return price.GreaterThan(s.mark)
+	return price.GreaterThan(s.book.Bid)
 }
 
 func (s *Strategy) purposeFor(side order.Side) order.Purpose {
@@ -874,6 +1084,8 @@ type snapshotData struct {
 	Retrying         map[int]int     `json:"retrying"`
 	Stats            strategy.Stats  `json:"stats"`
 	SeenTrades       []int64         `json:"seen_trades,omitempty"`
+	LastTrailAt      time.Time       `json:"last_trail_at,omitempty"`
+	TrailShifts      int             `json:"trail_shifts,omitempty"`
 }
 
 func (s *Strategy) Snapshot() ([]byte, error) {
@@ -894,6 +1106,8 @@ func (s *Strategy) Snapshot() ([]byte, error) {
 		Retrying:         s.retrying,
 		Stats:            s.stats,
 		SeenTrades:       ids,
+		LastTrailAt:      s.lastTrailAt,
+		TrailShifts:      s.trailShifts,
 	})
 }
 
@@ -921,6 +1135,8 @@ func (s *Strategy) Restore(data []byte) error {
 	for _, id := range d.SeenTrades {
 		s.seenTrades[id] = struct{}{}
 	}
+	s.lastTrailAt = d.LastTrailAt
+	s.trailShifts = d.TrailShifts
 	s.restored = s.grid != nil
 	return nil
 }

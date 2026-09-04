@@ -174,6 +174,13 @@ func (s *Strategy) onTPOrder(o order.Order, now time.Time) ([]strategy.Action, e
 	case order.StateFilled:
 		return s.handleTPFill(o, now), nil
 	case order.StateCanceled, order.StateExpired:
+		if o.FilledQty.IsPositive() && s.remainingAfterTP(o).Abs().GreaterThan(s.mkt.LotSize) {
+			s.noteFill(o)
+			s.applyTPFillToPosition(o)
+			s.tp.State, s.tp.COID = liveEmpty, 0
+			s.tp.PendingSince = time.Time{}
+			return s.rehangTakeProfit(now), nil
+		}
 		if o.FilledQty.IsPositive() {
 			return s.handleTPFill(o, now), nil
 		}
@@ -198,6 +205,13 @@ func (s *Strategy) onTPOrder(o order.Order, now time.Time) ([]strategy.Action, e
 }
 
 func (s *Strategy) handleTPFill(o order.Order, now time.Time) []strategy.Action {
+	if s.remainingAfterTP(o).GreaterThan(s.mkt.LotSize) {
+		s.noteFill(o)
+		s.applyTPFillToPosition(o)
+		s.tp.State, s.tp.COID = liveEmpty, 0
+		s.tp.PendingSince = time.Time{}
+		return s.rehangTakeProfit(now)
+	}
 	s.noteFill(o)
 	s.stats.CompletedGrids++
 	if px := fillPrice(o); px.IsPositive() && s.avgPrice.IsPositive() && o.FilledQty.IsPositive() {
@@ -230,9 +244,26 @@ func (s *Strategy) handleTPFill(o order.Order, now time.Time) []strategy.Action 
 	}
 	s.target = s.entryTarget()
 	s.phase = strategy.PhaseEntering
-	// 先 maker 限价减仓清掉止盈没平干净的残留，再建首单。
-	// 否则 Runner 若还拿着止盈前的仓位快照，会把「建仓」做成反向空单。
-	return append(acts, strategy.ClosePosition{Urgency: strategy.UrgencyMaker}, strategy.EnsurePosition{Target: s.target})
+	// 用 EnsurePosition 把仓位收到首单量：已平干净则建仓，有残留则 reduce-only 减到目标。
+	// 不要同时再挂 ClosePosition，否则全平单与建仓单会叠在一起。
+	return append(acts, strategy.EnsurePosition{Target: s.target})
+}
+
+func (s *Strategy) remainingAfterTP(o order.Order) decimal.Decimal {
+	left := s.position.Abs().Sub(o.FilledQty.Abs())
+	if left.IsNegative() {
+		return decimal.Zero
+	}
+	return left
+}
+
+func (s *Strategy) applyTPFillToPosition(o order.Order) {
+	left := s.remainingAfterTP(o)
+	if s.position.IsNegative() {
+		s.position = left.Neg()
+		return
+	}
+	s.position = left
 }
 
 func (s *Strategy) noteFill(o order.Order) {
@@ -375,16 +406,11 @@ func (s *Strategy) wantAdd(level int) bool {
 func (s *Strategy) resumeActions(now time.Time) []strategy.Action {
 	switch s.phase {
 	case strategy.PhaseEntering:
-		if s.needsEntry() && !s.hasWorkingInventory() {
-			return []strategy.Action{strategy.EnsurePosition{Target: s.target}}
-		}
 		if !s.needsEntry() {
-			// 恢复运行：建仓已在崩溃前完成，直接铺单。
 			s.phase = strategy.PhaseRunning
 			return s.placeActions(now)
 		}
-		// needsEntry 且已有同向仓：等 ClosePosition / EnsurePosition 完成，勿提前铺单。
-		return nil
+		return []strategy.Action{strategy.EnsurePosition{Target: s.target}}
 	case strategy.PhaseIdle:
 		if s.needsEntry() && !s.hasWorkingInventory() {
 			s.phase = strategy.PhaseEntering
@@ -597,7 +623,11 @@ func (s *Strategy) tpOrder() (decimal.Decimal, decimal.Decimal) {
 	} else {
 		px = avg.Mul(one.Sub(pct))
 	}
-	return s.mkt.RoundPrice(px, market.RoundNearest), s.mkt.RoundQty(s.position.Abs())
+	qty := s.mkt.RoundQty(s.position.Abs())
+	if s.params.Order.ShouldReduceOnlyClose() {
+		qty = s.mkt.RoundQtyUp(s.position.Abs())
+	}
+	return s.mkt.RoundPrice(px, market.RoundNearest), qty
 }
 
 func (s *Strategy) addSide() order.Side {

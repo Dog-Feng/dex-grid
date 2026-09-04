@@ -110,7 +110,7 @@ func Preview(in PreviewInput) (Derived, error) {
 	d.RoundTripFeeRate = m.RoundTripFeeRate().Mul(hundred)
 	d.MinProfitRate, d.MaxProfitRate = profitRateRange(g)
 
-	pivot := pivotCell(g, in.Mark)
+	pivot := g.PivotCell(in.Mark)
 	d.GridProfit = g.Cells[pivot].GrossProfit()
 	d.GridProfitRate = g.Cells[pivot].Spread().Div(g.Cells[pivot].Low).Mul(hundred)
 	fee := m.FeeFor(g.Cells[pivot].Low, g.Cells[pivot].Qty, true).
@@ -328,19 +328,6 @@ func profitRateRange(g *Grid) (minRate, maxRate decimal.Decimal) {
 		}
 	}
 	return minRate, maxRate
-}
-
-// pivotCell 返回现价所在的格子索引。
-func pivotCell(g *Grid, mark decimal.Decimal) int {
-	for i := range g.Cells {
-		if mark.GreaterThanOrEqual(g.Cells[i].Low) && mark.LessThan(g.Cells[i].High) {
-			return i
-		}
-	}
-	if mark.LessThan(g.Lower()) {
-		return 0
-	}
-	return len(g.Cells) - 1
 }
 
 // maxGridCountForFee 反推在手续费约束下最多能开多少格。

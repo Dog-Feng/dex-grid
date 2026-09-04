@@ -821,6 +821,124 @@ func TestPartialFillIsTracked(t *testing.T) {
 	}
 }
 
+func TestPartialFillPlacesOppositeAtFilledQty(t *testing.T) {
+	s := newStrategy(t, smallParams(Neutral))
+	acts, _ := s.Init(testState("150", "0"))
+	buy := findPlacement(t, acts, "100")
+	confirm(t, s, buy, order.StateOpen, decimal.Zero)
+
+	if _, err := s.OnEvent(orderEvent(buy, order.StateCanceled, d("0.5"))); err != nil {
+		t.Fatal(err)
+	}
+	idx := int(buy.ClientOrderID.Decode().Cell)
+	c := s.grid.Cells[idx]
+	if c.Side != order.Sell {
+		t.Fatalf("side = %s, want sell", c.Side)
+	}
+	if !c.OpenQty.Equal(d("0.5")) {
+		t.Fatalf("open qty = %s, want 0.5", c.OpenQty)
+	}
+
+	s.book = market.BookTicker{Bid: d("119.9"), Ask: d("120.1")}
+	s.mark = d("120")
+	next := s.placeActions(epoch0.Add(time.Second))
+	var opp strategy.PlaceOrder
+	for _, p := range placements(next) {
+		if p.ClientOrderID.Decode().Cell == uint16(idx) {
+			opp = p
+		}
+	}
+	if opp.Quantity.IsZero() {
+		t.Fatal("expected opposite order for the filled cell")
+	}
+	if !opp.Quantity.Equal(d("0.5")) {
+		t.Fatalf("opposite qty = %s, want 0.5", opp.Quantity)
+	}
+}
+
+func TestLongRallyDoesNotPause(t *testing.T) {
+	s := newStrategy(t, smallParams(Long))
+	if _, err := s.Init(testState("150", "2")); err != nil {
+		t.Fatal(err)
+	}
+	if s.View().Phase != strategy.PhaseRunning {
+		t.Fatalf("phase = %s", s.View().Phase)
+	}
+	acts, err := s.OnEvent(strategy.BookEvent{
+		Book: market.BookTicker{Bid: d("209.9"), Ask: d("210.1")},
+		Mark: d("210"),
+		Now:  epoch0.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.View().Phase != strategy.PhaseRunning {
+		t.Fatalf("long grid must keep running when price breaks the upper bound, phase=%s", s.View().Phase)
+	}
+	if countAction[strategy.Stop](acts) != 0 {
+		t.Fatal("rally must not stop the instance")
+	}
+}
+
+func TestTrailingUpShiftsRange(t *testing.T) {
+	p := smallParams(Neutral)
+	p.Grid.TrailingUp = true
+	s := newStrategy(t, p)
+	if _, err := s.Init(testState("150", "0")); err != nil {
+		t.Fatal(err)
+	}
+	before := s.View()
+	acts, err := s.OnEvent(strategy.BookEvent{
+		Book: market.BookTicker{Bid: d("200.9"), Ask: d("201.1")},
+		Mark: d("201"),
+		Now:  epoch0.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countAction[strategy.CancelAll](acts) != 1 {
+		t.Fatal("trailing should cancel and rebuild")
+	}
+	after := s.View()
+	if after.Epoch <= before.Epoch {
+		t.Fatalf("epoch %d should advance from %d", after.Epoch, before.Epoch)
+	}
+	wantLower := before.LowerPrice.Add(d("25"))
+	if !after.LowerPrice.Equal(wantLower) {
+		t.Fatalf("lower = %s, want %s", after.LowerPrice, wantLower)
+	}
+}
+
+func TestRestoredInitKeepsEpoch(t *testing.T) {
+	s := newStrategy(t, smallParams(Neutral))
+	if _, err := s.Init(testState("150", "0")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.OnCommand(strategy.Command{
+		Kind:    strategy.CmdAdjustRange,
+		Payload: AdjustRange{LowerPrice: d("120"), UpperPrice: d("220")},
+		Mark:    d("150"),
+		Now:     epoch0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	epoch := s.View().Epoch
+	blob, err := s.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := newStrategy(t, smallParams(Neutral))
+	if err := restored.Restore(blob); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restored.Init(testState("150", "0")); err != nil {
+		t.Fatal(err)
+	}
+	if restored.View().Epoch != epoch {
+		t.Fatalf("restored epoch = %d, want %d", restored.View().Epoch, epoch)
+	}
+}
+
 // 交易所拒单（Lighter 的 canceled-post-only）要让格子回到可重挂状态，
 // 并递增重挂计数，达到上限后停手等价格移开。
 func TestPostOnlyRejectionRetriesThenBacksOff(t *testing.T) {
@@ -1173,5 +1291,131 @@ func moveMarket(t *testing.T, s *Strategy, mark string, after time.Duration) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPendingAckMarksCellResting(t *testing.T) {
+	s := newStrategy(t, smallParams(Neutral))
+	acts, _ := s.Init(testState("150", "0"))
+	p := placements(acts)[0]
+	confirm(t, s, p, order.StatePending, decimal.Zero)
+	for _, c := range s.grid.Cells {
+		if c.COID != p.ClientOrderID {
+			continue
+		}
+		if c.State != CellResting {
+			t.Fatalf("state = %s, REST ACK should mark resting", c.State)
+		}
+		return
+	}
+	t.Fatal("placement coid not found")
+}
+
+func TestSkipPlaceWithoutBook(t *testing.T) {
+	s := newStrategy(t, smallParams(Neutral))
+	if _, err := s.Init(testState("150", "0")); err != nil {
+		t.Fatal(err)
+	}
+	s.book = market.BookTicker{}
+	acts := s.placeActions(epoch0)
+	if len(placements(acts)) != 0 {
+		t.Fatalf("placed %d without a book, want 0", len(placements(acts)))
+	}
+}
+
+func TestRecoverFromPositionFlipsCrossedBuys(t *testing.T) {
+	s := newStrategy(t, smallParams(Neutral))
+	if _, err := s.Init(testState("150", "0")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.OnCommand(strategy.Command{Kind: strategy.CmdCancelOrders, Now: epoch0}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.OnCommand(strategy.Command{Kind: strategy.CmdRefill, Now: epoch0}); err != nil {
+		t.Fatal(err)
+	}
+	moveMarket(t, s, "124", time.Second)
+	acts, err := s.OnEvent(strategy.ResyncEvent{
+		Position: position.Position{Size: d("1")},
+		Now:      epoch0.Add(2 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := s.grid.Cells[1]
+	if c.Seq == 0 || c.Side != order.Sell || !c.Armed {
+		t.Fatalf("cell1 = seq=%d side=%s armed=%v, want recovered sell", c.Seq, c.Side, c.Armed)
+	}
+	found := false
+	for _, p := range placements(acts) {
+		if p.ClientOrderID.Decode().Cell == 1 && p.Side == order.Sell {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected a sell on the recovered cell")
+	}
+}
+
+func TestPlaceActionsOutsideWindowKeepsCOID(t *testing.T) {
+	s := newStrategy(t, smallParams(Long))
+	acts, err := s.Init(testState("150", "2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	placed := placements(acts)
+	if len(placed) == 0 {
+		t.Fatal("expected placements")
+	}
+	for _, p := range placed {
+		confirm(t, s, p, order.StateOpen, decimal.Zero)
+	}
+
+	s.params.Grid.MaxActiveOrders = 2
+	window := s.grid.ActiveWindow(s.mark, 2)
+	var idx int
+	var coid order.ClientOrderID
+	found := false
+	for i := range s.grid.Cells {
+		c := &s.grid.Cells[i]
+		if window[i] || c.State != CellResting || c.COID == 0 {
+			continue
+		}
+		if c.State == CellResting && crossedByMark(c.Side, c.OrderPrice(), s.mark) {
+			continue
+		}
+		idx, coid, found = i, c.COID, true
+		break
+	}
+	if !found {
+		t.Fatal("need a resting cell outside the active window")
+	}
+
+	next := s.placeActions(epoch0.Add(time.Second))
+	canceled := false
+	for _, a := range next {
+		if c, ok := a.(strategy.CancelOrder); ok && c.ClientOrderID == coid {
+			canceled = true
+		}
+	}
+	if !canceled {
+		t.Fatal("expected cancel of the outside-window order")
+	}
+	if s.grid.Cells[idx].COID != coid {
+		t.Fatal("must keep COID so a racing fill can still be claimed")
+	}
+
+	fillActs, err := s.OnEvent(orderEvent(strategy.PlaceOrder{
+		ClientOrderID: coid,
+		Side:          s.grid.Cells[idx].Side,
+		Price:         s.grid.Cells[idx].OrderPrice(),
+		Quantity:      s.grid.Cells[idx].Qty,
+	}, order.StateFilled, s.grid.Cells[idx].Qty))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = fillActs
+	if s.View().Stats.Fills < 1 {
+		t.Fatal("fill after window cancel was dropped")
 	}
 }

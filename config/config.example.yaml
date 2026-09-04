@@ -19,17 +19,19 @@ app:
   tick_interval: 1s          # 定时事件间隔，驱动跟价/超时/止盈止损检查
   reconcile_interval: 15s    # 运行中挂单看门狗：缺补、多撤。0 则用 15s
   shutdown_timeout: 30s
+  http_timeout: 15s          # 交易所 REST 客户端超时，与进程退出等待无关
 
 server:
-  addr: "0.0.0.0:8080"       # 公网监听；只本机访问可改成 127.0.0.1:8080
+  addr: "127.0.0.1:8080"     # 默认只本机。公网监听 0.0.0.0:8080 时必须开 auth 或 ip_whitelist
   auth:
-    # 默认关闭。需要时开启 Bearer Token，所有 /api/* 校验 Authorization 头
+    # 默认关闭。公网监听时必须开启 Bearer Token，所有 /api/* 校验 Authorization 头
     enabled: false
     token: ${GRIDBOT_TOKEN}
-  metrics_enabled: true
+  metrics_enabled: true      # 字段保留；当前没有 /metrics 端点
   cors_origins: ["*"]        # 允许任意来源调用 API；收紧时可改成具体 Origin
+  trusted_proxies: []        # 可信反代 IP/CIDR；非空时才采信 X-Forwarded-For
   ip_whitelist:
-    enabled: false           # true 后只允许 allow 列表里的 IP（本机 127.0.0.1 / ::1 始终放行）
+    enabled: false           # true 后只允许 allow 列表里的 IP（未配 trusted_proxies 时本机始终放行）
     allow:
       - 127.0.0.1
       # - 1.2.3.4
@@ -95,6 +97,26 @@ exchanges:
       batch_size: 20
       order_expiry: 28d
       price_protection: true
+
+    rate_limit:
+      rps: 10
+      burst: 20
+
+    autostart: false
+
+  # SODEx 永续（Bolt）。必须追加在 lighter / rh_lighter 之后，ClientOrderID slot=2。
+  # X-API-Key 是密钥的 name（如 api-key-01），不是私钥。user_address 是主钱包地址。
+  - name: sodex
+    enabled: false
+    network: mainnet             # mainnet | testnet
+
+    credentials:
+      account_index: ${SODEX_ACCOUNT_ID}
+      api_key_private_key: ${SODEX_PRIVATE_KEY}
+
+    options:
+      api_key_name: ${SODEX_API_KEY}
+      user_address: ${SODEX_ADDRESS}
 
     rate_limit:
       rps: 10

@@ -3,6 +3,7 @@ package lighter
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,7 +87,11 @@ func (s *txSender) send(ctx context.Context, op string, build builder) (string, 
 	resp, err := s.rest.sendTx(ctx, txInfo.GetTxType(), payload, s.priceProtection)
 	if err != nil {
 		s.onSendFailure(err)
-		return "", classify(op, err)
+		classified := classify(op, err)
+		if exchange.ClassOf(classified) == exchange.ClassNonceStale {
+			s.hasNonce = false
+		}
+		return "", classified
 	}
 
 	s.nonce = nonce + 1
@@ -115,6 +120,9 @@ func (s *txSender) currentNonce(ctx context.Context) (int64, error) {
 func (s *txSender) onSendFailure(err error) {
 	var ae *apiError
 	if errorsAs(err, &ae) && ae.Status >= 400 && ae.Status < 500 {
+		if strings.Contains(strings.ToLower(ae.Message), "nonce") {
+			s.hasNonce = false
+		}
 		return
 	}
 	s.hasNonce = false
