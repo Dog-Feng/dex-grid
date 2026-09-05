@@ -105,6 +105,9 @@ body {
 .static-banner.warn {
   border-color: #f59e0b50; background: #f59e0b12; color: #fcd34d;
 }
+.static-banner.info {
+  border-color: #38bdf850; background: #38bdf812; color: #7dd3fc;
+}
 
 .panel {
   background: var(--panel); border: 1px solid var(--border);

@@ -17,6 +17,16 @@ const PHASE_LABEL = {
   paused: "已暂停",
   stopped: "已停止",
 };
+const STOP_REASON_LABEL = {
+  out_of_range: "价格突破区间",
+  manual: "手动停止",
+  circuit: "连续失败熔断",
+  take_profit: "止盈",
+  stop_loss: "止损",
+  entry_failed: "建仓失败",
+  shutdown: "进程退出",
+  error: "内部错误",
+};
 
 const state = {
   tab: "overview",
@@ -212,6 +222,15 @@ function isRunning(status) {
   return status === "running" || status === "starting" || status === "paused" || status === "reconnecting";
 }
 
+// 策略 phase 仍在运行态但实例 status 短暂不同步时（重连/竞态），仍应允许手动停止。
+function canStop(st) {
+  if (!st) return false;
+  const status = st.status || "stopped";
+  if (isRunning(status) || status === "error") return true;
+  const phase = st.strategy && st.strategy.phase;
+  return phase === "running" || phase === "entering" || phase === "out_of_range" || phase === "paused";
+}
+
 function isActiveInstance(st) {
   const s = (st && st.status) || "";
   return isRunning(s) || s === "error";
@@ -233,6 +252,7 @@ function showBanner(msg, kind) {
   el.textContent = msg;
   el.classList.toggle("error", kind === "error");
   el.classList.toggle("warn", kind === "warn");
+  el.classList.toggle("info", kind === "info");
 }
 
 function setConn(ok, text) {
@@ -450,11 +470,22 @@ function applyExchangePanel(st) {
   $("st-grids").textContent = String(stats.completed_grids ?? 0);
   $("st-runtime").textContent = fmtRuntime(stats.reset_at, running);
 
-  const phase = PHASE_LABEL[strat.phase] || STATUS_LABEL[status] || status || "—";
+  let phase = PHASE_LABEL[strat.phase] || STATUS_LABEL[status] || status || "—";
+  const stopReason = st && st.stop_reason;
+  if (!running && stopReason && STOP_REASON_LABEL[stopReason]) {
+    phase = `已停止（${STOP_REASON_LABEL[stopReason]}）`;
+  }
   const dirTxt = DIR_LABEL[dir] ? DIR_LABEL[dir] + "网格" : "网格";
   $("st-phase").textContent = running ? `${phase}（${dirTxt}）` : phase;
   $("st-conn").classList.toggle("online", running);
   $("st-conn").classList.toggle("warn", status === "error" || status === "reconnecting");
+  if (!running && stopReason === "out_of_range") {
+    showBanner("价格已突破区间，策略已按「停止并撤单」自动停止（仓位保留）。无需再点停止，可直接改配置后重新启动。", "info");
+  } else if (running && strat.phase === "out_of_range") {
+    showBanner("价格突破区间，网格已挂起等待回归（原有挂单保留）。可点「停止策略」撤单留仓。", "info");
+  } else {
+    showBanner("");
+  }
 
   $("st-watch").innerHTML = `挂单看门狗 · 目标 <b>${target || "—"}</b> / 已确认 <b>${resting}</b> · ${symbol ? symbol + " · " : ""}更新于 ${fmtTime(now)}`;
   $("st-progress-txt").textContent = `挂单 ${resting} / 目标 ${target || "—"}`;
@@ -463,7 +494,7 @@ function applyExchangePanel(st) {
   $("btn-start").textContent = isMartingale() ? `启动 ${ex} 马丁` : `启动 ${ex} 网格`;
   const gridsLbl = $("st-grids") && $("st-grids").previousElementSibling;
   if (gridsLbl) gridsLbl.textContent = isMartingale() ? "完成周期" : "完成格";
-  lockForm(running);
+  lockForm(running, st);
   drawChart();
 }
 
@@ -582,7 +613,7 @@ function renderOverview() {
   $("ov-status-detail").textContent = active.map((ex) => exchangeLabel(ex.name)).join(" · ");
 }
 
-function lockForm(running) {
+function lockForm(running, st) {
   const freeze = ["symbol-trigger", "leverage", "margin-mode", "sizing", "margin", "qty", "entry-mode", "entry-price", "out-of-range", "mg-drop", "mg-tp", "mg-initial", "mg-add", "mg-times", "mg-mult", "mg-mode", "mg-restart", "mg-preplace", "mg-sl"];
   freeze.forEach((id) => {
     const el = $(id);
@@ -593,7 +624,7 @@ function lockForm(running) {
     el.style.opacity = running ? "0.55" : "";
   });
   $("btn-start").disabled = running;
-  $("btn-stop").disabled = !running;
+  $("btn-stop").disabled = !canStop(st);
   $("btn-adjust").disabled = !running || isMartingale();
   $("btn-adjust").hidden = isMartingale();
   $("btn-cancel").disabled = !running;
@@ -1209,7 +1240,6 @@ async function refreshLive() {
   const cur = map[state.exchange];
   const curStatus = (cur && cur.status) || "stopped";
   setConn(true, STATUS_LABEL[curStatus] || "已连接");
-  showBanner("");
 }
 
 async function tick() {
